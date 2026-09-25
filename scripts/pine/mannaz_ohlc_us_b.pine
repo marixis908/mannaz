@@ -8,8 +8,12 @@
 // OHLC samego QQQ wychodzi automatycznie — drugi benchmark obok SPY (M57/M58).
 // Eksport: menu "..." -> Export chart data... -> format czasu ISO.
 // KONTROLA: pierwszy wiersz pliku ma miec 54 kolumny (6 dla QQQ + 16 x 3).
+// Skrypt sprawdza, czy siedzi na wykresie z kalendarzem NYSE (od 2026-09-25).
 
 indicator("Mannaz OHLC · US batch B", overlay = false, max_bars_back = 5000)
+
+if syminfo.timezone != "America/New_York"
+    runtime.error("Mannaz US-B: wykres bazowy musi byc z gieldy USA (np. NASDAQ:QQQ). Teraz: " + syminfo.tickerid)
 
 f(simple string sym) =>
     request.security(sym, timeframe.period, [high, low, close], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol = true)
