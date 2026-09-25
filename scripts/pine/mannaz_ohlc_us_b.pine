@@ -1,0 +1,65 @@
+//@version=6
+// MANNAZ — eksport dziennych OHLC, batch B (16 spolek US)
+//
+// Wykres bazowy: NASDAQ:QQQ, interwal 1D. Ustawienia jak w batchu A:
+//   korekta o dywidendy WYLACZONA, bez przeliczania waluty, sesja zwykla,
+//   przewinac w lewo do ~2022-09 przed eksportem.
+//
+// OHLC samego QQQ wychodzi automatycznie — drugi benchmark obok SPY (M57/M58).
+// Eksport: menu "..." -> Export chart data... -> format czasu ISO.
+// KONTROLA: pierwszy wiersz pliku ma miec 54 kolumny (6 dla QQQ + 16 x 3).
+
+indicator("Mannaz OHLC · US batch B", overlay = false, max_bars_back = 5000)
+
+f(simple string sym) =>
+    request.security(sym, timeframe.period, [high, low, close], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+D = display.all
+
+[h01, l01, c01] = f("NASDAQ:GRAB")
+plot(h01, "GRAB_h", display = D), plot(l01, "GRAB_l", display = D), plot(c01, "GRAB_c", display = D)
+
+[h02, l02, c02] = f("NASDAQ:TSLA")
+plot(h02, "TSLA_h", display = D), plot(l02, "TSLA_l", display = D), plot(c02, "TSLA_c", display = D)
+
+[h03, l03, c03] = f("NYSE:SPOT")
+plot(h03, "SPOT_h", display = D), plot(l03, "SPOT_l", display = D), plot(c03, "SPOT_c", display = D)
+
+[h04, l04, c04] = f("NASDAQ:FTAI")
+plot(h04, "FTAI_h", display = D), plot(l04, "FTAI_l", display = D), plot(c04, "FTAI_c", display = D)
+
+[h05, l05, c05] = f("NASDAQ:NVDA")
+plot(h05, "NVDA_h", display = D), plot(l05, "NVDA_l", display = D), plot(c05, "NVDA_c", display = D)
+
+[h06, l06, c06] = f("NASDAQ:RKLB")
+plot(h06, "RKLB_h", display = D), plot(l06, "RKLB_l", display = D), plot(c06, "RKLB_c", display = D)
+
+[h07, l07, c07] = f("NASDAQ:AXON")
+plot(h07, "AXON_h", display = D), plot(l07, "AXON_l", display = D), plot(c07, "AXON_c", display = D)
+
+[h08, l08, c08] = f("NYSE:APH")
+plot(h08, "APH_h", display = D), plot(l08, "APH_l", display = D), plot(c08, "APH_c", display = D)
+
+[h09, l09, c09] = f("NASDAQ:NFLX")
+plot(h09, "NFLX_h", display = D), plot(l09, "NFLX_l", display = D), plot(c09, "NFLX_c", display = D)
+
+[h10, l10, c10] = f("NYSE:ORCL")
+plot(h10, "ORCL_h", display = D), plot(l10, "ORCL_l", display = D), plot(c10, "ORCL_c", display = D)
+
+[h11, l11, c11] = f("NASDAQ:MKSI")
+plot(h11, "MKSI_h", display = D), plot(l11, "MKSI_l", display = D), plot(c11, "MKSI_c", display = D)
+
+[h12, l12, c12] = f("NASDAQ:TEM")
+plot(h12, "TEM_h", display = D), plot(l12, "TEM_l", display = D), plot(c12, "TEM_c", display = D)
+
+[h13, l13, c13] = f("NYSE:KLAR")
+plot(h13, "KLAR_h", display = D), plot(l13, "KLAR_l", display = D), plot(c13, "KLAR_c", display = D)
+
+[h14, l14, c14] = f("NASDAQ:COIN")
+plot(h14, "COIN_h", display = D), plot(l14, "COIN_l", display = D), plot(c14, "COIN_c", display = D)
+
+[h15, l15, c15] = f("NASDAQ:MBLY")
+plot(h15, "MBLY_h", display = D), plot(l15, "MBLY_l", display = D), plot(c15, "MBLY_c", display = D)
+
+[h16, l16, c16] = f("NASDAQ:TTD")
+plot(h16, "TTD_h", display = D), plot(l16, "TTD_l", display = D), plot(c16, "TTD_c", display = D)

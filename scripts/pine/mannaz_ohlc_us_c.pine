@@ -1,0 +1,35 @@
+//@version=6
+// MANNAZ — eksport dziennych OHLC, batch C-US: nowa pozycja + benchmarki zastepcze
+//
+// Wykres bazowy: AMEX:SPY (albo BATS:SPY), interwal 1D — ustawienia jak w batchu A:
+//   korekta o dywidendy WYLACZONA, waluta USD, sesja zwykla.
+//
+//   RRX  — Regal Rexnord, nowa pozycja z 23.09 (brak w batchach A/B)
+//   SMH  — benchmark zastepczy dla NVDA (M57)
+//   SOXX — benchmark zastepczy dla ACMR / polprzewodnikow
+//   IBIT — benchmark zastepczy dla MARA i COIN
+//
+// Skrypt sprawdza, czy siedzi na wykresie z kalendarzem NYSE.
+// KONTROLA po eksporcie: 18 kolumn (6 dla SPY + 4 x 3); pierwsza po "Volume" to RRX_h.
+
+indicator("Mannaz OHLC · US batch C", overlay = false, max_bars_back = 5000)
+
+if syminfo.timezone != "America/New_York"
+    runtime.error("Mannaz US-C: wykres bazowy musi byc z gieldy USA (np. AMEX:SPY). Teraz: " + syminfo.tickerid)
+
+f(simple string sym) =>
+    request.security(sym, timeframe.period, [high, low, close], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+D = display.all
+
+[h01, l01, c01] = f("NYSE:RRX")
+plot(h01, "RRX_h", display = D), plot(l01, "RRX_l", display = D), plot(c01, "RRX_c", display = D)
+
+[h02, l02, c02] = f("NASDAQ:SMH")
+plot(h02, "SMH_h", display = D), plot(l02, "SMH_l", display = D), plot(c02, "SMH_c", display = D)
+
+[h03, l03, c03] = f("NASDAQ:SOXX")
+plot(h03, "SOXX_h", display = D), plot(l03, "SOXX_l", display = D), plot(c03, "SOXX_c", display = D)
+
+[h04, l04, c04] = f("NASDAQ:IBIT")
+plot(h04, "IBIT_h", display = D), plot(l04, "IBIT_l", display = D), plot(c04, "IBIT_c", display = D)

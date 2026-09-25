@@ -1,0 +1,35 @@
+//@version=6
+// MANNAZ — eksport dziennych OHLC, batch C (Europa) — wersja 2
+//
+// Wykres bazowy: EURONEXT:ASML, interwal 1D.
+//   - korekta o dywidendy WYLACZONA ("adj" w prawym dolnym rogu zgaszony)
+//   - waluta przy prawej osi: EUR (M2) — przeliczona waluta to blad CICHY
+//   - sesja zwykla
+//
+// NOWE w v2: skrypt sam sprawdza, czy siedzi na wykresie z kalendarzem Amsterdamu.
+// Na wykresie SPY/QQQ/TSX rzuci bledem zamiast po cichu wyprodukowac zly plik.
+//
+// KONTROLA po eksporcie: 15 kolumn; pierwsza po "Volume" to BESI_h.
+// (Poprzedni plik C mial tu GRAB_h — byl na nim skrypt batch B.)
+//
+// IFX notowany na XETR, dociagany na kalendarz Amsterdamu — jakosc B.
+// CSU nie tutaj: osobny eksport samego wykresu TSX:CSU, waluta CAD.
+
+indicator("Mannaz OHLC · EU v2", overlay = false, max_bars_back = 5000)
+
+if syminfo.timezone != "Europe/Amsterdam"
+    runtime.error("Mannaz EU: wykres bazowy musi byc z Euronext Amsterdam (np. EURONEXT:ASML). Teraz: " + syminfo.tickerid)
+
+f(simple string sym) =>
+    request.security(sym, timeframe.period, [high, low, close], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+D = display.all
+
+[h01, l01, c01] = f("EURONEXT:BESI")
+plot(h01, "BESI_h", display = D), plot(l01, "BESI_l", display = D), plot(c01, "BESI_c", display = D)
+
+[h02, l02, c02] = f("EURONEXT:ADYEN")
+plot(h02, "ADYEN_h", display = D), plot(l02, "ADYEN_l", display = D), plot(c02, "ADYEN_c", display = D)
+
+[h03, l03, c03] = f("XETR:IFX")
+plot(h03, "IFX_h", display = D), plot(l03, "IFX_l", display = D), plot(c03, "IFX_c", display = D)
