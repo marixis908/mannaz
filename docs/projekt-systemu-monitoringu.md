@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 2 · 2026-08-27**
+**Rewizja 3 · 2026-09-25**
 
 ---
 
@@ -22,7 +22,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 |---|---|---|
 | 1.0 | 2026-08-27 | Projekt pierwotny: 9 archetypów wyceny, grupy peer, 7 wskaźników technicznych, reguły Turtle, kadencja |
 | 1.1 | 2026-08-27 | Po recenzji zewnętrznej: sygnał główny RVS zamiast reszty z regresji; wersja minimalna; kwarantanna; egzekucja transzowa; dostawa dzielona po krytyczności |
-| **2.0** | **2026-08-27** | **Wielorynkowość i wielowalutowość; reverse DCF i MEROI; polityka alokacji; kadencja tygodniowa zamiast dobowej; weryfikacja Hostingera; pełny rejestr opcji odrzuconych; cztery zmienne stanu; korekty po recenzji Fable** |
+| 2.0 | 2026-08-27 | Wielorynkowość i wielowalutowość; reverse DCF i MEROI; polityka alokacji; kadencja tygodniowa zamiast dobowej; weryfikacja Hostingera; pełny rejestr opcji odrzuconych; cztery zmienne stanu; korekty po recenzji Fable |
+| **3.0** | **2026-09-25** | **Stan infrastruktury po pomiarach: P-07 zamknięty, P-09 przeformułowany; §5.5 — osobny kontener PostgreSQL dla Mannaza zamiast wspólnej instancji z NocoDB; oryginał dokumentu w repo `mannaz`** |
 
 ### 0.3 Oznaczenia
 
@@ -282,7 +283,7 @@ Brak Pythona i brak Postgresa zamykają temat niezależnie od reszty limitów. *
 
 > **[S] To nie jest ochrona wystarczająca dla bazy finansowej.** Tygodniowy obraz maszyny oznacza w najgorszym razie utratę siedmiu dni danych, a snapshot to checkpoint na czas jednej operacji, nie kopia zapasowa. Własny `pg_dump` do zewnętrznej lokalizacji w cronie, codziennie — przy tej wielkości bazy dump trwa sekundy.
 
-**[Z] Firewall:** zarządzany z hPanel, filtruje przed dotarciem do serwera, działa **niezależnie od** ufw/iptables (ruch musi przejść obie warstwy). Domyślnie wszystkie porty zamknięte; **pusty ruleset zablokuje cały ruch po przypisaniu**. [N] Niezweryfikowane, czy nowy VPS dostaje domyślną grupę — do sprawdzenia przed uruchomieniem Postgresa (P-07).
+**[Z] Firewall:** zarządzany z hPanel, filtruje przed dotarciem do serwera, działa **niezależnie od** ufw/iptables (ruch musi przejść obie warstwy). Domyślnie wszystkie porty zamknięte; **pusty ruleset zablokuje cały ruch po przypisaniu**. [Z] Pomiar 2026-09-25 (P-07, zamknięty): VPS ma przypisaną grupę `frank-web`, aktywną — przepuszcza TCP 22/80/443, resztę odrzuca. Zachowanie dla IPv6 niezmierzone.
 
 **Port 5432 nie będzie otwierany.** Usługa i baza siedzą na tej samej maszynie — połączenie przez `localhost` albo sieć wewnętrzną Dockera. Zero ekspozycji.
 
@@ -327,9 +328,9 @@ Mitygacja niezależna od planu: ciężkie przeliczenia pod `nice`, rozłożenie 
 
 ### 5.5 Rekomendacja infrastrukturalna
 
-**Jeśli obecny VPS to KVM 1 — upgrade do KVM 2 przed dołożeniem czwartej usługi.** Nie z powodu RAM (4 GB wystarczy: n8n ~300–500 MB, NocoDB ~300–500 MB, Postgres ~300–400 MB, Python ~150–300 MB, OS ~300–400 MB = ok. 1,5–2,1 GB), tylko z powodu **jednego vCPU w zderzeniu z polityką dławienia**. KVM 4 nie jest potrzebny.
+**Rozstrzygnięte w rew. 3: VPS to KVM 2 (2 vCPU, 8 GB RAM, 100 GB) — upgrade nie jest potrzebny.** Szacunek RAM czterech usług (n8n ~300–500 MB, NocoDB ~300–500 MB, Postgres ~300–400 MB, Python ~150–300 MB, OS ~300–400 MB = ok. 1,5–2,1 GB) mieści się z zapasem, a argument z dławienia przy jednym vCPU nie dotyczy. Zapas przy kontenerze Mannaza mierzy P-09. KVM 4 nie jest potrzebny.
 
-Konfiguracja: **jedna instancja PostgreSQL 17/18 w Dockerze, osobna baza dla Mannaza, osobna rola z uprawnieniami tylko do niej**, `shared_buffers` 256–512 MB. Jeśli NocoDB używa już Postgresa — użyć tej samej instancji, osobnej bazy; oszczędza ~300 MB RAM i jeden proces do pilnowania.
+Konfiguracja: **osobny kontener PostgreSQL 17/18 dla Mannaza, własna rola**, `shared_buffers` 256–512 MB, `cpus:` i `mem_limit:` w docker-compose. **Nie** wspólna instancja z wewnętrznym Postgresem NocoDB Franka (`nocodb-fjht-nocodb-db-1`): oszczędność ~300 MB RAM jest przy 8 GB pomijalna, a wspólna instancja to wspólny cykl życia, restartów i backupu z produkcją Franka — ten sam blast radius, który wyklucza §6 pkt 2. Decyzja ownera 2026-09-25 (zastępuje rekomendację rew. 2).
 
 ## 6. Wybór stacku
 
@@ -1292,9 +1293,9 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 | **P-04** | Poprawność kalendarza XWAR | Różnica symetryczna między `XWAR.sessions_in_range()` a datami z pobranych szeregów | Kalendarz twierdzący, że była sesja, dla której nie ma danych, jest błędny albo dane mają dziurę |
 | **P-05** | **Rewalidacja całej tabeli peer** | Sprawdzenie istnienia i statusu każdego z ~150 tickerów | PARA już nie istnieje; WBD w trakcie zmian [N] |
 | **P-06** | Backfill filings.xbrl.org PL, FY2020–FY2023 | `filter[country]=PL`, pobranie paczek | Dane nieodtwarzalne po wycofaniu API |
-| **P-07** | Czy VPS ma przypisaną domyślną grupę firewalla | Panel Hostingera | Bez przypisania liczy się wyłącznie firewall systemowy |
+| **P-07** | Czy VPS ma przypisaną domyślną grupę firewalla | Panel Hostingera | **Zamknięty 2026-09-25:** grupa `frank-web` przypisana i aktywna (TCP 22/80/443); IPv6 niezmierzone |
 | **P-08** | Budżet czasowy przebiegu o docelowej godzinie | Pomiar `duration_sec` o 04:30 i 07:00 UTC, n ≥ 5 | Zmierzona anomalia: 91–97 s o 06:00 vs 25,1 s o 09:56 |
-| **P-09** | Zapas RAM i dysku na VPS oraz szczyt Franka | Monitoring hPanel przez tydzień | Decyzja o upgrade KVM 1 → KVM 2 |
+| **P-09** | Zapas RAM i dysku na VPS przy kontenerze Mannaza oraz szczyt Franka | Monitoring hPanel przez tydzień | Wartości `mem_limit:` i `cpus:` kontenera Mannaza (rew. 3: decyzja o upgrade KVM 1 → KVM 2 nieaktualna — VPS to KVM 2) |
 | **P-10** | Efektywna liczba zakładów po korelacji | PCA na ≥120 zwrotach tygodniowych, shrinkage | HHI daje 21,5 **wg wag**; po korelacji będzie istotnie niżej. **Zmienia sizing** |
 | **P-11** | Realny czas wpisu ręcznego mianowników | Chronometraż pierwszego kwartału | Próg decyzji o płatnym API (O-15) |
 
