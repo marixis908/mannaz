@@ -1,0 +1,18 @@
+# dane finansowe i surowe eksporty — nigdy w repo
+data/
+_incoming/
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.dump
+*.sql.gz
+backups/
+# sekrety
+.env
+.env.*
+!.env.example
+# robocze
+tmp/
+__pycache__/
+.venv/
