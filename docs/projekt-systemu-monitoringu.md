@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 3 · 2026-09-25**
+**Rewizja 3.1 · 2026-09-25**
 
 ---
 
@@ -23,7 +23,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 1.0 | 2026-08-27 | Projekt pierwotny: 9 archetypów wyceny, grupy peer, 7 wskaźników technicznych, reguły Turtle, kadencja |
 | 1.1 | 2026-08-27 | Po recenzji zewnętrznej: sygnał główny RVS zamiast reszty z regresji; wersja minimalna; kwarantanna; egzekucja transzowa; dostawa dzielona po krytyczności |
 | 2.0 | 2026-08-27 | Wielorynkowość i wielowalutowość; reverse DCF i MEROI; polityka alokacji; kadencja tygodniowa zamiast dobowej; weryfikacja Hostingera; pełny rejestr opcji odrzuconych; cztery zmienne stanu; korekty po recenzji Fable |
-| **3.0** | **2026-09-25** | **Stan infrastruktury po pomiarach: P-07 zamknięty, P-09 przeformułowany; §5.5 — osobny kontener PostgreSQL dla Mannaza zamiast wspólnej instancji z NocoDB; oryginał dokumentu w repo `mannaz`** |
+| 3.0 | 2026-09-25 | Stan infrastruktury po pomiarach: P-07 zamknięty, P-09 przeformułowany; §5.5 — osobny kontener PostgreSQL dla Mannaza zamiast wspólnej instancji z NocoDB; oryginał dokumentu w repo `mannaz` |
+| **3.1** | **2026-09-25** | **Stooq po pomiarze: dostęp skryptowy zablokowany JS proof-of-work, ścieżka `get_apikey` nie wydaje klucza; Stooq przechodzi do roli źródła ręcznego (§9.2, §9.3, §12, §25.2, §25.3, O-12, R-01, P-02, nowy P-12)** |
 
 ### 0.3 Oznaczenia
 
@@ -463,18 +464,25 @@ Do tego plan darmowy daje **2 lata historii** — za mało na jednoczesne SMA200
 
 ### 9.2 Zmiana wobec rewizji 1: Stooq się zdegradował
 
-**[Z2] Od marca 2026 Stooq wymaga klucza API**; od czerwca 2026 stosuje **site-wide JavaScript proof-of-work**. Klucz jest darmowy (CAPTCHA, 16 znaków, bez rejestracji), ale raportowane są awarie kluczy „due to IP or usage volume" i potrzeba ich odnawiania. Dzienny limit istniał od dawna, konkretna liczba nigdy nie została opublikowana.
+**[Z2] Od marca 2026 Stooq deklaruje klucz API**; od czerwca 2026 stosuje **site-wide JavaScript proof-of-work**. Według źródeł wtórnych klucz jest darmowy (CAPTCHA, bez rejestracji), a raportowane są awarie kluczy „due to IP or usage volume". Dzienny limit istniał od dawna, konkretna liczba nigdy nie została opublikowana.
 
-**Wniosek:** zapis z rewizji 1 „Stooq — fallback na ceny, niezależny od Yahoo" jest **nieaktualny**. Stooq nie jest już źródłem klasy „ustaw i zapomnij".
+**Pomiar 2026-09-25 [Z]** (stooq.pl: PKN; stooq.com: AAPL.US):
+- żądanie skryptowe (`curl.exe` z komputera ownera, bez klucza) na `q/d/l/?s=pkn&i=d` zwraca `200 text/html`, 796 znaków — stronę proof-of-work (SHA-256, prefiks 4 zer hex, weryfikacja przez `/__verify`), nie CSV;
+- przeglądarka pobiera CSV bez klucza i bez CAPTCHA, także w czystej sesji incognito;
+- ścieżka `?get_apikey` nie wyświetla formularza CAPTCHA (formularz istnieje w kodzie strony, ukryty) — klucza nie da się uzyskać.
 
-**Stooq zachowuje jednak jedną unikalną przewagę [Z2]:** parametr `o=` to **maska korekt korporacyjnych** — siedem znaków sterujących osobno splitem, dywidendami, prawami poboru, denominacją. To jedyne darmowe źródło dające tę kontrolę, co przy GPW (gdzie prawa poboru są częste) ma realną wartość. **Kierunek flagi wymaga weryfikacji empirycznej na spółce ze znanym splitem** (P-02) — pomyłka zatruwa cały szereg.
+Automatyczne rozwiązywanie proof-of-work w importerze jest obejściem zabezpieczenia antybotowego serwisu i nie wchodzi w grę.
+
+**Wniosek:** zapis z rewizji 1 „Stooq — fallback na ceny, niezależny od Yahoo" jest **nieaktualny**. Stooq jest **źródłem ręcznym** — pobieranym z przeglądarki do kontroli punktowych — i nie jest dostępny dla importera przy zerowym budżecie.
+
+**Stooq zachowuje jednak jedną unikalną przewagę [Z2]:** parametr `o=` to **maska korekt korporacyjnych** — siedem znaków sterujących osobno splitem, dywidendami, prawami poboru, denominacją. To jedyne darmowe źródło dające tę kontrolę, co przy GPW (gdzie prawa poboru są częste) ma realną wartość. **Kierunek flagi wymaga weryfikacji empirycznej na spółce ze znanym splitem** (P-02, wykonalny ręcznie w przeglądarce) — pomyłka zatruwa cały szereg.
 
 ### 9.3 Matryca źródeł
 
 | Warstwa | Źródło | Rola | Status |
 |---|---|---|---|
 | **Ceny EOD, wszystkie rynki** | **yfinance** | jedyne realne źródło jednolite | [Z] sufiksy |
-| Ceny — kontrola | Stooq z `apikey` (US, PL, UK, JP, HK, DE) | drugie źródło | [Z2] degradacja |
+| Ceny — kontrola | Stooq, pobieranie ręczne z przeglądarki (US, PL, UK, JP, HK, DE) | kontrola punktowa, poza importerem | [Z] pomiar 2026-09-25 (§9.2) |
 | Ceny — opcjonalnie USA | Massive Stocks Basic | wysoka jakość, tylko USA | [Z] |
 | Kalendarze sesyjne | `exchange_calendars` 4.13.2, Apache-2.0 | 62 kalendarze, w tym XWAR | [Z] |
 | **FX podstawa** | **NBP API tabela A** | wszystko → PLN, kurs urzędowy | [Z] |
@@ -610,7 +618,7 @@ Dodanie spółki jest operacją rutynową. Checklista — każdy punkt musi być
 |---|---|---|
 | 1 | `ticker_local`, `isin`, `exchange` (kod MIC) | MIC, nie nazwa potoczna |
 | 2 | **`currency`** i asercja wobec waluty giełdy | dla `.L` oczekiwane GBp, nie GBP |
-| 3 | Sufiks źródła cenowego per dostawca | Yahoo `.WA` ≠ Stooq (bez sufiksu na stooq.pl) ≠ Stooq.com (`.pl`) |
+| 3 | Sufiks źródła cenowego per dostawca | Yahoo `.WA` ≠ Stooq (bez sufiksu na stooq.pl); stooq.com: `pkn.pl` nie istnieje (pomiar 2026-09-25), zapis GPW do ustalenia — P-12 |
 | 4 | **`archetype`** z tabeli §14 | determinuje mnożnik, bramkę jakości i model absolutny |
 | 5 | **Grupa peer core (4–6)** z uzasadnieniem i datą `valid_from` | §15 |
 | 6 | **Benchmark zastępczy** — instrument dający tę samą ekspozycję prościej | §21.4 |
@@ -1154,7 +1162,7 @@ Etap 4  dopiero teraz zmiana progów
 
 | Element | Wersja minimalna | Wersja pełna |
 |---|---|---|
-| Ceny EOD | yfinance, wszystkie rynki | + Stooq jako kontrola |
+| Ceny EOD | yfinance, wszystkie rynki | + Stooq jako kontrola ręczna (§9.2) |
 | FX | NBP tabela A | + Frankfurter jako kontrola |
 | 7 wskaźników, 5 reguł ryzyka, sizing | w całości | bez zmian |
 | Mianowniki mnożników | **arkusz ręczny, kwartalnie** | pipeline SEC + XBRL PL |
@@ -1184,7 +1192,7 @@ Kryteria sformułowane jako **liczby przewidziane przed pomiarem, bez hedge'y**.
 **Realny horyzont po godzinach: 5–7 miesięcy do wersji pełnej, 5–8 weekendów do F3.** Nominalne „dwa weekendy" z rewizji 1 było zaniżone — test dwóch źródeł z założenia pali się czerwono do czasu napisania normalizatora konwencji, dochodzi walidacja wskaźników i pierwsze wypełnienie arkusza.
 
 **Gdzie projekt najprawdopodobniej umrze:**
-1. **Króliczy dół uzgadniania źródeł w F1.** Mitygacja: start na samym yfinance, Stooq jako logowana kontrola, akceptacja „szwy znane i opisane" zamiast twardego progu.
+1. **Króliczy dół uzgadniania źródeł w F1.** Mitygacja: start na samym yfinance, Stooq jako ręczna kontrola punktowa, akceptacja „szwy znane i opisane" zamiast twardego progu.
 2. **Rytuał kwartalny w drugim i trzecim kwartale**, gdy minie nowość. Mitygacja: stan `STALE` czyni zaniedbany arkusz widocznym zamiast cichej stęchlizny.
 3. **Kolejna runda recenzji zamiast kodu.**
 
@@ -1216,7 +1224,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 | # | Opcja | Powód odrzucenia | Co by musiało się zmienić |
 |---|---|---|---|
 | **O-11** | **Massive (Polygon) jako kręgosłup cenowy** | [Z] **Wyłącznie giełdy USA** — potwierdzone dwiema stronami dostawcy. Plan darmowy daje 2 lata historii, za mało na SMA200 + momentum + reżim RVS jednocześnie | Portfel wróciłby do wyłącznie amerykańskiego. Pozostaje **opcjonalnym źródłem wysokiej jakości dla części USA** |
-| **O-12** | **Stooq jako bezobsługowy fallback** | [Z2] Od III 2026 wymaga klucza API, od VI 2026 JS proof-of-work; klucze wymagają rotacji | Zostaje jako **kontrola z kosztem utrzymania** i jedyne źródło maski korekt `o=` |
+| **O-12** | **Stooq jako źródło importera (bezobsługowy fallback lub kontrola automatyczna)** | [Z] Pomiar 2026-09-25: żądanie skryptowe dostaje stronę JS proof-of-work zamiast CSV; ścieżka `get_apikey` nie wydaje klucza (§9.2) | Oficjalny, działający dostęp skryptowy (klucz albo API). Do tego czasu **źródło ręczne** i jedyne źródło maski korekt `o=` |
 | **O-13** | **Rezygnacja z forward P/E i konsensusu** | Amputowałaby EV/NTM Sales dla **NOW (największa pozycja, 9%)**, AXON, RBRK, RKLB, fwd P/E dla megacapów i NVO **oraz pierwszy człon bramki anty-pułapkowej** | Konsensus zostaje, z jawną flagą jakości `low` i **bez roli sygnałowej** (M28) |
 | **O-14** | Twelve Data / EODHD / Alpha Vantage / FMP / Tiingo | [Z] Odpowiednio: 3 giełdy na free; 20 wywołań/dzień i rok historii; 25/dzień; kalendarz i peers płatne przy Basic ograniczonym do próbki symboli; fundamenty jako płatny dodatek | Budżet płatny — wtedy porównać tiery pod kątem **pokrycia spoza USA** |
 | **O-15** | Płatne API za 19–25 USD/mies. jako rozwiązanie problemu danych | Nie kupuje danych **point-in-time** — plany retailowe podają bieżącą wersję, nie stan z dnia X; prawdziwe PIT kosztuje tysiące. **Archiwum od dnia zero potrzebne tak samo przy 0 jak przy 25 USD** | Decyzja po pierwszym kwartale, na **zmierzonym** czasie wpisu ręcznego |
@@ -1264,7 +1272,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 
 | # | Ryzyko | Klasa | Mitygacja |
 |---|---|---|---|
-| R-01 | **yfinance przestaje działać albo zmienia schemat** — nieoficjalne API, ToS „personal use only", zero SLA, a dla portfela wielorynkowego **jedyne jednolite źródło** | krytyczne | Cache z TTL, circuit breaker (T12), Stooq jako kontrola tam, gdzie pokrywa, stan `FAILED` zamiast cichego zera |
+| R-01 | **yfinance przestaje działać albo zmienia schemat** — nieoficjalne API, ToS „personal use only", zero SLA, a dla portfela wielorynkowego **jedyne jednolite źródło** | krytyczne | Cache z TTL, circuit breaker (T12), Stooq jako ręczna kontrola punktowa tam, gdzie pokrywa (automatycznej drugiej kontroli brak — §9.2), stan `FAILED` zamiast cichego zera |
 | R-02 | **Błąd jednostki waluty (GBX/GBP)** przechodzi wprost w sizing i stop — błąd 100× | krytyczne, ciche | Asercja waluty per giełda (T7), sanity-check `\|log return\| > 4` (T8) |
 | R-03 | **Zamrożony mnożnik** przy przechowywaniu mnożników zamiast mianowników | krytyczne, ciche | T17 |
 | R-04 | **Ujemny runway** przy `burn ≤ 0` wystawia zdrowe megacapy jako pułapkę | wysokie, ciche | T18 |
@@ -1288,7 +1296,7 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 | # | Pomiar | Test | Co zmienia |
 |---|---|---|---|
 | **P-01** | Źródło cen Franka i jego konwencja korekty | Odczyt **konfiguracji węzła** w workflow, nie nazwy | Rozstrzyga, czy jakikolwiek reuse feedu jest w ogóle rozważalny (§7.3) |
-| **P-02** | Kierunek flagi w masce `o=` Stooq | Pobranie spółki ze znanym splitem z `o=0000000` i `o=1111110`, porównanie z ceną przed splitem | Pomyłka zatruwa cały szereg GPW |
+| **P-02** | Kierunek flagi w masce `o=` Stooq | Ręczne pobranie z przeglądarki spółki ze znanym splitem z `o=0000000` i `o=1111110`, porównanie z ceną przed splitem | Pomyłka zatruwa cały szereg GPW |
 | **P-03** | **Czy HKD jest w tabeli A NBP** | `api.nbp.pl/api/exchangerates/rates/a/hkd/?format=json` — 404 oznacza tabelę B | Przy tabeli B kurs raz w tygodniu → Frankfurter jako podstawa dla HKD, z jawnym zapisem różnego fixingu |
 | **P-04** | Poprawność kalendarza XWAR | Różnica symetryczna między `XWAR.sessions_in_range()` a datami z pobranych szeregów | Kalendarz twierdzący, że była sesja, dla której nie ma danych, jest błędny albo dane mają dziurę |
 | **P-05** | **Rewalidacja całej tabeli peer** | Sprawdzenie istnienia i statusu każdego z ~150 tickerów | PARA już nie istnieje; WBD w trakcie zmian [N] |
@@ -1298,6 +1306,7 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 | **P-09** | Zapas RAM i dysku na VPS przy kontenerze Mannaza oraz szczyt Franka | Monitoring hPanel przez tydzień | Wartości `mem_limit:` i `cpus:` kontenera Mannaza (rew. 3: decyzja o upgrade KVM 1 → KVM 2 nieaktualna — VPS to KVM 2) |
 | **P-10** | Efektywna liczba zakładów po korelacji | PCA na ≥120 zwrotach tygodniowych, shrinkage | HHI daje 21,5 **wg wag**; po korelacji będzie istotnie niżej. **Zmienia sizing** |
 | **P-11** | Realny czas wpisu ręcznego mianowników | Chronometraż pierwszego kwartału | Próg decyzji o płatnym API (O-15) |
+| **P-12** | Zapis symboli GPW na stooq.com | Wyszukiwarka symboli stooq.com dla PKN; porównanie szeregu ze stooq.pl | Rozstrzyga wiersz 3 checklisty §12 (pomiar 2026-09-25: `pkn.pl` nie istnieje) |
 
 **Pytania otwarte, należące do właściciela:**
 
