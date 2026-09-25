@@ -1,0 +1,66 @@
+//@version=6
+// MANNAZ — eksport dziennych OHLC, batch A (16 spolek US)
+//
+// Wykres bazowy: AMEX:SPY, interwal 1D.
+//   - korekta o dywidendy WYLACZONA (T6: szereg do stopow i ATR)
+//   - bez przeliczania waluty
+//   - sesja zwykla, bez extended hours
+//   - przewinac w lewo do ~2022-09 (ok. 1000 sesji) PRZED eksportem
+//
+// OHLC samego SPY wychodzi do CSV automatycznie i sluzy jako benchmark (M57/M58).
+// Eksport: menu "..." -> Export chart data...
+
+indicator("Mannaz OHLC · US batch A", overlay = false, max_bars_back = 5000)
+
+f(simple string sym) =>
+    request.security(sym, timeframe.period, [high, low, close], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+D = display.data_window
+
+[h01, l01, c01] = f("NYSE:NOW")
+plot(h01, "NOW_h", display = D), plot(l01, "NOW_l", display = D), plot(c01, "NOW_c", display = D)
+
+[h02, l02, c02] = f("NASDAQ:META")
+plot(h02, "META_h", display = D), plot(l02, "META_l", display = D), plot(c02, "META_c", display = D)
+
+[h03, l03, c03] = f("NYSE:SE")
+plot(h03, "SE_h", display = D), plot(l03, "SE_l", display = D), plot(c03, "SE_c", display = D)
+
+[h04, l04, c04] = f("NASDAQ:MELI")
+plot(h04, "MELI_h", display = D), plot(l04, "MELI_l", display = D), plot(c04, "MELI_c", display = D)
+
+[h05, l05, c05] = f("NASDAQ:MSFT")
+plot(h05, "MSFT_h", display = D), plot(l05, "MSFT_l", display = D), plot(c05, "MSFT_c", display = D)
+
+[h06, l06, c06] = f("NYSE:NU")
+plot(h06, "NU_h", display = D), plot(l06, "NU_l", display = D), plot(c06, "NU_c", display = D)
+
+[h07, l07, c07] = f("NASDAQ:MARA")
+plot(h07, "MARA_h", display = D), plot(l07, "MARA_l", display = D), plot(c07, "MARA_c", display = D)
+
+[h08, l08, c08] = f("NYSE:KKR")
+plot(h08, "KKR_h", display = D), plot(l08, "KKR_l", display = D), plot(c08, "KKR_c", display = D)
+
+[h09, l09, c09] = f("NASDAQ:AMZN")
+plot(h09, "AMZN_h", display = D), plot(l09, "AMZN_l", display = D), plot(c09, "AMZN_c", display = D)
+
+[h10, l10, c10] = f("NYSE:BABA")
+plot(h10, "BABA_h", display = D), plot(l10, "BABA_l", display = D), plot(c10, "BABA_c", display = D)
+
+[h11, l11, c11] = f("NYSE:UBER")
+plot(h11, "UBER_h", display = D), plot(l11, "UBER_l", display = D), plot(c11, "UBER_c", display = D)
+
+[h12, l12, c12] = f("NYSE:RBRK")
+plot(h12, "RBRK_h", display = D), plot(l12, "RBRK_l", display = D), plot(c12, "RBRK_c", display = D)
+
+[h13, l13, c13] = f("NASDAQ:DLO")
+plot(h13, "DLO_h", display = D), plot(l13, "DLO_l", display = D), plot(c13, "DLO_c", display = D)
+
+[h14, l14, c14] = f("NYSE:CRCL")
+plot(h14, "CRCL_h", display = D), plot(l14, "CRCL_l", display = D), plot(c14, "CRCL_c", display = D)
+
+[h15, l15, c15] = f("NASDAQ:ACMR")
+plot(h15, "ACMR_h", display = D), plot(l15, "ACMR_l", display = D), plot(c15, "ACMR_c", display = D)
+
+[h16, l16, c16] = f("NYSE:NVO")
+plot(h16, "NVO_h", display = D), plot(l16, "NVO_l", display = D), plot(c16, "NVO_c", display = D)

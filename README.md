@@ -12,7 +12,7 @@ prawdy, nie ten plik.
 | `docs/decyzje.md` | dziennik decyzji: data, decyzja, kto, uzasadnienie |
 | `docs/backlog.md` | backlog; zamknięcie pozycji zmienia `status`, wiersz zostaje |
 | `docs/oceny/` | notatki z ocen poszczególnych walorów |
-| `scripts/pine/` | skrypty Pine (TradingView) — eksport OHLC z TradingView: us_b (QQQ + 16 spółek), us_c (SPY + RRX i benchmarki zastępcze), eu_2 (ASML + BESI/ADYEN/IFX); batch A brak |
+| `scripts/pine/` | skrypty Pine (TradingView) — eksport OHLC z TradingView: us_a (SPY + 16 spółek), us_b (QQQ + 16 spółek), us_c (SPY + RRX i benchmarki zastępcze), eu_2 (ASML + BESI/ADYEN/IFX); CSU osobnym eksportem wykresu TSX:CSU |
 
 Od pierwszego commita to repo jest oryginałem dokumentu projektowego. Kopia w projekcie
 Claude jest jego pochodną i przy rozbieżności przegrywa.
