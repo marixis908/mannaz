@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4 · 2026-09-26**
+**Rewizja 4.1 · 2026-09-26**
 
 ---
 
@@ -25,7 +25,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 2.0 | 2026-08-27 | Wielorynkowość i wielowalutowość; reverse DCF i MEROI; polityka alokacji; kadencja tygodniowa zamiast dobowej; weryfikacja Hostingera; pełny rejestr opcji odrzuconych; cztery zmienne stanu; korekty po recenzji Fable |
 | 3.0 | 2026-09-25 | Stan infrastruktury po pomiarach: P-07 zamknięty, P-09 przeformułowany; §5.5 — osobny kontener PostgreSQL dla Mannaza zamiast wspólnej instancji z NocoDB; oryginał dokumentu w repo `mannaz` |
 | 3.1 | 2026-09-25 | Stooq po pomiarze: dostęp skryptowy zablokowany JS proof-of-work, ścieżka `get_apikey` nie wydaje klucza; Stooq przechodzi do roli źródła ręcznego (§9.2, §9.3, §12, §25.2, §25.3, O-12, R-01, P-02, nowy P-12) |
-| **4** | **2026-09-26** | **Klucz przypisania archetypu §14.1 (kalibracja 17/20), archetyp A0, reguła „klucz proponuje, rejestracja decyduje" (§12, M76), progi klucza T34–T37, instrumenty pochodne §19.4, erratum §19.3 (zapadka Chandeliera od inicjalizacji), O-45** |
+| 4 | 2026-09-26 | Klucz przypisania archetypu §14.1 (kalibracja 17/20), archetyp A0, reguła „klucz proponuje, rejestracja decyduje" (§12, M76), progi klucza T34–T37, instrumenty pochodne §19.4, erratum §19.3 (zapadka Chandeliera od inicjalizacji), O-45 |
+| **4.1** | **2026-09-26** | **§19.4: wartość rachunku KONTRAKTOWY w kapitale satelity = środki ogółem łącznie z depozytem zablokowanym; wynik zmienny rozliczany dziennie w środkach, bez osobnego doliczania (pomiar CC-R K2)** |
 
 ### 0.3 Oznaczenia
 
@@ -978,7 +979,7 @@ Poziom 3: suma otwartych ryzyk       ≤ 15%
 - Ekspozycja kontraktu terminowego = liczba × mnożnik × kurs instrumentu bazowego, w PLN.
 - ATR, stop i REGIME liczy się na instrumencie bazowym.
 - Ryzyko = (close bazy − stop) × liczba × mnożnik; dla pozycji krótkiej lustrzanie, ze stopem nad ceną.
-- Kontrakty wchodzą do budżetów ryzyka poziomów 1–3. Nominał kontraktu nie wchodzi do kapitału satelity; wchodzi wartość rachunku KONTRAKTOWY (środki + wynik zmienny).
+- Kontrakty wchodzą do budżetów ryzyka poziomów 1–3. Nominał kontraktu nie wchodzi do kapitału satelity; wchodzi wartość rachunku KONTRAKTOWY = środki ogółem łącznie z depozytem zablokowanym. Broker rozlicza wynik zmienny codziennie w środkach, więc nie dolicza się go osobno.
 - Seria wygasła bez transakcji zamykającej jest zamykana w dniu wygaśnięcia (trzeci piątek miesiąca serii). Archetyp kontraktu to A0 (§14.1, pytanie 1); archetyp bazy jest zapisywany w `archetype_secondary` jako informacja.
 
 ---

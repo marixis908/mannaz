@@ -29,3 +29,5 @@ wskazuje, co zastępuje.
 | 2026-09-26 | GMT: akcje z preIPO wprowadzone bilansem otwarcia (ilość i koszt podane przez ownera); SHO → CBF, parytet połączenia 0,2281:1 | owner | ilości i koszty tylko w data/manual (poza gitem) |
 | 2026-09-26 | Rozjazd „42 pozycje ZAGRANICZNY” z czatu 24.09 zamknięty jako błąd po stronie czatu; FIFO = broker jest pomiarem | owner | B2: ilości 39/39 |
 | 2026-09-25 (wieczór) | Repo `marixis908/mannaz` **publiczne**; dane finansowe poza gitem od pierwszego commita | owner | uchyla wpis 2026-09-25 „repo prywatne”; pomiar 2026-09-26: raw.githubusercontent.com/…/README.md → 200 bez uwierzytelnienia |
+| 2026-09-26 | Rew. 4.1: wartość rachunku KONTRAKTOWY = środki ogółem z depozytem, bez osobnego wyniku zmiennego (pomiar CC-R K2) | nadzorca | saldo z historii = PODSUMOWANIE brokera co do grosza; wynik zmienny rozliczany dziennie w środkach; §19.4 rew. 4.1 |
+| 2026-09-26 | Mnożniki serii kontraktów ze specyfikacji GPW (sql/007), heurystyka odrzucona | nadzorca | brak mnożnika = błąd z nazwą serii; `instruments.multiplier_source` z URL/komunikatem GPW |
