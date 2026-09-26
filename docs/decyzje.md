@@ -28,3 +28,4 @@ wskazuje, co zastępuje.
 | 2026-09-26 | CBF = A2 (klucz v2 przyjęty); ponowna kalibracja po danych FY2026 bez konsolidacji Vercom | owner | archetype_override_reason pozostaje pusty |
 | 2026-09-26 | GMT: akcje z preIPO wprowadzone bilansem otwarcia (ilość i koszt podane przez ownera); SHO → CBF, parytet połączenia 0,2281:1 | owner | ilości i koszty tylko w data/manual (poza gitem) |
 | 2026-09-26 | Rozjazd „42 pozycje ZAGRANICZNY” z czatu 24.09 zamknięty jako błąd po stronie czatu; FIFO = broker jest pomiarem | owner | B2: ilości 39/39 |
+| 2026-09-25 (wieczór) | Repo `marixis908/mannaz` **publiczne**; dane finansowe poza gitem od pierwszego commita | owner | uchyla wpis 2026-09-25 „repo prywatne”; pomiar 2026-09-26: raw.githubusercontent.com/…/README.md → 200 bez uwierzytelnienia |
