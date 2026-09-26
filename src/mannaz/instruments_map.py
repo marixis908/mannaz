@@ -71,6 +71,7 @@ IDENTITY_CONFIRMATION_REQUIRED = frozenset({"MDV", "GMT"})
 FUTURES_MULTIPLIER_OVERRIDES: dict[str, Decimal | None] = {
     "PGE": Decimal(1000),
     "CDR": Decimal(100),
+    "MDV": Decimal(100),  # owner 2026-09-26
 }
 
 # Normalizacja fullExchangeName z yfinance do krótkich kodów używanych też w

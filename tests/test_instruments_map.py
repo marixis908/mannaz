@@ -94,10 +94,10 @@ def test_futures_base_mapping_cdr_known_multiplier():
 
 
 def test_futures_base_mapping_unknown_base_multiplier_none_and_flagged():
-    base_symbol, multiplier, note = futures_base_mapping("FMDVZ26")
-    assert base_symbol == "MDV.WA"
+    base_symbol, multiplier, note = futures_base_mapping("FXYZZ26")
+    assert base_symbol == "XYZ.WA"
     assert multiplier is None
-    assert "MDV" in note
+    assert "XYZ" in note
 
 
 def test_futures_base_mapping_unrecognized_series_code():
