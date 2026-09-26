@@ -8,7 +8,7 @@ prawdy, nie ten plik.
 
 | ścieżka | zawartość |
 |---|---|
-| `docs/projekt-systemu-monitoringu.md` | dokument projektowy (rewizja 2) — źródło prawdy metody |
+| `docs/projekt-systemu-monitoringu.md` | dokument projektowy (rewizja 4) — źródło prawdy metody |
 | `docs/decyzje.md` | dziennik decyzji: data, decyzja, kto, uzasadnienie |
 | `docs/backlog.md` | backlog; zamknięcie pozycji zmienia `status`, wiersz zostaje |
 | `docs/oceny/` | notatki z ocen poszczególnych walorów |

@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 3.1 · 2026-09-25**
+**Rewizja 4 · 2026-09-26**
 
 ---
 
@@ -24,7 +24,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 1.1 | 2026-08-27 | Po recenzji zewnętrznej: sygnał główny RVS zamiast reszty z regresji; wersja minimalna; kwarantanna; egzekucja transzowa; dostawa dzielona po krytyczności |
 | 2.0 | 2026-08-27 | Wielorynkowość i wielowalutowość; reverse DCF i MEROI; polityka alokacji; kadencja tygodniowa zamiast dobowej; weryfikacja Hostingera; pełny rejestr opcji odrzuconych; cztery zmienne stanu; korekty po recenzji Fable |
 | 3.0 | 2026-09-25 | Stan infrastruktury po pomiarach: P-07 zamknięty, P-09 przeformułowany; §5.5 — osobny kontener PostgreSQL dla Mannaza zamiast wspólnej instancji z NocoDB; oryginał dokumentu w repo `mannaz` |
-| **3.1** | **2026-09-25** | **Stooq po pomiarze: dostęp skryptowy zablokowany JS proof-of-work, ścieżka `get_apikey` nie wydaje klucza; Stooq przechodzi do roli źródła ręcznego (§9.2, §9.3, §12, §25.2, §25.3, O-12, R-01, P-02, nowy P-12)** |
+| 3.1 | 2026-09-25 | Stooq po pomiarze: dostęp skryptowy zablokowany JS proof-of-work, ścieżka `get_apikey` nie wydaje klucza; Stooq przechodzi do roli źródła ręcznego (§9.2, §9.3, §12, §25.2, §25.3, O-12, R-01, P-02, nowy P-12) |
+| **4** | **2026-09-26** | **Klucz przypisania archetypu §14.1 (kalibracja 17/20), archetyp A0, reguła „klucz proponuje, rejestracja decyduje" (§12, M76), progi klucza T34–T37, instrumenty pochodne §19.4, erratum §19.3 (zapadka Chandeliera od inicjalizacji), O-45** |
 
 ### 0.3 Oznaczenia
 
@@ -619,7 +620,7 @@ Dodanie spółki jest operacją rutynową. Checklista — każdy punkt musi być
 | 1 | `ticker_local`, `isin`, `exchange` (kod MIC) | MIC, nie nazwa potoczna |
 | 2 | **`currency`** i asercja wobec waluty giełdy | dla `.L` oczekiwane GBp, nie GBP |
 | 3 | Sufiks źródła cenowego per dostawca | Yahoo `.WA` ≠ Stooq (bez sufiksu na stooq.pl); stooq.com: `pkn.pl` nie istnieje (pomiar 2026-09-25), zapis GPW do ustalenia — P-12 |
-| 4 | **`archetype`** z tabeli §14 | determinuje mnożnik, bramkę jakości i model absolutny |
+| 4 | **`archetype`** — klucz §14.1 proponuje, rejestracja decyduje (M76) | zapisywane: `archetype_key` (wynik klucza z odpowiedziami na pytania 1–9), `archetype` (decyzja), `archetype_secondary`, przy rozbieżności `archetype_override_reason`; determinuje mnożnik, bramkę jakości i model absolutny |
 | 5 | **Grupa peer core (4–6)** z uzasadnieniem i datą `valid_from` | §15 |
 | 6 | **Benchmark zastępczy** — instrument dający tę samą ekspozycję prościej | §21.4 |
 | 7 | **Teza + 2–3 kryteria falsyfikacji**, zapisane przed pierwszym sygnałem | §20.4 |
@@ -630,6 +631,8 @@ Dodanie spółki jest operacją rutynową. Checklista — każdy punkt musi być
 | 12 | Pierwszy przebieg w trybie `shadow` — instrument nie generuje alertów przez 2 tygodnie | |
 
 **T29.** Instrument bez kompletu 1–11 ma stan `UNKNOWN` we wszystkich czterech wymiarach i **nie wchodzi do statystyk portfelowych**.
+
+**M76.** Klucz §14.1 **proponuje** archetyp, rejestracja (pole `archetype`) **decyduje**. Rozbieżność klucz ≠ rejestracja jest dozwolona wyłącznie z flagą i pisemnym uzasadnieniem (`archetype_override_reason`) i jest wykazywana przy każdej kalibracji klucza.
 
 ## 13. Jakość danych i degradacja
 
@@ -653,7 +656,7 @@ Dodanie spółki jest operacją rutynową. Checklista — każdy punkt musi być
 
 ## 14. Archetypy wyceny
 
-Każdy instrument ma dokładnie jeden archetyp. Archetyp determinuje **trzy rzeczy naraz**: mnożnik główny, bramkę jakości i model wyceny absolutnej.
+Każdy instrument satelity ma dokładnie jeden archetyp **główny**, zaproponowany kluczem §14.1 i zatwierdzony przy rejestracji (§12, M76). Przy dwóch segmentach o porównywalnej wadze obowiązuje archetyp segmentu z większym zyskiem brutto, a drugi segment trafia do pola `archetype_secondary` (tylko do bramki jakości, nie do mnożnika). Archetyp determinuje **trzy rzeczy naraz**: mnożnik główny, bramkę jakości i model wyceny absolutnej.
 
 | # | Archetyp | Mnożnik główny | Zmienna towarzysząca | Bramka jakości (M15) | Model absolutny |
 |---|---|---|---|---|---|
@@ -668,6 +671,35 @@ Każdy instrument ma dokładnie jeden archetyp. Archetyp determinuje **trzy rzec
 | A9 | Capex-heavy / przemysł | EV/EBIT, EV/NTM Sales | marża brutto, backlog | backlog, book-to-bill, marża brutto, cash burn | reverse DCF na marży |
 
 **Czego nie używać, per archetyp:** A3 i A4 — P/E i EV/EBITDA; A5 — EV/EBITDA i EV/Sales (EV nie ma sensu, gdy dług jest surowcem); A7 — GAAP P/E (carry i konsolidacja czynią go bez treści); A8 — P/E i P/B (po ASU 2023-08 zysk jest funkcją ceny aktywa, nie operacji); A9 — samo EV/EBITDA (ukrywa zużycie majątku).
+
+### 14.1 Klucz przypisania archetypu
+
+Pytania zadaje się w podanej kolejności; pierwsze „tak" rozstrzyga. Dla konglomeratu odpowiedź dotyczy segmentu dominującego (T37). Gdy żaden segment nie dominuje, rozstrzyga segment z większym zyskiem brutto, a drugi trafia do `archetype_secondary`.
+
+1. Kontrakt terminowy, ETF, fundusz albo certyfikat **w satelicie**? → **A0**. Instrumenty rdzenia są poza §14.
+2. Aktywa krypto na bilansie są główną ekspozycją? → **A8**.
+3. Wynik zależy od marży odsetkowej i strat kredytowych na własnej książce? → **A5**.
+4. Przychód to opłaty od zarządzanych aktywów (FRE) i carry? → **A7**.
+5. Przychód = wolumen płatności × take-rate, bez własnej książki? → **A6**.
+6. Przychód = GMV × take-rate, bez własnego zapasu? → **A4**.
+7. Oprogramowanie (SaaS, licencja z maintenance, platforma komunikacyjna CPaaS) z przychodem powtarzalnym co najmniej na progu T35? Do przychodu powtarzalnego wlicza się subskrypcję, ARR i przychód użyciowy na umowach. Subskrypcja treści albo usług niebędących oprogramowaniem nie spełnia tego pytania. → EBIT < 0: **A3**, inaczej **A2**.
+8. Kapitalizacja co najmniej na progu T34 i EBIT > 0 w trzech ostatnich latach obrotowych? → **A1**.
+9. Capex/przychód powyżej progu T36 **albo** backlog, portfel zamówień, order intake lub book-to-bill raportowane jako KPI? RPO się nie liczy. → **A9**.
+10. Żadne → **A0**.
+
+**EBIT** w kluczu to Operating Income według GAAP/MSSF (w yfinance pole `Operating Income`), a nie pole `EBIT` dostawcy.
+
+**A0 — bez modelu wyceny.** Alerty wycenowe wyłączone; technika (§18) i ryzyko (§19) działają.
+
+**Kalibracja 2026-09-26.** Klucz odtwarza 17 z 20 przypadków jednoznacznych z testu na składzie satelity; predykcja ≥ 18/20 chybiona. Rozbieżne: ACMR i MKSI (klucz A0) oraz IFX (klucz A1). Rejestracja nadaje im A9 z uzasadnieniem „cykliczny półprzewodnik — bramka book-to-bill / zamówienia" (M76). Niezależność kalibracji jest częściowa: recenzent stosujący klucz widział tabelę §15.1 z archetypami.
+
+**T34.** Próg kapitalizacji w pytaniu 8: ≥ 30 mld USD dla spółek z USA, Europy i Kanady; ≥ 5 mld PLN dla GPW. [S] Przegląd: następna kalibracja klucza.
+
+**T35.** Próg przychodu powtarzalnego w pytaniu 7: ≥ 70 % przychodu ostatniego roku obrotowego. [S] Przegląd: następna kalibracja klucza.
+
+**T36.** Próg capex w pytaniu 9: capex/przychód > 10 % w ostatnim roku obrotowym (yfinance: `Capital Expenditure` / `Total Revenue`). [S] Przegląd: następna kalibracja klucza.
+
+**T37.** Segment dominujący konglomeratu: > ~60 % przychodu albo zysku. [S] Przegląd: następna kalibracja klucza.
 
 ## 15. Grupy peer
 
@@ -938,8 +970,16 @@ Poziom 3: suma otwartych ryzyk       ≤ 15%
 **M51.** System startuje na istniejących pozycjach z historycznymi wejściami, a wszystkie reguły są pisane dla wejść nowych. Semantyka inicjalizacji:
 
 - Pozycje **już poniżej** poziomu stopu w dniu pierwszym → stan `RISK = HIGH` i **jednorazowy raport inicjalizacyjny**, nie 31 alertów. Alert właściwy dopiero przy kolejnym przecięciu.
-- Stop 2N od historycznego wejścia dla pozycji z dużym zyskiem jest **martwy** — zastępowany przez Chandelier od maksimum posiadania.
+- Stop 2N od historycznego wejścia dla pozycji z dużym zyskiem jest **martwy** — zastępowany przez Chandelier z §19.1 (`max(high,22) − 3×ATR22`), z zapadką „nigdy w dół" biegnącą od dnia inicjalizacji systemu.
 - Raport inicjalizacyjny jest **poza limitem 15 alertów miesięcznie** i występuje dokładnie raz.
+
+### 19.4 Instrumenty pochodne
+
+- Ekspozycja kontraktu terminowego = liczba × mnożnik × kurs instrumentu bazowego, w PLN.
+- ATR, stop i REGIME liczy się na instrumencie bazowym.
+- Ryzyko = (close bazy − stop) × liczba × mnożnik; dla pozycji krótkiej lustrzanie, ze stopem nad ceną.
+- Kontrakty wchodzą do budżetów ryzyka poziomów 1–3. Nominał kontraktu nie wchodzi do kapitału satelity; wchodzi wartość rachunku KONTRAKTOWY (środki + wynik zmienny).
+- Seria wygasła bez transakcji zamykającej jest zamykana w dniu wygaśnięcia (trzeci piątek miesiąca serii). Archetyp kontraktu to A0 (§14.1, pytanie 1); archetyp bazy jest zapisywany w `archetype_secondary` jako informacja.
 
 ---
 
@@ -1234,6 +1274,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 | **O-19** | `pandas_market_calendars` | Od v2.0 lustrzanie odbija `exchange_calendars`, czyli warstwa pośrednia bez własnego źródła prawdy; wydanie starsze o 14 miesięcy | Nic |
 | **O-20** | FRED jako główne źródło FX | [Z] Brak dziennej serii dla złotego; aktualizacja tygodniowa | Zmiana waluty bazowej |
 | **O-21** | exchangerate.host / Wise / ExchangeRate-API | [Z] 100 zapytań/miesiąc; wymaga tokenu konta; brak szeregów historycznych | Nic |
+| **O-45** | S&P / Kensho (Capital IQ przez MCP) jako źródło danych fundamentalnych | Wymaga płatnego konta; brak konta (decyzja 2026-09-25) | Budżet na dane > 0 |
 
 ### 26.3 Model analityczny
 
