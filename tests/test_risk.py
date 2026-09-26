@@ -7,16 +7,22 @@ import statistics
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from mannaz.risk import (
+    aggregate_risk_budgets,
     chandelier_hold,
     chandelier_series,
+    check_kontraktowy_coverage,
     compute_risk_native,
     compute_theme_budgets,
     compute_weighted_entry_price,
     gbp_pence_factor,
     is_breached,
     is_regime,
+    is_risk_budget_eligible,
     is_warning,
+    kontraktowy_account_value,
     level1_check,
     level3_check,
     log_returns,
@@ -388,3 +394,168 @@ def test_resolve_default_date_picks_latest_date_without_null_close():
 
 def test_resolve_default_date_all_null_returns_none():
     assert resolve_default_date([(date(2026, 9, 25), True)]) is None
+
+
+# ---------------------------------------------------------------------------
+# is_risk_budget_eligible (§19.4, brief CC-R) — equity/etf spoza core LUB future
+# ---------------------------------------------------------------------------
+
+
+def test_is_risk_budget_eligible_equity_etf_non_core_and_future_only():
+    assert is_risk_budget_eligible("equity", is_core=False) is True
+    assert is_risk_budget_eligible("etf", is_core=False) is True
+    assert is_risk_budget_eligible("equity", is_core=True) is False  # core -> nie
+    assert is_risk_budget_eligible("future", is_core=False) is True
+    assert is_risk_budget_eligible("certificate", is_core=False) is False
+
+
+# ---------------------------------------------------------------------------
+# aggregate_risk_budgets (brief CC-R (e)) — kontrakt w heat/temacie/poziomie 1,
+# pozycja core wykluczona z budżetów
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_risk_budgets_future_enters_heat_theme_and_level1_core_excluded():
+    items = [
+        ("AAA", "equity", False, Decimal(500), "tech"),
+        ("FUT1", "future", False, Decimal(1500), "tech"),
+        ("CORE1", "equity", True, Decimal(9999), "tech"),  # core -> wykluczony z budzetow
+    ]
+    result = aggregate_risk_budgets(items, Decimal(100000))
+
+    # poziom 3 (heat) — kontrakt wchodzi ryzykiem, pozycja core pominieta
+    assert result.satellite_risk_total == Decimal(2000)
+    assert result.total_risk_pct == Decimal(2)
+    assert result.level3_breach is False
+
+    # poziom 2 (temat) — kontrakt wchodzi do sumy tematu
+    assert result.theme_budgets["tech"].risk_pct == Decimal(2)
+    assert result.theme_budgets["tech"].breach is False
+
+    # poziom 1 — kontrakt liczony, core -> (None, None)
+    assert result.level1_results[0] == (Decimal("0.5"), False)
+    assert result.level1_results[1] == (Decimal("1.5"), True)
+    assert result.level1_results[2] == (None, None)
+    assert result.level1_breach_tickers == ["FUT1"]
+
+
+def test_aggregate_risk_budgets_short_future_mirrored_risk_enters_heat():
+    """Kontrakt krotki: stop nad cena (lustrzane ryzyko wzgledem long) —
+    compute_risk_native -> risk_pln -> wchodzi do heat na tych samych zasadach
+    co long."""
+    risk_native, below_stop = compute_risk_native(
+        close_d=Decimal(100), stop_eff=Decimal(110), qty_abs=Decimal(3), multiplier=Decimal(10), is_short=True
+    )
+    assert risk_native == Decimal(300)  # (110-100)*3*10
+    assert below_stop is False
+
+    items = [("FSHORT", "future", False, risk_native, "energy")]
+    result = aggregate_risk_budgets(items, Decimal(100000))
+    assert result.satellite_risk_total == Decimal(300)
+    assert result.theme_budgets["energy"].risk_pct == Decimal("0.3")
+
+
+def test_aggregate_risk_budgets_multiplier_missing_risk_none_is_skipped():
+    items = [("FMISS", "future", False, None, "tech")]
+    result = aggregate_risk_budgets(items, Decimal(100000))
+    assert result.satellite_risk_total == Decimal(0)
+    assert result.level1_results == [(None, None)]
+    assert "tech" not in result.theme_budgets
+
+
+# ---------------------------------------------------------------------------
+# kontraktowy_account_value (brief CC-R (a)/(g), §19.4 + decyzja nadzorcy K3)
+# — srodki ogolem lacznie z depozytem zablokowanym; nominal kupna/sprzedazy
+# NIE jest przeplywem srodkow, liczy sie wylacznie prowizja jako koszt.
+# ---------------------------------------------------------------------------
+
+
+def _kontraktowy_row(
+    transaction_date, row_type, amount, qty=None, price=None, multiplier=None, currency="PLN", broker_ticker="FSYN1"
+):
+    return {
+        "transaction_date": transaction_date,
+        "currency": currency,
+        "row_type": row_type,
+        "amount": Decimal(amount),
+        "qty": Decimal(qty) if qty is not None else None,
+        "price": Decimal(price) if price is not None else None,
+        "multiplier": Decimal(multiplier) if multiplier is not None else None,
+        "broker_ticker": broker_ticker,
+    }
+
+
+def test_kontraktowy_account_value_kupno_sprzedaz_only_commission_deposits_and_transfers_passthrough():
+    rows = [
+        # kupno: nominal 3*100*10=3000, prowizja 15 -> amount = -(3000+15)
+        _kontraktowy_row(date(2026, 1, 10), "kupno", "-3015", qty=3, price=100, multiplier=10),
+        # sprzedaz: nominal 2*50*10=1000, prowizja 20 -> amount = +(1000+20)
+        _kontraktowy_row(date(2026, 1, 15), "sprzedaz", "1020", qty=2, price=50, multiplier=10),
+        _kontraktowy_row(date(2026, 1, 20), "depozyt_doplata", "500"),
+        _kontraktowy_row(date(2026, 1, 25), "przelew_wewnetrzny", "-200"),
+    ]
+    # nominal (3000, 1000) NIE wchodzi -> tylko -15 (prowizja kupno) - 20 (prowizja sprzedaz) + 500 - 200
+    assert kontraktowy_account_value(rows, as_of=date(2026, 1, 25)) == Decimal(265)
+
+
+def test_kontraktowy_account_value_filters_by_as_of():
+    rows = [
+        _kontraktowy_row(date(2026, 1, 10), "kupno", "-3015", qty=3, price=100, multiplier=10),
+        _kontraktowy_row(date(2026, 1, 15), "sprzedaz", "1020", qty=2, price=50, multiplier=10),
+        _kontraktowy_row(date(2026, 1, 20), "depozyt_doplata", "500"),
+        _kontraktowy_row(date(2026, 1, 25), "przelew_wewnetrzny", "-200"),  # po as_of, pominiety
+    ]
+    assert kontraktowy_account_value(rows, as_of=date(2026, 1, 20)) == Decimal(465)
+
+
+def test_kontraktowy_account_value_missing_multiplier_raises_value_error_with_series_name():
+    # K4b: brak instruments.multiplier -> wyraźny błąd z nazwą serii, bez zgadywania
+    rows = [_kontraktowy_row(date(2026, 2, 1), "sprzedaz", "10025", qty=1, price=100, multiplier=None, broker_ticker="FEXP1")]
+    with pytest.raises(ValueError, match="FEXP1"):
+        kontraktowy_account_value(rows, as_of=date(2026, 2, 1))
+
+
+def test_kontraktowy_account_value_ignores_manual_non_cash_rows():
+    # K4c: wiersze ręczne niosą koszt dla FIFO, nie przepływ gotówki -> saldo bez zmian
+    base = [
+        _kontraktowy_row(date(2026, 1, 10), "kupno", "-3015", qty=3, price=100, multiplier=10),
+        _kontraktowy_row(date(2026, 1, 20), "depozyt_zwrot", "500"),
+    ]
+    manual = [
+        _kontraktowy_row(date(2026, 1, 5), "bilans_otwarcia", "-1000", qty=1, price=1000),
+        _kontraktowy_row(date(2026, 1, 6), "zamiana_wydanie", "700", qty=1, price=700),
+        _kontraktowy_row(date(2026, 1, 6), "zamiana_przyjecie", "-700", qty=1, price=700),
+    ]
+    assert kontraktowy_account_value(base + manual, as_of=date(2026, 1, 20)) == kontraktowy_account_value(
+        base, as_of=date(2026, 1, 20)
+    ) == Decimal(485)
+
+
+def test_kontraktowy_account_value_other_currency_raises_value_error():
+    rows = [_kontraktowy_row(date(2026, 1, 10), "kupno", "-3015", qty=3, price=100, multiplier=10, currency="USD")]
+    with pytest.raises(ValueError, match="USD"):
+        kontraktowy_account_value(rows, as_of=date(2026, 1, 10))
+
+
+# ---------------------------------------------------------------------------
+# check_kontraktowy_coverage (brief CC-R (b)) — nigdy cichego zera
+# ---------------------------------------------------------------------------
+
+
+def test_check_kontraktowy_coverage_no_rows_raises_runtime_error():
+    with pytest.raises(RuntimeError):
+        check_kontraktowy_coverage(n_rows=0, max_date=None, has_open_futures=True, as_of=date(2026, 9, 25))
+    with pytest.raises(RuntimeError):
+        check_kontraktowy_coverage(n_rows=0, max_date=None, has_open_futures=False, as_of=date(2026, 9, 25))
+
+
+def test_check_kontraktowy_coverage_stale_history_with_open_futures_raises_runtime_error():
+    with pytest.raises(RuntimeError):
+        check_kontraktowy_coverage(n_rows=5, max_date=date(2026, 9, 20), has_open_futures=True, as_of=date(2026, 9, 25))
+
+
+def test_check_kontraktowy_coverage_ok_cases_do_not_raise():
+    # historia siega D
+    check_kontraktowy_coverage(n_rows=5, max_date=date(2026, 9, 25), has_open_futures=True, as_of=date(2026, 9, 25))
+    # historia sprzed D, ale brak otwartych kontraktow -> nie ma czego rozliczac codziennie
+    check_kontraktowy_coverage(n_rows=5, max_date=date(2026, 9, 20), has_open_futures=False, as_of=date(2026, 9, 25))

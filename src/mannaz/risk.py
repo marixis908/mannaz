@@ -45,7 +45,22 @@ NIE na samym kontrakcie — kontrakt sam nie ma serii cenowej w Yahoo (patrz
 NATOMIAST na transakcjach KONTRAKTU (jednostki kontraktu GPW dla akcji są w tej
 samej skali co akcja bazowa — `cena kontraktu` z tytułu transakcji brokera to
 przybliżenie ceny bazy, nie osobna waluta/skala). `multiplier IS NULL`
-(FMDVZ26 na dziś) -> ryzyko NULL, `multiplier_missing=True`, wyłączone z sum."""
+(kontrakty wygasłe) -> ryzyko NULL, `multiplier_missing=True`, wyłączone z sum.
+
+CC-R, krok K4 (§19.4 dokumentu projektowego — kontrakty w budżetach ryzyka):
+kontrakty terminowe WCHODZĄ do budżetów poziomów 1-3 (`is_risk_budget_eligible`
+= equity/etf spoza core LUB future) ryzykiem (`risk_pln`), analogicznie do
+akcji/ETF satelitarnych — ale ich NOMINAŁ nigdy nie wchodzi do kapitału
+satelity (kapitał liczy tylko wartość pozycji equity/etf spoza core, patrz
+komentarz przy `capital_satelite_positions_pln` w `run_risk`). Zamiast
+nominału do kapitału satelity wchodzi WARTOŚĆ RACHUNKU KONTRAKTOWY (decyzja
+nadzorcy K3): środki ogółem łącznie z depozytem zablokowanym, liczone przez
+`kontraktowy_account_value` z historii `transactions` (rachunek KONTRAKTOWY) —
+wynik zmienny NIE jest doliczany osobno, bo broker rozlicza go już codziennie
+w środkach (wiersze `depozyt_doplata`/`depozyt_zwrot`). `capital_by_rachunek`
+i metryki ZAGRANICZNY (wagi pozycji/below_stop/below_chandelier_hold w %
+wartości) pozostają BEZ ZMIAN — kontrakty tam nie wchodzą, tylko w budżety
+i w łączny kapitał satelity (`capital_satelite_pln`)."""
 
 from __future__ import annotations
 
@@ -400,6 +415,147 @@ def compute_theme_budgets(
 
 
 # ---------------------------------------------------------------------------
+# Budżety §19.2/§19.4 (brief CC-R) — kontrakty terminowe WCHODZĄ do budżetów
+# poziomów 1-3 ryzykiem (risk_pln), obok akcji/ETF satelitarnych spoza core;
+# NIE wchodzą do wag pozycji/kapitału/metryk ZAGRANICZNY (bez zmian, patrz
+# `run_risk`).
+# ---------------------------------------------------------------------------
+
+
+def is_risk_budget_eligible(instrument_type: str, is_core: bool) -> bool:
+    """§19.4: (equity/etf spoza core) LUB future — jedyne dwa typy pozycji,
+    które wchodzą do budżetów ryzyka poziomów 1-3. Certyfikaty/inne typy oraz
+    pozycje core (SPYI/V80A/V60A) — nie."""
+    return (instrument_type in ("equity", "etf") and not is_core) or instrument_type == "future"
+
+
+@dataclass
+class RiskBudgetAggregateResult:
+    satellite_risk_total: Decimal
+    total_risk_pct: Decimal | None
+    level3_breach: bool | None
+    theme_budgets: dict[str, ThemeBudgetResult]
+    level1_results: list[tuple[Decimal | None, bool | None]]
+    level1_breach_tickers: list[str]
+
+
+def aggregate_risk_budgets(
+    items: list[tuple[str, str, bool, Decimal | None, str | None]],
+    capital: Decimal | None,
+) -> RiskBudgetAggregateResult:
+    """Czysta funkcja (brief CC-R (e)) — agreguje budżety poziomów 1-3 z listy
+    `items` = (broker_ticker, instrument_type, is_core, risk_pln, theme), JEDEN
+    element per policzalna pozycja z `run_risk` (kolejność = kolejność
+    `computed`). Eligibility per element liczona wewnątrz
+    (`is_risk_budget_eligible`) — pozwala wywołać tę funkcję z pełnej listy
+    pozycji (equity/etf/future/inne) bez wstępnego filtrowania przez wołającego.
+    `level1_results` wyrównane indeksem do `items` (żeby dało się przypisać
+    z powrotem `risk_pct_satellite_capital`/`level1_breach` do wierszy bez
+    grupowania po tickerze — ten sam ticker może wystąpić w kilku wierszach)."""
+    satellite_risk_total = Decimal(0)
+    ticker_risk_pln_for_themes: list[tuple[str, Decimal | None]] = []
+    ticker_to_theme: dict[str, str] = {}
+    level1_results: list[tuple[Decimal | None, bool | None]] = []
+    level1_breach_tickers: list[str] = []
+
+    for ticker, instrument_type, is_core, risk_pln, theme in items:
+        eligible = is_risk_budget_eligible(instrument_type, is_core)
+
+        if eligible and risk_pln is not None:
+            satellite_risk_total += risk_pln
+
+        if eligible:
+            ticker_risk_pln_for_themes.append((ticker, risk_pln))
+            if theme is not None:
+                ticker_to_theme[ticker] = theme
+
+        if eligible and risk_pln is not None and capital:
+            pct, breach = level1_check(risk_pln, capital)
+            level1_results.append((pct, breach))
+            if breach:
+                level1_breach_tickers.append(ticker)
+        else:
+            level1_results.append((None, None))
+
+    total_risk_pct, level3_breach = level3_check(satellite_risk_total, capital)
+    theme_budgets = compute_theme_budgets(ticker_risk_pln_for_themes, ticker_to_theme, capital)
+
+    return RiskBudgetAggregateResult(
+        satellite_risk_total=satellite_risk_total,
+        total_risk_pct=total_risk_pct,
+        level3_breach=level3_breach,
+        theme_budgets=theme_budgets,
+        level1_results=level1_results,
+        level1_breach_tickers=level1_breach_tickers,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rachunek KONTRAKTOWY — wartość rachunku (brief CC-R, §19.4 + decyzja
+# nadzorcy K3): środki ogółem łącznie z depozytem zablokowanym. Nominał
+# kupna/sprzedaży NIE jest przepływem środków (broker rozlicza wynik zmienny
+# codziennie w środkach przez wiersze depozyt_doplata/depozyt_zwrot) — z
+# wiersza kupno/sprzedaz liczy się WYŁĄCZNIE prowizja, zawsze jako koszt.
+# ---------------------------------------------------------------------------
+
+# Wiersze ręczne (opening_balances.py) NIE są przepływem gotówki: `amount`
+# niesie koszt lotu dla FIFO, nie ruch środków (nadzorca, K5a/K4c).
+NON_CASH_ROW_TYPES = frozenset({"bilans_otwarcia", "zamiana_przyjecie", "zamiana_wydanie"})
+
+
+def kontraktowy_account_value(rows: list[dict[str, Any]], as_of: date) -> Decimal:
+    """rows: [{'transaction_date','currency','row_type','amount','qty','price',
+    'multiplier','broker_ticker'}] z rachunku KONTRAKTOWY, nieposortowane.
+    Suma dla transaction_date <= as_of wg reguł: kupno/sprzedaz -> tylko
+    prowizja jako koszt (nominał pomijany; mnożnik wyłącznie z
+    `instruments.multiplier` — brak -> ValueError z nazwą serii, K4b);
+    NON_CASH_ROW_TYPES -> pomijane; pozostałe row_type -> amount bez zmian.
+    Wszystkie wiersze muszą być w PLN -> ValueError w przeciwnym razie."""
+    total = Decimal(0)
+    for row in rows:
+        if row["transaction_date"] > as_of or row["row_type"] in NON_CASH_ROW_TYPES:
+            continue
+        if row["currency"] != "PLN":
+            raise ValueError(
+                f"KONTRAKTOWY: oczekiwano waluty PLN, otrzymano {row['currency']} dla "
+                f"{row.get('broker_ticker')} @ {row['transaction_date']}"
+            )
+        if row["row_type"] in ("kupno", "sprzedaz"):
+            multiplier = row["multiplier"]
+            if multiplier is None:
+                raise ValueError(
+                    f"KONTRAKTOWY: brak mnoznika (instruments.multiplier IS NULL) dla serii "
+                    f"{row.get('broker_ticker')} @ {row['transaction_date']} — uzupelnij ze "
+                    "specyfikacji GPW (sql/007_futures_multipliers.sql), bez zgadywania."
+                )
+            commission = abs(row["amount"]) - row["qty"] * row["price"] * multiplier
+            total -= commission
+        else:
+            total += row["amount"]
+    return total
+
+
+def check_kontraktowy_coverage(n_rows: int, max_date: date | None, has_open_futures: bool, as_of: date) -> None:
+    """Kontrola pokrycia historii KONTRAKTOWY do D (brief CC-R (b)) — nigdy
+    cichego zera. `n_rows`/`max_date` liczone na wierszach z
+    transaction_date <= as_of (patrz `_kontraktowy_rows`). RuntimeError gdy:
+    brak historii KONTRAKTOWY do D w ogóle, albo (przy otwartych kontraktach)
+    historia nie sięga D — broker księguje rozliczenie każdej sesji, więc brak
+    wiersza na D przy otwartych pozycjach oznacza niekompletne dane."""
+    if n_rows == 0:
+        raise RuntimeError(
+            f"KONTRAKTOWY: brak historii transakcji do D={as_of} — nie da sie ustalic "
+            "wartosci rachunku kontraktowego (nigdy cicho 0)."
+        )
+    if has_open_futures and (max_date is None or max_date < as_of):
+        raise RuntimeError(
+            f"KONTRAKTOWY: historia nie obejmuje D={as_of} (ostatni wiersz: {max_date}) "
+            "przy otwartych kontraktach terminowych — broker ksieguje rozliczenie kazdej "
+            "sesji, brak wiersza na D oznacza niekompletne dane."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cena wejścia ważona pozostałymi lotami FIFO (brief P4.1) — NIEZALEŻNA od
 # fifo.compute_position (patrz docstring modułu: potrzebujemy dat REMAINING
 # lotów, nie "pierwszy/ostatni kupno w całej historii", i kosztu opartego na
@@ -568,6 +724,11 @@ class RiskSummary:
     futures_nominal_sanity: dict[str, bool] = field(default_factory=dict)
     excluded_no_price_tickers: list[str] = field(default_factory=list)
     theme_budgets: dict[str, ThemeBudgetResult] = field(default_factory=dict)
+    # CC-R (§19.4): kapitał satelity = wartość pozycji (equity/etf spoza core,
+    # BEZ futures) + wartość rachunku KONTRAKTOWY (nominał futures nie wchodzi).
+    capital_satelite_positions_pln: Decimal = Decimal(0)
+    kontraktowy_account_value_pln: Decimal = Decimal(0)
+    capital_satelite_pln: Decimal = Decimal(0)
 
 
 def resolve_default_risk_date(conn: psycopg.Connection) -> date | None:
@@ -692,6 +853,27 @@ def _earliest_prior_risk_date(
     return row[0] if row else None
 
 
+def _kontraktowy_rows(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
+    """Wszystkie wiersze `transactions` rachunku KONTRAKTOWY do dnia D
+    włącznie (`transaction_date <= as_of`), z `instruments.multiplier`
+    doklejonym LEFT JOIN (NULL -> błąd w `kontraktowy_account_value`;
+    mnożniki serii ze specyfikacji GPW, sql/007). Wejście dla `kontraktowy_account_value` /
+    `check_kontraktowy_coverage`."""
+    cur.execute(
+        """
+        SELECT t.transaction_date, t.currency, t.row_type, t.amount, t.qty, t.price,
+               i.multiplier, i.broker_ticker
+        FROM transactions t
+        LEFT JOIN instruments i ON i.id = t.instrument_id
+        WHERE t.rachunek LIKE %s AND t.transaction_date <= %s
+        ORDER BY t.transaction_date, t.id
+        """,
+        (f"{KONTRAKTOWY_PREFIX}%", as_of),
+    )
+    cols = ("transaction_date", "currency", "row_type", "amount", "qty", "price", "multiplier", "broker_ticker")
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
 def _fx_rate_on_or_before(cur: psycopg.Cursor, currency: str, target_date: date) -> tuple[Decimal | None, date | None]:
     if currency == "PLN":
         return Decimal(1), target_date
@@ -724,7 +906,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
         }
 
         capital_by_rachunek: dict[str, Decimal] = {}
-        capital_total = Decimal(0)
+        capital_satelite_positions_pln = Decimal(0)
         positions_count_by_rachunek: dict[str, int] = {}
 
         computed: list[dict[str, Any]] = []
@@ -915,23 +1097,40 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
             )
             computed.append(row)
 
-            # --- kapitał satelity: equity/etf, is_core=false, BEZ futures ---
+            # --- kapitał satelity: equity/etf, is_core=false, BEZ futures
+            # (§19.4 CC-R: nominał futures NIE wchodzi do kapitału satelity —
+            # zamiast niego wchodzi wartość rachunku KONTRAKTOWY, patrz niżej). ---
             if instrument_type in ("equity", "etf") and not is_core and close_d is not None and fx_rate is not None:
                 value_pln = close_d * qty * fx_rate
-                capital_total += value_pln
+                capital_satelite_positions_pln += value_pln
                 capital_by_rachunek[rachunek] = capital_by_rachunek.get(rachunek, Decimal(0)) + value_pln
                 positions_count_by_rachunek[rachunek] = positions_count_by_rachunek.get(rachunek, 0) + 1
                 summary.capital_satelite_positions_total += 1
 
-        # --- druga faza: budżety poziom 1/3, agregaty raportu (satellite only) ---
-        satellite_risk_total = Decimal(0)
+        # --- kapitał satelity CC-R (§19.4 + decyzja nadzorcy K3): pozycje
+        # equity/etf (wyżej) + wartość rachunku KONTRAKTOWY (środki ogółem
+        # łącznie z depozytem zablokowanym; wynik zmienny już w niej —
+        # patrz docstring modułu / kontraktowy_account_value). Kontrola
+        # pokrycia PRZED liczeniem wartości — nigdy cichego zera. ---
+        kontraktowy_rows = _kontraktowy_rows(cur, as_of)
+        has_open_futures = any(p["instrument_type"] == "future" for p in positions)
+        max_kontraktowy_date = max((r["transaction_date"] for r in kontraktowy_rows), default=None)
+        check_kontraktowy_coverage(len(kontraktowy_rows), max_kontraktowy_date, has_open_futures, as_of)
+        kontraktowy_value_pln = kontraktowy_account_value(kontraktowy_rows, as_of)
+
+        summary.capital_satelite_positions_pln = capital_satelite_positions_pln
+        summary.kontraktowy_account_value_pln = kontraktowy_value_pln
+        capital_satelite_pln = capital_satelite_positions_pln + kontraktowy_value_pln
+        summary.capital_satelite_pln = capital_satelite_pln
+
+        # --- druga faza: budżety poziom 1/3 (satelita + futures, §19.4) i
+        # agregaty raportu ZAGRANICZNY (bez zmian, kontrakty tam nie wchodzą). ---
         satellite_risk_zagraniczny = Decimal(0)
         satellite_value_zagraniczny = Decimal(0)
         satellite_value_zagraniczny_below_hold = Decimal(0)
         satellite_value_zagraniczny_below_stop = Decimal(0)
         stop_source_counts: dict[str, int] = {}
-        ticker_risk_pln_for_themes: list[tuple[str, Decimal | None]] = []
-        ticker_to_theme: dict[str, str] = {}
+        budget_items: list[tuple[str, str, bool, Decimal | None, str | None]] = []
 
         for row in computed:
             if isinstance(row, dict):
@@ -952,21 +1151,26 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                 summary.multiplier_missing_tickers.append(row.broker_ticker)
 
             is_zagraniczny = row.rachunek.upper().startswith("ZAGRANICZNY")
+            # Wagi pozycji/kapitał/metryki ZAGRANICZNY: BEZ ZMIAN wobec P4.1 —
+            # kontrakty tam NIE wchodzą (brief CC-R (c)/(d)), inaczej niż
+            # budżety poziom 1-3 (patrz budget_items/aggregate_risk_budgets).
             is_satellite_capital_eligible = row.instrument_type in ("equity", "etf") and not row.is_core
 
             if is_zagraniczny and row.below_stop:
                 summary.below_stop_zagraniczny_tickers.append(row.broker_ticker)
 
-            if is_satellite_capital_eligible and row.risk_pln is not None:
-                satellite_risk_total += row.risk_pln
-                if is_zagraniczny:
-                    satellite_risk_zagraniczny += row.risk_pln
+            if is_satellite_capital_eligible and is_zagraniczny and row.risk_pln is not None:
+                satellite_risk_zagraniczny += row.risk_pln
 
-            if is_satellite_capital_eligible:
-                ticker_risk_pln_for_themes.append((row.broker_ticker, row.risk_pln))
-                pos_theme = instrument_theme_by_id.get(row.instrument_id)
-                if pos_theme is not None:
-                    ticker_to_theme[row.broker_ticker] = pos_theme
+            budget_items.append(
+                (
+                    row.broker_ticker,
+                    row.instrument_type,
+                    row.is_core,
+                    row.risk_pln,
+                    instrument_theme_by_id.get(row.instrument_id),
+                )
+            )
 
             if (
                 is_satellite_capital_eligible
@@ -984,9 +1188,14 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
         summary.capital_satelite_positions_by_rachunek = positions_count_by_rachunek
         summary.stop_source_counts = stop_source_counts
 
-        pct_total, breach3 = level3_check(satellite_risk_total, capital_total)
-        summary.total_risk_pct_satellite_capital = pct_total
-        summary.level3_breach = breach3
+        # --- Poziomy 1/3 (§19.2/§19.4, kapitał = capital_satelite_pln) + poziom
+        # 2 (tematy) — czysta agregacja (brief CC-R (e)), testowalna bez bazy. ---
+        budget_result = aggregate_risk_budgets(budget_items, capital_satelite_pln)
+        summary.total_risk_pct_satellite_capital = budget_result.total_risk_pct
+        summary.level3_breach = budget_result.level3_breach
+        summary.theme_budgets = budget_result.theme_budgets
+        summary.level1_breach_tickers = budget_result.level1_breach_tickers
+
         pct_zagr, _ = level3_check(satellite_risk_zagraniczny, _sum_zagraniczny_capital(capital_by_rachunek))
         summary.total_risk_pct_zagraniczny_satellite_capital = pct_zagr
 
@@ -998,20 +1207,12 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                 satellite_value_zagraniczny_below_stop / satellite_value_zagraniczny * Decimal(100)
             )
 
-        # --- Poziom 2 (§19.2): suma ryzyka per temat jako % kapitału satelity,
-        # flaga > 3% (instruments.theme, sql/seed_themes.sql — 53 nazwy). ---
-        summary.theme_budgets = compute_theme_budgets(ticker_risk_pln_for_themes, ticker_to_theme, capital_total)
-
-        for row in computed:
-            if isinstance(row, dict):
-                continue
-            is_satellite_capital_eligible = row.instrument_type in ("equity", "etf") and not row.is_core
-            if is_satellite_capital_eligible and row.risk_pln is not None and capital_total:
-                pct1, breach1 = level1_check(row.risk_pln, capital_total)
-                row.risk_pct_satellite_capital = pct1
-                row.level1_breach = breach1
-                if breach1:
-                    summary.level1_breach_tickers.append(row.broker_ticker)
+        # level1_results wyrównane indeksem do budget_items (patrz docstring
+        # aggregate_risk_budgets) -> ten sam porządek co non_dict_rows.
+        non_dict_rows = [r for r in computed if not isinstance(r, dict)]
+        for row, (pct1, breach1) in zip(non_dict_rows, budget_result.level1_results):
+            row.risk_pct_satellite_capital = pct1
+            row.level1_breach = breach1
 
         # --- kontrolka nominału P4.2: FPGEZ26/FCDRZ26 (multiplier znany) ---
         for row in computed:
