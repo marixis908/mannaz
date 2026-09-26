@@ -6,6 +6,13 @@
 -- v2 order: 1-6, 7 (A2/A3), 9 (A1), 8 (A9), else A0.
 -- source_tags: Z = yfinance measured, W = business-model judgement, N = unknown.
 -- Status [W]; owner approval pending. Idempotent.
+-- NOTE (D2, brief CC-P6): to jest tylko wynik klucza (co klucz "proponuje").
+-- Rejestracja §12 (co "decyduje") żyje w kolumnach archetype_key /
+-- archetype_override_reason, dodanych i wypełnionych przez
+-- sql/006_archetype_key_override.sql, który MUSI być zastosowany PO tym
+-- pliku (także po każdym ponownym zastosowaniu tego seedu) — inaczej
+-- poza_14 nie zostanie zwinięte do A0 dla satelity i rejestracja ACMR/
+-- MKSI/IFX (A9) wróci do wyniku klucza (A0/A0/A1).
 INSERT INTO archetype_assignments (instrument_id, archetype, archetype_secondary, answers,
     resolution, key_version, source_tags, valid_from, reason)
 SELECT i.id, v.arch, v.sec, v.answers, v.res, 'v2', v.tags, DATE '2026-09-26', v.reason
