@@ -193,7 +193,7 @@ def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary
             """
             SELECT DISTINCT t.rachunek, t.instrument_id, t.currency
             FROM transactions t
-            WHERE t.row_type IN ('kupno', 'sprzedaz') AND t.instrument_id IS NOT NULL
+            WHERE t.row_type IN ('kupno', 'sprzedaz', 'bilans_otwarcia') AND t.instrument_id IS NOT NULL
             """
         )
         groups = cur.fetchall()
@@ -211,13 +211,13 @@ def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary
                 SELECT transaction_date, row_type, qty, amount
                 FROM transactions
                 WHERE rachunek = %s AND instrument_id = %s AND currency = %s
-                  AND row_type IN ('kupno', 'sprzedaz')
+                  AND row_type IN ('kupno', 'sprzedaz', 'bilans_otwarcia')
                 ORDER BY transaction_date, id
                 """,
                 (rachunek, instrument_id, currency),
             )
             rows = [
-                {"date": d, "type": rt, "qty": qty, "amount": abs(amount)}
+                {"date": d, "type": "kupno" if rt == "bilans_otwarcia" else rt, "qty": qty, "amount": abs(amount)}
                 for d, rt, qty, amount in cur.fetchall()
             ]
 
