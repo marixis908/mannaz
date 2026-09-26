@@ -5,12 +5,20 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 prices [--instrument-ids ID [ID ...]] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     python -m mannaz.run_p3 fx [--currencies USD EUR ...] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     python -m mannaz.run_p3 calendar
+    python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
 
 Bez argumentów `--instrument-ids`/`--currencies`/`--start`/`--end`, `prices` i
 `fx` robią PEŁNE pobranie (wszystkie zmapowane instrumenty / wszystkie 9 walut,
 2023-10-01 -> dziś) — brief P3 zastrzega, że pełne pobranie wykonuje inny
 agent; do próby na małym podzbiorze użyj `--instrument-ids` / `--currencies`.
-"""
+
+`risk` (brief CC-P, P4.1/P4.2, §19 dokumentu projektowego) bez `--date`
+liczy D = ostatnia sesja, dla której WSZYSTKIE instrumenty satelity z cenami
+NA TĘ DATĘ mają niepusty close_split_adj (patrz `risk.resolve_default_risk_date`
+i uwaga [Z] w brief P4.1 — dziś to zazwyczaj D-1 względem najnowszego wiersza
+`prices_daily`, bo Yahoo bywa zwraca świece bez zamknięcia). Wynik: agregaty
+WYŁĄCZNIE (liczby pozycji, listy tickerów, procenty kapitału satelity) —
+NIGDY per-pozycji ilości/koszty/kwoty (zasada projektu)."""
 
 from __future__ import annotations
 
@@ -24,6 +32,7 @@ from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
 from mannaz.instruments_map import run_instrument_mapping
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
 from mannaz.prices import run_prices_fetch
+from mannaz.risk import run_risk
 
 
 def _parse_date(value: str) -> date:
@@ -116,6 +125,40 @@ def cmd_calendar(args: argparse.Namespace) -> None:
             print(f"  id={r.instrument_id} ticker={r.broker_ticker} note={r.note}")
 
 
+def cmd_risk(args: argparse.Namespace) -> None:
+    conn = get_connection()
+    try:
+        summary = run_risk(conn, as_of=args.date)
+    finally:
+        conn.close()
+
+    # Wyłącznie agregaty — bez ilości/kosztów/kwot per pozycja (zasada projektu).
+    print(f"D: {summary.risk_date}")
+    print(f"n_positions: {len(summary.rows)} (+{len(summary.excluded_no_price_tickers)} bez ceny/bazy na D)")
+    print(f"kapital_satelity_pozycje: {summary.capital_satelite_positions_total} "
+          f"(per rachunek: {summary.capital_satelite_positions_by_rachunek})")
+    print(f"below_stop (RISK=HIGH) ogolem: {len(summary.below_stop_tickers)} {summary.below_stop_tickers}")
+    print(f"below_stop ZAGRANICZNY: {len(summary.below_stop_zagraniczny_tickers)} {summary.below_stop_zagraniczny_tickers}")
+    print(f"pct_wartosci_ZAGRANICZNY_satelity_pod_stop_effective: {summary.zagraniczny_satellite_value_pct_below_stop}")
+    print(f"stop_source_counts: {summary.stop_source_counts}")
+    print(f"heat_pct_kapital_satelity_ogolem: {summary.total_risk_pct_satellite_capital}")
+    print(f"heat_pct_kapital_satelity_ZAGRANICZNY: {summary.total_risk_pct_zagraniczny_satellite_capital}")
+    print(f"level3_breach (>15%): {summary.level3_breach}")
+    print(f"level1_breach_tickers (>1%): {summary.level1_breach_tickers}")
+    print(f"REGIME: {summary.regime_tickers}")
+    print(f"OSTRZEZENIE: {summary.warning_tickers}")
+    print(f"liczba_pod_chandelier_from_entry: {len(summary.below_chandelier_from_entry_tickers)} {summary.below_chandelier_from_entry_tickers}")
+    print(f"liczba_pod_chandelier_hold (wariant B): {len(summary.variant_b_tickers)} {summary.variant_b_tickers}")
+    print(f"wariant_B_pct_wartosci_ZAGRANICZNY_satelity: {summary.variant_b_zagraniczny_satellite_value_pct}")
+    print("tematy_pct_kapital_satelity (poziom 2, prog >3%):")
+    for theme, result in sorted(summary.theme_budgets.items()):
+        print(f"  {theme}: {result.risk_pct} breach={result.breach}")
+    print(f"multiplier_missing: {summary.multiplier_missing_tickers}")
+    print(f"futures_nominal_sanity (dodatni i rzedu 1e4-1e6): {summary.futures_nominal_sanity}")
+    if summary.excluded_no_price_tickers:
+        print(f"wykluczone_brak_ceny_na_D: {summary.excluded_no_price_tickers}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Brief CC-P, faza P3 (ceny i FX)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -143,6 +186,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_cal = sub.add_parser("calendar", help="P3.4 — porownanie dat cenowych z exchange_calendars")
     p_cal.set_defaults(func=cmd_calendar)
+
+    p_risk = sub.add_parser("risk", help="P4.1/P4.2 — ATR/stopy/REGIME/ryzyko PLN per pozycja (risk_daily)")
+    p_risk.add_argument(
+        "--date", type=_parse_date, default=None,
+        help="D; domyslnie ostatnia sesja z kompletnymi close_split_adj dla satelity"
+    )
+    p_risk.set_defaults(func=cmd_risk)
 
     return parser
 
