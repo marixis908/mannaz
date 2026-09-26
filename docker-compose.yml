@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: mannaz-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mannaz
+      POSTGRES_USER: mannaz
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - mannaz_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mannaz -d mannaz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mannaz_pgdata:
+    name: mannaz_pgdata
