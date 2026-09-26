@@ -246,6 +246,21 @@ def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary
                 pos.qty, instrument_type, contract_expiry, as_of
             )
 
+            # certificate redemption (wykup) closes the whole position when no
+            # transaction follows it
+            cur.execute(
+                """
+                SELECT 1 FROM corporate_events c
+                WHERE c.instrument_id = %s AND c.event_type = 'certificate_redemption'
+                  AND c.event_date <= %s
+                  AND c.event_date >= (SELECT max(transaction_date) FROM transactions
+                                       WHERE instrument_id = %s AND row_type IN ('kupno', 'sprzedaz'))
+                """,
+                (instrument_id, as_of, instrument_id),
+            )
+            if not expired_closed and effective_qty != 0 and cur.fetchone():
+                effective_qty, expired_closed = 0, True
+
             if expired_closed:
                 expired_counts[rachunek] = expired_counts.get(rachunek, 0) + 1
                 cur.execute(
