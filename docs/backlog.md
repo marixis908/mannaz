@@ -19,3 +19,5 @@ i uzupełnia datę — wiersz zostaje.
 | B-12 | Kapitał satelity: wartość rachunku KONTRAKTOWY (środki + wynik zmienny) zgodnie z §19.4 | otwarte | 2026-09-26 |  | [N] kod dziś jej nie dolicza |
 | B-13 | Ryzyko kontraktów poza heat i poza budżetem tematów w `risk.py` — sprzeczne z §19.4 | otwarte | 2026-09-26 |  | pomiar D=2026-09-24: heat satelity 3,251 % bez kontraktów vs 3,997 % z kontraktami |
 | B-14 | Poza zakresem przekroju B/R/K (brief CC-P): pipeline cykliczny F0–F6, RVS, alerty, reverse DCF, baza na VPS | otwarte | 2026-09-26 |  | osobne briefy |
+| B-15 | NU: średnia brokera wyższa o 0,06 USD/szt. od kosztu rezydualnego FIFO | otwarte | 2026-09-26 |  | [N]; hipoteza: prowizje/opłaty wliczone przez brokera w koszt jednego lotu; test: przeliczenie FIFO NU z opłatami |
+| B-16 | Porównanie FIFO z eksportem pozycji brokera jako moduł w `src\` (dziś skrypt `tmp\przekroj\compare_b2.py`, poza gitem) | otwarte | 2026-09-26 |  | warunek powtarzalnej kontroli P2.6 (B-08) |

@@ -1,12 +1,13 @@
 -- P4.3 themes for level-2 risk budget (§19.2, <= 3% of satellite capital per theme).
--- Status [W]: proposed by review-fable 2026-09-26, accepted by main session as
--- working version; owner approval pending (brief CC-P §5). Idempotent.
+-- Proposed by review-fable 2026-09-26; approved by owner 2026-09-26 (brief CC-P6
+-- pt 1.2: 14 themes, ORCL/IFX -> semi/AI-infra, UBER -> platformy-US,
+-- TSLA -> auto/autonomia; fix-up F: VRC -> software). Idempotent.
 UPDATE instruments i SET theme = t.theme
 FROM (VALUES
   ('ACMR','semi/AI-infra'),('APH','semi/AI-infra'),('ASML','semi/AI-infra'),('BESI','semi/AI-infra'),
   ('IFX','semi/AI-infra'),('MKSI','semi/AI-infra'),('NVDA','semi/AI-infra'),('ORCL','semi/AI-infra'),
   ('ACP','GPW-tech'),('CBF','GPW-tech'),('SGN','GPW-tech'),('SHO','GPW-tech'),('TXT','GPW-tech'),
-  ('VRC','GPW-tech'),('FCDRZ26','GPW-tech'),
+  ('VRC','software'),('FCDRZ26','GPW-tech'),
   ('CSU','software'),('NOW','software'),('RBRK','software'),('TEM','software'),
   ('AMZN','platformy-US'),('META','platformy-US'),('NFLX','platformy-US'),('UBER','platformy-US'),
   ('COIN','krypto'),('CRCL','krypto'),('ETFBTCPL','krypto'),('MARA','krypto'),

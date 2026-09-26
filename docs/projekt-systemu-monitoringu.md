@@ -693,13 +693,13 @@ Pytania zadaje się w podanej kolejności; pierwsze „tak" rozstrzyga. Dla kong
 
 **Kalibracja 2026-09-26.** Klucz odtwarza 17 z 20 przypadków jednoznacznych z testu na składzie satelity; predykcja ≥ 18/20 chybiona. Rozbieżne: ACMR i MKSI (klucz A0) oraz IFX (klucz A1). Rejestracja nadaje im A9 z uzasadnieniem „cykliczny półprzewodnik — bramka book-to-bill / zamówienia" (M76). Niezależność kalibracji jest częściowa: recenzent stosujący klucz widział tabelę §15.1 z archetypami.
 
-**T34.** Próg kapitalizacji w pytaniu 8: ≥ 30 mld USD dla spółek z USA, Europy i Kanady; ≥ 5 mld PLN dla GPW. [W] Przegląd: następna kalibracja klucza.
+**T34.** Próg kapitalizacji w pytaniu 8: ≥ 30 mld USD dla spółek z USA, Europy i Kanady; ≥ 5 mld PLN dla GPW. [S] Przegląd: następna kalibracja klucza.
 
-**T35.** Próg przychodu powtarzalnego w pytaniu 7: ≥ 70 % przychodu ostatniego roku obrotowego. [W] Przegląd: następna kalibracja klucza.
+**T35.** Próg przychodu powtarzalnego w pytaniu 7: ≥ 70 % przychodu ostatniego roku obrotowego. [S] Przegląd: następna kalibracja klucza.
 
-**T36.** Próg capex w pytaniu 9: capex/przychód > 10 % w ostatnim roku obrotowym (yfinance: `Capital Expenditure` / `Total Revenue`). [W] Przegląd: następna kalibracja klucza.
+**T36.** Próg capex w pytaniu 9: capex/przychód > 10 % w ostatnim roku obrotowym (yfinance: `Capital Expenditure` / `Total Revenue`). [S] Przegląd: następna kalibracja klucza.
 
-**T37.** Segment dominujący konglomeratu: > ~60 % przychodu albo zysku. [W] Przegląd: następna kalibracja klucza.
+**T37.** Segment dominujący konglomeratu: > ~60 % przychodu albo zysku. [S] Przegląd: następna kalibracja klucza.
 
 ## 15. Grupy peer
 
