@@ -15,9 +15,11 @@ syntetyczny. Zero ilości/kosztów/kwot ownera drukowanych z tych testów."""
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -432,5 +434,94 @@ def test_9_check_ignored_denied_no_file_written_ascii_error_exit_nonzero(db_conn
         assert result.error_message.startswith("ERROR: report path not git-ignored:")
         assert result.error_message.isascii()
         assert not reports_dir.exists(), "Q3: check-ignore odmowa -> katalog raportow NIE tworzony"
+    finally:
+        conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Z2 (brief CC-C fix) — raport tygodniowy nigdy nie ujawnia numeru rachunku,
+# nawet z REALNYMI kontami z `transactions` (nie tylko syntetycznym `TEST
+# 000001` powyżej).
+# ---------------------------------------------------------------------------
+
+
+def _z2_import_new_instrument(tmp_path: Path, label: str, rachunek: str, order_no: str, isin_suffix: str) -> Path:
+    """Buduje plik incoming z zakupem NOWEGO (nigdy wcześniej niezaimportowanego)
+    instrumentu na `rachunek` — wzór `test_3_new_instrument_...` powyżej, ale
+    na realnym rachunku (zamiast syntetycznego `TEST 000001`), żeby
+    `registration_gaps` (brief C4) wygenerował wiersz z prawdziwym numerem
+    rachunku w `state.registration_queue`, jeśli maskowanie (`account_label`)
+    nie działałoby."""
+    incoming = tmp_path / f"incoming_{label}"
+    incoming.mkdir()
+    content = (
+        "Data;Rachunek;Waluta;Tytuł operacji;Wartość\n"
+        f"01.03.1990;{rachunek};PLN;"
+        + _buy_title(f"Z2TESTOWA{label} SA", f"PL0000000{isin_suffix}", "1.000000", "1.000000", order_no)
+        + ";-1,00\n"
+    )
+    _write_bom_csv(incoming / "financeHistory (1).csv", content)
+    return incoming
+
+
+@pytest.mark.db
+def test_z2_real_account_numbers_never_leak_into_rendered_report(db_conn, tmp_path):
+    conn = db_conn
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT rachunek FROM transactions")
+            all_rachunki = [r[0] for r in cur.fetchall() if r[0]]
+        if not all_rachunki:
+            pytest.skip("brak rachunkow w transactions — test wymaga istniejacych danych")
+
+        # Ciagi cyfr (numery rachunkow) wyciagniete ze WSZYSTKICH realnych
+        # rachunkow w bazie — len>=4, zeby nie lapac przypadkowych krotkich
+        # liczb (np. pojedynczych cyfr) gdzie indziej w raporcie. Nigdy nie
+        # drukowane (asercje nizej uzywaja WYLACZNIE liczby trafien).
+        digit_sequences = sorted(
+            {m for r in all_rachunki for m in re.findall(r"\d+", r) if len(m) >= 4}
+        )
+        if not digit_sequences:
+            pytest.skip("zaden realny rachunek nie zawiera numeru (>=4 cyfry) — nic do przetestowania")
+
+        real_rachunek = next((r for r in all_rachunki if re.search(r"\d{4,}", r)), None)
+        if real_rachunek is None:
+            pytest.skip("brak rachunku z numerem >=4 cyfry")
+
+        incoming_1 = _z2_import_new_instrument(tmp_path, "A", real_rachunek, "0000000091", "Z2A1")
+        result = run_cycle(
+            **_run_cycle_kwargs(
+                tmp_path,
+                conn,
+                incoming_dir=incoming_1,
+                raw_archive_dir=tmp_path / "archive_a",
+                reports_dir=tmp_path / "reports_a",
+            )
+        )
+        assert result.report_path is not None
+        report_text = result.report_path.read_text(encoding="utf-8")
+
+        hits = sum(1 for d in digit_sequences if d in report_text)
+        assert hits == 0, f"raport zawiera {hits} ciag(i) cyfr pochodzacych z numerow realnych rachunkow (oczekiwano 0)"
+
+        # Kontrolka dodatnia: identyczny scenariusz, ale `account_label`
+        # podmieniony na tożsamość (stara ścieżka bez maskowania) — musi
+        # ujawnić co najmniej jeden numer, dowodząc, że asercja powyżej
+        # faktycznie umie wykryć numer, a nie tylko że akurat go nie było.
+        incoming_2 = _z2_import_new_instrument(tmp_path, "B", real_rachunek, "0000000092", "Z2A2")
+        with mock.patch("mannaz.cycle.account_label", side_effect=lambda r: r):
+            result_identity = run_cycle(
+                **_run_cycle_kwargs(
+                    tmp_path,
+                    conn,
+                    incoming_dir=incoming_2,
+                    raw_archive_dir=tmp_path / "archive_b",
+                    reports_dir=tmp_path / "reports_b",
+                )
+            )
+        assert result_identity.report_path is not None
+        report_text_identity = result_identity.report_path.read_text(encoding="utf-8")
+        identity_hits = sum(1 for d in digit_sequences if d in report_text_identity)
+        assert identity_hits >= 1, "kontrolka dodatnia: z account_label=tozsamosc raport powinien ujawnic numer"
     finally:
         conn.rollback()

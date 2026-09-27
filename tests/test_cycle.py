@@ -16,11 +16,16 @@ from mannaz.cycle import (
     ContinuityGap,
     Gap,
     MarketFreshnessResult,
+    PositionChange,
     PositionSnapshotRow,
+    ProcessedFileReportRow,
     RegistrationRow,
     ReportState,
     RiskReportAggregates,
+    StopEvent,
     StopEventRow,
+    StopOrderRow,
+    account_label,
     build_stop_order_rows,
     check_file_continuity,
     diff_positions,
@@ -28,6 +33,7 @@ from mannaz.cycle import (
     has_data_failures,
     is_satellite,
     market_freshness,
+    prev_evaluation_maps,
     registration_gaps,
     render_report,
     stop_change_arrow,
@@ -65,7 +71,10 @@ def test_continuity_gap_when_file_starts_after_last_known_date():
     assert gaps == [ContinuityGap("AKCYJNY 000001", date(2026, 3, 10), date(2026, 3, 5))]
     msg = gaps[0].as_data_failure()
     assert "dziura w historii" in msg
-    assert "AKCYJNY 000001" in msg
+    # Z2 (brief CC-C fix): as_data_failure() maskuje numer rachunku — TYP
+    # obecny, numer NIE.
+    assert "AKCYJNY" in msg
+    assert "000001" not in msg
     assert "2026-03-10" in msg
     assert "2026-03-05" in msg
 
@@ -405,10 +414,10 @@ def test_stop_order_decision_high_state_overrides_everything():
 
 def test_build_stop_order_rows_sorts_high_first_then_tak():
     items = [
-        ("AAA", "AKCYJNY 000001", "long", Decimal("90"), "USD", Decimal("100"), None, Decimal("20"), False),  # nie (zapadka)
-        ("BBB", "AKCYJNY 000001", "long", Decimal("110"), "USD", Decimal("100"), None, Decimal("20"), False),  # tak
-        ("CCC", "KONTRAKTOWY 000001", "long", Decimal("50"), "PLN", None, "CDR.WA", None, False),  # tak (nowa pozycja), kontrakt
-        ("DDD", "AKCYJNY 000001", "long", Decimal("90"), "USD", Decimal("100"), None, Decimal("20"), True),  # HIGH
+        ("AAA", "AKCYJNY 000001", "long", Decimal("90"), "USD", "USD", Decimal("100"), None, Decimal("20"), False),  # nie (zapadka)
+        ("BBB", "AKCYJNY 000001", "long", Decimal("110"), "USD", "USD", Decimal("100"), None, Decimal("20"), False),  # tak
+        ("CCC", "KONTRAKTOWY 000001", "long", Decimal("50"), "PLN", "PLN", None, "CDR.WA", None, False),  # tak (nowa pozycja), kontrakt
+        ("DDD", "AKCYJNY 000001", "long", Decimal("90"), "USD", "USD", Decimal("100"), None, Decimal("20"), True),  # HIGH
     ]
     rows = build_stop_order_rows(items)
     decisions = [r.decision for r in rows]
@@ -447,6 +456,9 @@ def _stop_event_row(
     instrument_type="equity",
     is_core=False,
     below_stop=True,
+    currency="USD",
+    settlement_currency="USD",
+    stop_effective=Decimal("100"),
 ) -> StopEventRow:
     return StopEventRow(
         broker_ticker=ticker,
@@ -457,10 +469,11 @@ def _stop_event_row(
         below_stop=below_stop,
         price_date_used=date(2026, 9, 25),
         close_d=Decimal("90"),
-        stop_effective=Decimal("100"),
+        stop_effective=stop_effective,
         stop_source="chandelier",
         price_source_symbol="XYZ",
-        currency="USD",
+        currency=currency,
+        settlement_currency=settlement_currency,
     )
 
 
@@ -473,13 +486,13 @@ def test_stop_events_new_breach_no_prev_row_is_an_event():
 
 def test_stop_events_already_high_on_prev_is_not_an_event():
     row = _stop_event_row()
-    events = stop_events([row], prev_risk_state_by_key={("AKCYJNY 000001", 1): "HIGH"})
+    events = stop_events([row], prev_risk_state_by_key={("AKCYJNY 000001", 1, "USD"): "HIGH"})
     assert events == []
 
 
 def test_stop_events_prev_normal_is_a_new_event():
     row = _stop_event_row()
-    events = stop_events([row], prev_risk_state_by_key={("AKCYJNY 000001", 1): "NORMAL"})
+    events = stop_events([row], prev_risk_state_by_key={("AKCYJNY 000001", 1, "USD"): "NORMAL"})
     assert len(events) == 1
 
 
@@ -498,6 +511,140 @@ def test_stop_events_core_position_always_skipped():
 def test_stop_events_certificate_type_skipped_even_if_somehow_present():
     row = _stop_event_row(ticker="CERT", instrument_type="certificate")
     assert stop_events([row], prev_risk_state_by_key={}) == []
+
+
+# ---------------------------------------------------------------------------
+# Z1a (brief CC-C fix) — klucz poprzedniej oceny rozszerzony o
+# settlement_currency (diagnoza sesji głównej: `risk_daily` UNIQUE (rachunek,
+# instrument_id, settlement_currency, risk_date) — bez waluty rozliczenia w
+# kluczu dwie pozycje tej samej spółki w dwóch walutach rozliczenia (np. GRAB
+# EUR/USD, META EUR/USD) nadpisywały się w słownikach poprzedniej oceny).
+# ---------------------------------------------------------------------------
+
+
+def _prev_evaluation_row_old_key(
+    rachunek: str, instrument_id: int, stop_effective: Decimal | None, risk_state: str | None
+) -> tuple[str, int, Decimal | None, str | None]:
+    """Pomocnik testowy: odtwarza STARE (usterkowe) budowanie słownika —
+    klucz (rachunek, instrument_id), BEZ settlement_currency."""
+    return (rachunek, instrument_id, stop_effective, risk_state)
+
+
+def _old_prev_evaluation_maps(
+    rows: list[tuple[str, int, Decimal | None, str | None]],
+) -> tuple[dict[tuple[str, int], Decimal], dict[tuple[str, int], str | None]]:
+    """Pomocnik testowy: odtwarza STARY (usterkowy) sposób budowania
+    słowników poprzedniej oceny — klucz (rachunek, instrument_id), tak jak
+    `run_cycle` robił to PRZED Z1a. Używany WYŁĄCZNIE jako kontrolka
+    dodatnia — dowodzi, że stary klucz faktycznie nadpisuje wiersze."""
+    prev_stops: dict[tuple[str, int], Decimal] = {}
+    prev_risk_state: dict[tuple[str, int], str | None] = {}
+    for rachunek, instrument_id, stop_effective, risk_state in rows:
+        key = (rachunek, instrument_id)
+        if stop_effective is not None:
+            prev_stops[key] = stop_effective
+        prev_risk_state[key] = risk_state
+    return prev_stops, prev_risk_state
+
+
+def test_prev_evaluation_maps_keeps_eur_and_usd_rows_separate():
+    """a) GRAB (rachunek/instrument_id wspólne), EUR i USD, RÓŻNE stopy i
+    RÓŻNE risk_state na poprzedniej ocenie -> `prev_evaluation_maps` z kluczem
+    rozszerzonym o settlement_currency NIE nadpisuje jednego wiersza drugim."""
+    rows = [
+        ("AKCYJNY 000001", 42, "EUR", Decimal("3.7267"), "HIGH"),
+        ("AKCYJNY 000001", 42, "USD", Decimal("3.36"), "NORMAL"),
+    ]
+    prev_stops, prev_risk_state = prev_evaluation_maps(rows)
+    assert prev_stops[("AKCYJNY 000001", 42, "EUR")] == Decimal("3.7267")
+    assert prev_stops[("AKCYJNY 000001", 42, "USD")] == Decimal("3.36")
+    assert prev_risk_state[("AKCYJNY 000001", 42, "EUR")] == "HIGH"
+    assert prev_risk_state[("AKCYJNY 000001", 42, "USD")] == "NORMAL"
+
+
+def test_prev_evaluation_maps_omits_null_stop_but_keeps_state():
+    rows = [("AKCYJNY 000001", 42, "EUR", None, "NORMAL")]
+    prev_stops, prev_risk_state = prev_evaluation_maps(rows)
+    assert ("AKCYJNY 000001", 42, "EUR") not in prev_stops
+    assert prev_risk_state[("AKCYJNY 000001", 42, "EUR")] == "NORMAL"
+
+
+def test_z1a_grab_eur_usd_each_row_keeps_its_own_prev_stop_and_direction():
+    """a) Scenariusz z diagnozy sesji głównej: GRAB EUR i GRAB USD, ten sam
+    rachunek i instrument_id, oba below_stop=True na D, ale RÓŻNE stopy na D
+    i na poprzedniej ocenie, i RÓŻNE stany na poprzedniej ocenie (EUR: prev
+    HIGH; USD: prev NORMAL). Z kluczem rozszerzonym o settlement_currency:
+    - `stop_events`: zdarzenie tylko dla USD (EUR była HIGH już poprzednio);
+    - budowa wierszy M62 (`prev_stops.get`) daje każdemu wierszowi WŁASNY
+      stop poprzedni -> własny kierunek zmiany (nie 3,36 dla EUR)."""
+    rachunek, instrument_id = "AKCYJNY 000001", 42
+    prev_rows = [
+        (rachunek, instrument_id, "EUR", Decimal("3.7267"), "HIGH"),
+        (rachunek, instrument_id, "USD", Decimal("3.36"), "NORMAL"),
+    ]
+    prev_stops, prev_risk_state = prev_evaluation_maps(prev_rows)
+
+    eur_row = _stop_event_row(
+        ticker="GRAB",
+        rachunek=rachunek,
+        instrument_id=instrument_id,
+        below_stop=True,
+        currency="EUR",
+        settlement_currency="EUR",
+        stop_effective=Decimal("3.7267"),
+    )
+    usd_row = _stop_event_row(
+        ticker="GRAB",
+        rachunek=rachunek,
+        instrument_id=instrument_id,
+        below_stop=True,
+        currency="USD",
+        settlement_currency="USD",
+        stop_effective=Decimal("3.36"),
+    )
+
+    events = stop_events([eur_row, usd_row], prev_risk_state)
+    assert len(events) == 1, "EUR byla HIGH juz na poprzedniej ocenie -> nie generuje nowego zdarzenia"
+    assert events[0].settlement_currency == "USD"
+
+    # M62: każdy wiersz dostaje WŁASNY stop poprzedni (nie 3,36 dla EUR).
+    eur_stop_prev = prev_stops.get((rachunek, instrument_id, "EUR"))
+    usd_stop_prev = prev_stops.get((rachunek, instrument_id, "USD"))
+    assert eur_stop_prev == Decimal("3.7267")
+    assert usd_stop_prev == Decimal("3.36")
+    assert eur_stop_prev != usd_stop_prev
+
+    eur_stop_d = Decimal("3.7267")  # stop na D — stały, bez zmiany
+    assert stop_change_arrow(eur_stop_d, eur_stop_prev) == "bez zmiany"
+
+
+def test_z1a_control_old_key_without_currency_overwrites_rows():
+    """b) Kontrolka dodatnia: identyczna sytuacja zbudowana STARYM kluczem
+    (rachunek, instrument_id), bez settlement_currency, jak `run_cycle` robił
+    to PRZED Z1a — wiersz EUR dostaje wartość USD (nadpisanie), dowodząc, że
+    stary klucz faktycznie gubi/dubluje dane."""
+    rachunek, instrument_id = "AKCYJNY 000001", 42
+    old_rows = [
+        _prev_evaluation_row_old_key(rachunek, instrument_id, Decimal("3.7267"), "HIGH"),  # EUR wpisany pierwszy
+        _prev_evaluation_row_old_key(rachunek, instrument_id, Decimal("3.36"), "NORMAL"),  # USD nadpisuje EUR
+    ]
+    old_prev_stops, old_prev_risk_state = _old_prev_evaluation_maps(old_rows)
+
+    # Usterka: jeden klucz (rachunek, instrument_id) -> tylko OSTATNI wiersz
+    # (USD) przetrwał, wartość EUR (3,7267 / HIGH) zniknęła.
+    assert old_prev_stops[(rachunek, instrument_id)] == Decimal("3.36")
+    assert old_prev_stops[(rachunek, instrument_id)] != Decimal("3.7267")
+    assert old_prev_risk_state[(rachunek, instrument_id)] == "NORMAL"
+    assert len(old_prev_stops) == 1, "stary klucz miesza EUR i USD w jeden wpis (usterka z diagnozy)"
+
+    # ... podczas gdy poprawny klucz (Z1a) zachowuje OBA wiersze osobno.
+    correct_rows = [
+        (rachunek, instrument_id, "EUR", Decimal("3.7267"), "HIGH"),
+        (rachunek, instrument_id, "USD", Decimal("3.36"), "NORMAL"),
+    ]
+    correct_prev_stops, _ = prev_evaluation_maps(correct_rows)
+    assert len(correct_prev_stops) == 2
+    assert correct_prev_stops[(rachunek, instrument_id, "EUR")] == Decimal("3.7267")
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +849,7 @@ def test_render_report_m62_column_header_shows_prev_date_not_d1():
             state="NORMAL",
             stop_d=Decimal("110"),
             stop_d_currency="USD",
+            settlement_currency="USD",
             stop_prev=Decimal("100"),
             atr22_threshold=Decimal("5.00"),
             base_symbol_label=None,
@@ -727,6 +875,7 @@ def test_render_report_stop_events_table_rendered():
             stop_source="chandelier",
             price_source_symbol="XYZ",
             currency="USD",
+            settlement_currency="USD",
         )
     ]
     text = render_report(state)
@@ -978,3 +1127,124 @@ def test_safe_print_falls_back_when_stream_has_no_reconfigure():
     stream = _NoReconfigureStream()
     safe_print("## 🔴 emoji linia", stream=stream)
     assert "emoji".encode("utf-8") in stream.buffer.written
+
+
+# ---------------------------------------------------------------------------
+# Z2 (brief CC-C fix) — raport tygodniowy pokazuje TYP rachunku, NIGDY numer.
+# ---------------------------------------------------------------------------
+
+
+def test_account_label_three_types_returns_type_without_number():
+    assert account_label("AKCYJNY 900001") == "AKCYJNY"
+    assert account_label("ZAGRANICZNY 900002") == "ZAGRANICZNY"
+    assert account_label("KONTRAKTOWY 900003") == "KONTRAKTOWY"
+
+
+def test_account_label_no_space_returns_whole_string_unchanged():
+    assert account_label("BEZSPACJI") == "BEZSPACJI"
+
+
+def test_account_label_empty_string_returns_empty_string():
+    assert account_label("") == ""
+
+
+def test_account_label_never_returns_pure_digits():
+    for rachunek in ("AKCYJNY 900001", "ZAGRANICZNY 900002", "KONTRAKTOWY 900003"):
+        label = account_label(rachunek)
+        assert not label.isdigit(), f"account_label nie powinno zwrocic samych cyfr: {label!r}"
+
+
+_Z2_RACHUNEK_AKCYJNY = "AKCYJNY 900001"
+_Z2_RACHUNEK_ZAGRANICZNY = "ZAGRANICZNY 900002"
+_Z2_RACHUNEK_KONTRAKTOWY = "KONTRAKTOWY 900003"
+
+
+def _z2_state_with_accounts_in_every_section() -> ReportState:
+    """Stan z rachunkami w formacie "<TYP> <numer syntetyczny>" (900001-900003)
+    we WSZYSTKICH sekcjach raportu, które pokazują rachunek: DATA FAILURE
+    (ciągłość + kolejka rejestracji), STOP, M62, Zmiany pozycji, HEARTBEAT
+    (per rachunek)."""
+    state = ReportState(
+        d=date(2026, 9, 25),
+        run_started_at=datetime(2026, 9, 27, 8, 0, tzinfo=timezone.utc),
+    )
+    # DATA FAILURE > Błędy importu (ciągłość) — string już wyrenderowany przez
+    # `ContinuityGap.as_data_failure()`, dokładnie jak w `run_cycle`.
+    state.import_failures = [
+        ContinuityGap(_Z2_RACHUNEK_AKCYJNY, date(2026, 3, 10), date(2026, 3, 5)).as_data_failure()
+    ]
+    # DATA FAILURE > Kolejka rejestracji (bramka)
+    state.registration_queue = [
+        Gap(
+            ticker="AAA",
+            rachunek=_Z2_RACHUNEK_AKCYJNY,
+            brak="brak instruments.yahoo_symbol",
+            gdzie_uzupelnic="instruments.yahoo_symbol/exchange",
+        )
+    ]
+    # STOP (§2)
+    state.stop_events = [
+        StopEvent(
+            broker_ticker="BBB",
+            rachunek=_Z2_RACHUNEK_ZAGRANICZNY,
+            price_date_used=date(2026, 9, 25),
+            close_d=Decimal("90"),
+            stop_effective=Decimal("100"),
+            stop_source="chandelier",
+            price_source_symbol="BBB",
+            currency="USD",
+            settlement_currency="EUR",
+        )
+    ]
+    # M62
+    state.stop_order_rows = [
+        StopOrderRow(
+            broker_ticker="BBB",
+            rachunek=_Z2_RACHUNEK_ZAGRANICZNY,
+            position_kind="long",
+            state="NORMAL",
+            stop_d=Decimal("110"),
+            stop_d_currency="USD",
+            settlement_currency="EUR",
+            stop_prev=Decimal("100"),
+            atr22_threshold=Decimal("5.00"),
+            base_symbol_label=None,
+            decision="tak",
+        )
+    ]
+    # Zmiany pozycji
+    state.position_changes = [
+        PositionChange(broker_ticker="CCC", rachunek=_Z2_RACHUNEK_KONTRAKTOWY, rodzaj="nowa"),
+    ]
+    # HEARTBEAT > pliki przetworzone (per rachunek)
+    state.files_processed = [
+        ProcessedFileReportRow(
+            original_name="financeHistory (1).csv",
+            sha8="deadbeef",
+            status="przetworzony",
+            per_rachunek={_Z2_RACHUNEK_AKCYJNY: (1, 0), _Z2_RACHUNEK_KONTRAKTOWY: (2, 1)},
+            date_range=(date(2026, 3, 1), date(2026, 3, 5)),
+        )
+    ]
+    return state
+
+
+def test_render_report_never_shows_account_numbers_only_types():
+    state = _z2_state_with_accounts_in_every_section()
+    text = render_report(state)
+
+    for number in ("900001", "900002", "900003"):
+        assert number not in text, f"raport nie powinien pokazywac numeru rachunku (znaleziono {number!r})"
+    for typ in ("AKCYJNY", "ZAGRANICZNY", "KONTRAKTOWY"):
+        assert typ in text, f"raport powinien pokazywac TYP rachunku {typ!r}"
+
+
+def test_render_report_positive_control_old_path_would_leak_number(monkeypatch):
+    """Kontrolka dodatnia: ten sam stan wyrenderowany starą ścieżką
+    (`mannaz.cycle.account_label` podmieniony na tożsamość) MUSI zawierać co
+    najmniej jeden numer rachunku — dowód, że test powyżej faktycznie umie
+    wykryć numer, a nie tylko że akurat żaden się nie pojawił."""
+    state = _z2_state_with_accounts_in_every_section()
+    monkeypatch.setattr("mannaz.cycle.account_label", lambda rachunek: rachunek)
+    text = render_report(state)
+    assert any(number in text for number in ("900001", "900002", "900003"))

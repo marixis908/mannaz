@@ -96,7 +96,7 @@ class ContinuityGap:
 
     def as_data_failure(self) -> str:
         return (
-            f"dziura w historii: rachunek {self.rachunek}, plik zaczyna się "
+            f"dziura w historii: rachunek {account_label(self.rachunek)}, plik zaczyna się "
             f"{self.file_start_date.isoformat()}, ostatnia zaimportowana "
             f"{self.last_known_date.isoformat()}"
         )
@@ -329,6 +329,13 @@ class StopEventRow:
     stop_source: str | None
     price_source_symbol: str | None  # symbol Yahoo instrumentu CENOWEGO (dla kontraktu: baza)
     currency: str
+    # Z2 (brief CC-C fix): waluta rozliczenia rachunku (risk.PositionRiskRow.
+    # settlement_currency) — po zamianie rachunku na TYP bez numeru (account_
+    # label) dwa wiersze tego samego tickera/typu rachunku w różnych walutach
+    # rozliczenia (np. GRAB, META) wyglądałyby identycznie; ta kolumna je
+    # rozróżnia. `currency` (powyżej) to waluta WYCENY (quote_currency albo,
+    # gdy brak, settlement_currency) — może być inna niż settlement_currency.
+    settlement_currency: str
 
 
 @dataclass(frozen=True)
@@ -341,29 +348,36 @@ class StopEvent:
     stop_source: str | None
     price_source_symbol: str | None
     currency: str
+    settlement_currency: str
 
 
 def stop_events(
     rows: list[StopEventRow],
-    prev_risk_state_by_key: dict[tuple[str, int], str | None],
+    prev_risk_state_by_key: dict[tuple[str, int, str], str | None],
 ) -> list[StopEvent]:
     """Poprawka po przeglądzie sesji głównej (CC-C): §2 raportu = ZDARZENIE
     przecięcia stopu od poprzedniej oceny (M69 EVENT; CC-U V3) — NIE lista
     wszystkich pozycji aktualnie pod stopem. Tylko satelita
     (`is_risk_budget_eligible`); zdarzenie, gdy `below_stop is True` na D
     ORAZ (brak wiersza w `risk_daily` na `prev_date` dla (rachunek,
-    instrument_id) LUB `risk_state` na `prev_date` różny od `'HIGH'`) —
-    pozycja, która była HIGH już na poprzedniej ocenie, nie generuje nowego
-    zdarzenia. `prev_risk_state_by_key`: (rachunek, instrument_id) ->
-    risk_state na `prev_date` (klucz nieobecny = brak wiersza na prev_date =
-    zawsze zdarzenie, gdy below_stop)."""
+    instrument_id, settlement_currency) LUB `risk_state` na `prev_date`
+    różny od `'HIGH'`) — pozycja, która była HIGH już na poprzedniej ocenie,
+    nie generuje nowego zdarzenia.
+    Z1a (brief CC-C fix, diagnoza sesji głównej): klucz rozszerzony o
+    `settlement_currency` — bez niej dwa wiersze tej samej spółki rozliczane
+    w różnych walutach (np. GRAB EUR/USD, META EUR/USD) dzieliły ten sam
+    klucz (rachunek, instrument_id) i nadpisywały się w słowniku poprzedniej
+    oceny (fałszywy stan HIGH/brak zdarzenia dla jednej z walut).
+    `prev_risk_state_by_key`: (rachunek, instrument_id, settlement_currency)
+    -> risk_state na `prev_date` (klucz nieobecny = brak wiersza na
+    prev_date = zawsze zdarzenie, gdy below_stop)."""
     events: list[StopEvent] = []
     for row in rows:
         if not is_risk_budget_eligible(row.instrument_type, row.is_core):
             continue
         if row.below_stop is not True:
             continue
-        key = (row.rachunek, row.instrument_id)
+        key = (row.rachunek, row.instrument_id, row.settlement_currency)
         if prev_risk_state_by_key.get(key) == "HIGH":
             continue
         events.append(
@@ -376,9 +390,45 @@ def stop_events(
                 stop_source=row.stop_source,
                 price_source_symbol=row.price_source_symbol,
                 currency=row.currency,
+                settlement_currency=row.settlement_currency,
             )
         )
     return events
+
+
+# ---------------------------------------------------------------------------
+# Z1a (brief CC-C fix) — słowniki poprzedniej oceny (czysta funkcja)
+# ---------------------------------------------------------------------------
+
+
+def prev_evaluation_maps(
+    rows: list[tuple[str, int, str, Decimal | None, str | None]],
+) -> tuple[dict[tuple[str, int, str], Decimal], dict[tuple[str, int, str], str | None]]:
+    """Z1a (brief CC-C fix, diagnoza sesji głównej): buduje z wierszy
+    `risk_daily` na `prev_date` dwa słowniki poprzedniej oceny — stop_prev
+    (M62, §3) i risk_state poprzedni (§2, `stop_events`) — po kluczu
+    (rachunek, instrument_id, settlement_currency).
+    Usterka naprawiona tutaj: `risk_daily` ma UNIQUE (rachunek,
+    instrument_id, settlement_currency, risk_date) — klucz BEZ waluty
+    rozliczenia nadpisywał w słowniku wiersz jednej waluty wartością drugiej,
+    gdy ta sama spółka na tym samym rachunku miała pozycje rozliczane w
+    dwóch walutach (np. GRAB EUR/USD, META EUR/USD).
+    rows: (rachunek, instrument_id, settlement_currency, stop_effective,
+    risk_state) — jeden wiersz per pozycja z `risk_daily` na `prev_date`
+    (kolejność zgodna z `SELECT rachunek, instrument_id, settlement_currency,
+    stop_effective, risk_state FROM risk_daily WHERE risk_date = prev_date`).
+    Zwraca (prev_stops, prev_risk_state): `prev_stops` pomija wiersze ze
+    `stop_effective IS NULL` (jak poprzednio — brak punktu odniesienia);
+    `prev_risk_state` zawiera WSZYSTKIE wiersze (klucz nieobecny = brak
+    wiersza w `risk_daily` na `prev_date` dla tego klucza)."""
+    prev_stops: dict[tuple[str, int, str], Decimal] = {}
+    prev_risk_state: dict[tuple[str, int, str], str | None] = {}
+    for rachunek, instrument_id, settlement_currency, stop_effective, risk_state in rows:
+        key = (rachunek, instrument_id, settlement_currency)
+        if stop_effective is not None:
+            prev_stops[key] = stop_effective
+        prev_risk_state[key] = risk_state
+    return prev_stops, prev_risk_state
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +492,11 @@ class StopOrderRow:
     state: str  # 'HIGH' | 'NORMAL' (poprawka po przeglądzie, P1)
     stop_d: Decimal | None
     stop_d_currency: str
+    # Z2 (brief CC-C fix): waluta rozliczenia rachunku (risk.PositionRiskRow.
+    # settlement_currency) — po account_label(rachunek) (TYP bez numeru) dwa
+    # wiersze tego samego tickera/typu rachunku w różnych walutach rozliczenia
+    # wyglądałyby identycznie; kolumna rozróżnia je w tabeli M62.
+    settlement_currency: str
     stop_prev: Decimal | None
     atr22_threshold: Decimal | None  # 0,25*ATR22 na D, w stop_d_currency; None gdy brak ATR22
     base_symbol_label: str | None  # kontrakty: symbol bazy ("poziom na bazie"); inaczej None
@@ -463,20 +518,24 @@ def stop_change_arrow(stop_d: Decimal | None, stop_prev: Decimal | None) -> str:
 
 def build_stop_order_rows(
     items: list[
-        tuple[str, str, str, Decimal | None, str, Decimal | None, str | None, Decimal | None, bool | None]
+        tuple[
+            str, str, str, Decimal | None, str, str, Decimal | None, str | None, Decimal | None, bool | None
+        ]
     ]
 ) -> list[StopOrderRow]:
     """items: (broker_ticker, rachunek, position_kind, stop_d, stop_d_currency,
-    stop_prev, base_symbol_label, atr22_d, below_stop), jeden per pozycja
-    satelity otwarta na D w `risk_daily`. Zwraca wiersze posortowane:
-    najpierw stan HIGH, potem decyzje zaczynające się od „tak”."""
+    settlement_currency, stop_prev, base_symbol_label, atr22_d, below_stop),
+    jeden per pozycja satelity otwarta na D w `risk_daily`. Zwraca wiersze
+    posortowane: najpierw stan HIGH, potem decyzje zaczynające się od „tak”."""
     rows: list[StopOrderRow] = []
-    for ticker, rachunek, kind, stop_d, ccy, stop_prev, base_label, atr22_d, below_stop in items:
+    for ticker, rachunek, kind, stop_d, ccy, settlement_ccy, stop_prev, base_label, atr22_d, below_stop in items:
         state = "HIGH" if below_stop is True else "NORMAL"
         threshold = STOP_ORDER_MIN_CHANGE_ATR * atr22_d if atr22_d is not None else None
         decision = stop_order_decision(kind, stop_d, stop_prev, atr22_d, below_stop)
         rows.append(
-            StopOrderRow(ticker, rachunek, kind, state, stop_d, ccy, stop_prev, threshold, base_label, decision)
+            StopOrderRow(
+                ticker, rachunek, kind, state, stop_d, ccy, settlement_ccy, stop_prev, threshold, base_label, decision
+            )
         )
     rows.sort(
         key=lambda r: (
@@ -569,6 +628,22 @@ def format_money(value: Decimal | None, currency: str) -> str:
     if value is None:
         return "brak"
     return f"{format_number(value)} {currency}"
+
+
+# ---------------------------------------------------------------------------
+# Z2 (brief CC-C fix) — prezentacja rachunku w raporcie: TYP bez numeru.
+# ---------------------------------------------------------------------------
+
+
+def account_label(rachunek: str) -> str:
+    """Z2: rachunek w bazie ma postać "<TYP> <numer>" (np. "AKCYJNY 900001").
+    Czysta funkcja — pierwszy token przed spacją; gdy `rachunek` nie zawiera
+    spacji, zwraca go w całości niezmienionego. NIGDY nie zwraca cyfr numeru.
+    Używana w KAŻDYM miejscu renderowania raportu tygodniowego (`render_report`
+    i pomocnicze `_render_*`) oraz we wpisach `ContinuityGap.as_data_failure`
+    (DATA FAILURE ciągłości) — dane wewnętrzne (klucze słowników, SQL, `rows`)
+    pozostają BEZ ZMIAN, to WYŁĄCZNIE prezentacja w tekście raportu."""
+    return rachunek.split(" ", 1)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +854,7 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
         lines.append("| ticker | rachunek | czego brakuje | gdzie uzupełnić |")
         lines.append("|---|---|---|---|")
         for g in state.registration_queue:
-            lines.append(f"| {g.ticker} | {g.rachunek} | {g.brak} | {g.gdzie_uzupelnic} |")
+            lines.append(f"| {g.ticker} | {account_label(g.rachunek)} | {g.brak} | {g.gdzie_uzupelnic} |")
     else:
         lines.append("brak")
 
@@ -856,11 +931,15 @@ def _render_stop_section(state: ReportState) -> list[str]:
     if not state.stop_events:
         lines.append("brak")
         return lines
-    lines.append("| ticker | rachunek | data ceny | close | stop | źródło stopu | źródło ceny |")
-    lines.append("|---|---|---|---|---|---|---|")
+    # Z2 (brief CC-C fix): kolumna "waluta rozliczenia" — po account_label
+    # (rachunek pokazuje TYP bez numeru) rozróżnia wiersze tego samego
+    # tickera/typu rachunku rozliczane w różnych walutach (np. GRAB, META).
+    lines.append("| ticker | rachunek | waluta rozliczenia | data ceny | close | stop | źródło stopu | źródło ceny |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for e in state.stop_events:
         lines.append(
-            f"| {e.broker_ticker} | {e.rachunek} | {_fmt_date(e.price_date_used)} | "
+            f"| {e.broker_ticker} | {account_label(e.rachunek)} | {e.settlement_currency} | "
+            f"{_fmt_date(e.price_date_used)} | "
             f"{format_money(e.close_d, e.currency)} | {format_money(e.stop_effective, e.currency)} | "
             f"{e.stop_source} | {e.price_source_symbol or 'brak'} |"
         )
@@ -877,15 +956,18 @@ def _render_stop_orders_section(state: ReportState) -> list[str]:
     if not state.stop_order_rows:
         lines.append("brak")
         return lines
+    # Z2 (brief CC-C fix): kolumna "waluta rozliczenia" — patrz uzasadnienie w
+    # `_render_stop_section`.
     lines.append(
-        f"| ticker | rachunek | stan | kierunek | stop D | stop z poprzedniej oceny ({prev_label}) | "
-        "zmiana | 0,25×ATR22 | poziom na bazie | zmień zlecenie |"
+        f"| ticker | rachunek | waluta rozliczenia | stan | kierunek | stop D | "
+        f"stop z poprzedniej oceny ({prev_label}) | zmiana | 0,25×ATR22 | poziom na bazie | zmień zlecenie |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in state.stop_order_rows:
         zmiana = stop_change_arrow(r.stop_d, r.stop_prev)
         lines.append(
-            f"| {r.broker_ticker} | {r.rachunek} | {r.state} | {r.position_kind} | "
+            f"| {r.broker_ticker} | {account_label(r.rachunek)} | {r.settlement_currency} | "
+            f"{r.state} | {r.position_kind} | "
             f"{format_money(r.stop_d, r.stop_d_currency)} | {format_money(r.stop_prev, r.stop_d_currency)} | "
             f"{zmiana} | {format_money(r.atr22_threshold, r.stop_d_currency)} | "
             f"{r.base_symbol_label or '-'} | {r.decision} |"
@@ -941,7 +1023,7 @@ def _render_position_changes_section(state: ReportState) -> list[str]:
         lines.append("brak")
     else:
         for c in state.position_changes:
-            lines.append(f"- {c.broker_ticker} ({c.rachunek}): {c.rodzaj}")
+            lines.append(f"- {c.broker_ticker} ({account_label(c.rachunek)}): {c.rodzaj}")
     lines.append("")
     if state.archetype_missing:
         lines.append(f"Do rejestracji (§12): brak archetypu: {', '.join(state.archetype_missing)}")
@@ -956,7 +1038,9 @@ def _render_heartbeat_section(state: ReportState) -> list[str]:
     lines.append("- pliki przetworzone:")
     if state.files_processed:
         for f in state.files_processed:
-            per_r = "; ".join(f"{r}: nowe={n} zdublowane={d}" for r, (n, d) in sorted(f.per_rachunek.items()))
+            per_r = "; ".join(
+                f"{account_label(r)}: nowe={n} zdublowane={d}" for r, (n, d) in sorted(f.per_rachunek.items())
+            )
             rng = (
                 f"{f.date_range[0].isoformat()}..{f.date_range[1].isoformat()}"
                 if f.date_range is not None
@@ -1452,19 +1536,19 @@ def run_cycle(
         state.risk_aggregates = RiskReportAggregates.from_risk_summary(risk_summary)
 
         # Poprzednia ocena (D-1): stop_effective (M62) I risk_state (STOP §2,
-        # M69 EVENT) na `prev_date` — jedno zapytanie, dwa słowniki.
-        prev_stops: dict[tuple[str, int], Decimal] = {}
-        prev_risk_state: dict[tuple[str, int], str | None] = {}
+        # M69 EVENT) na `prev_date` — jedno zapytanie, dwa słowniki. Z1a:
+        # klucz (rachunek, instrument_id, settlement_currency) — patrz
+        # `prev_evaluation_maps`.
+        prev_stops: dict[tuple[str, int, str], Decimal] = {}
+        prev_risk_state: dict[tuple[str, int, str], str | None] = {}
         if prev_date is not None:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT rachunek, instrument_id, stop_effective, risk_state FROM risk_daily WHERE risk_date = %s",
+                    "SELECT rachunek, instrument_id, settlement_currency, stop_effective, risk_state "
+                    "FROM risk_daily WHERE risk_date = %s",
                     (prev_date,),
                 )
-                for r, i, stop_eff, risk_state in cur.fetchall():
-                    if stop_eff is not None:
-                        prev_stops[(r, i)] = stop_eff
-                    prev_risk_state[(r, i)] = risk_state
+                prev_stops, prev_risk_state = prev_evaluation_maps(cur.fetchall())
 
         # symbol Yahoo instrumentu CENOWEGO (dla kontraktu: baza) — jeden
         # lookup per pozycja, dzielony przez STOP (§2) i M62.
@@ -1492,6 +1576,7 @@ def run_cycle(
                 stop_source=row.stop_source,
                 price_source_symbol=price_source_symbols.get(row.instrument_id),
                 currency=row.quote_currency or row.settlement_currency,
+                settlement_currency=row.settlement_currency,
             )
             for row in risk_summary.rows
         ]
@@ -1505,12 +1590,14 @@ def run_cycle(
         # instrumencie BAZOWYM przez `risk.run_risk` (patrz docstring modułu
         # risk.py, P4.2), więc `row.atr22` jest już właściwą wartością.
         stop_order_items: list[
-            tuple[str, str, str, Decimal | None, str, Decimal | None, str | None, Decimal | None, bool | None]
+            tuple[
+                str, str, str, Decimal | None, str, str, Decimal | None, str | None, Decimal | None, bool | None
+            ]
         ] = []
         for row in risk_summary.rows:
             if not is_risk_budget_eligible(row.instrument_type, row.is_core):
                 continue
-            stop_prev = prev_stops.get((row.rachunek, row.instrument_id))
+            stop_prev = prev_stops.get((row.rachunek, row.instrument_id, row.settlement_currency))
             base_symbol_label = price_source_symbols.get(row.instrument_id) if row.instrument_type == "future" else None
             stop_order_items.append(
                 (
@@ -1519,6 +1606,7 @@ def run_cycle(
                     row.position_kind,
                     row.stop_effective,
                     row.quote_currency or row.settlement_currency,
+                    row.settlement_currency,
                     stop_prev,
                     base_symbol_label,
                     row.atr22,
