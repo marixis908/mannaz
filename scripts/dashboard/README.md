@@ -13,14 +13,19 @@ bazy). Kontrakt danych — autorytatywny, rozstrzyga wątpliwości:
 - `template.html` — szablon strony (CSS+JS inline, jeden punkt wstrzyknięcia
   JSON: `__DASHBOARD_DATA_JSON__`).
 
-## Uruchomienie (PowerShell, z katalogu worktree)
+## Uruchomienie (PowerShell, z dowolnego katalogu)
 
 ```powershell
-C:\Users\MariuszBrysik\projects\Mannaz\.venv\Scripts\python.exe scripts\dashboard\generate.py --date 2026-09-25 --risk-date 2026-09-24 --out C:\Users\MariuszBrysik\projects\Mannaz\tmp\dashboard\out\dev\dashboard-dev.html
+& C:\Users\MariuszBrysik\projects\Mannaz\.venv\Scripts\python.exe C:\Users\MariuszBrysik\projects\Mannaz-dashboard\scripts\dashboard\generate.py --date 2026-09-25 --risk-date 2026-09-25 --out C:\Users\MariuszBrysik\projects\Mannaz\tmp\dashboard\out\dashboard-2026-09-25.html
 ```
 
+Po merge do `main`: ścieżkę skryptu zamienić na
+`C:\Users\MariuszBrysik\projects\Mannaz\scripts\dashboard\generate.py`.
+Wynik zawsze do katalogu ignorowanego (`tmp\` albo `out\`) — nigdy do indeksu git.
+
 `--date` (D składu) i `--risk-date` (D ryzyka) są WYMAGANE, bez wartości
-domyślnych. Kody wyjścia: `0` sukces, `2` STOP — waluta nieobsłużona, `3`
+domyślnych. Domyślnie D ryzyka = D; inna data tylko gdy test pochodzenia
+`risk_daily` na D da FAIL/NIEROZSTRZYGNIETY (stdout pokazuje wynik per test). Kody wyjścia: `0` sukces, `2` STOP — waluta nieobsłużona, `3`
 STOP — dane starsze niż 5 sesji, `1` inny błąd. Stdout: wyłącznie liczności,
 daty, sha256, PASS/FAIL (repo publiczne — zero kwot/wag/cen/tickerów/numerów
 rachunków w logach).
