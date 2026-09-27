@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.4 · 2026-09-27**
+**Rewizja 4.5 · 2026-09-27**
 
 ---
 
@@ -29,7 +29,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.1 | 2026-09-26 | §19.4: wartość rachunku KONTRAKTOWY w kapitale satelity = środki ogółem łącznie z depozytem zablokowanym; wynik zmienny rozliczany dziennie w środkach, bez osobnego doliczania (pomiar CC-R K2) |
 | 4.2 | 2026-09-27 | §19 M77: zasada „dane ≤ D” dla wielkości liczonych na dzień D; §19.3: zapadka Chandeliera per okres posiadania (brief CC-S) |
 | 4.3 | 2026-09-27 | T27: forward-fill przy odczycie (`run_risk`), tabela cen tylko z realnymi sesjami, flaga nieświeżości i data użytej ceny w `risk_daily` (brief CC-U) |
-| **4.4** | **2026-09-27** | **T12: zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie (T27); §8.2/§8.3: `prices_eod` → `prices_daily`, kolumny zgodne z bazą, bez `is_stale` (brief CC-I)** |
+| 4.4 | 2026-09-27 | T12: zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie (T27); §8.2/§8.3: `prices_eod` → `prices_daily`, kolumny zgodne z bazą, bez `is_stale` (brief CC-I) |
+| **4.5** | **2026-09-27** | **§23.2: etap lokalny — przebieg główny uruchamiany ręcznie przez ownera po wgraniu historii transakcji, raport lokalny zamiast Slacka i dead-mana; §22.3 T38: próg istotności zmiany zlecenia stop (brief CC-C)** |
 
 ### 0.3 Oznaczenia
 
@@ -1087,6 +1088,8 @@ Redukcje wg drabiny z §21.2. Wyjścia reżimowe i tezowe — jednorazowo, bez d
 
 **M63.** Poziom stopu zmienia się rzadko (Chandelier podąża za maksimum). Aktualizacja zlecenia jest pozycją w przeglądzie okresowym, a przy skoku zmienności — osobnym alertem.
 
+**T38.** Próg istotności zmiany zlecenia stop: 0,25 × ATR22. [S] Przegląd po F6 (shadow mode).
+
 ---
 
 # CZĘŚĆ VI — OPERACJE
@@ -1126,6 +1129,8 @@ Ocena dobowa dałaby ok. pięciokrotnie więcej okazji do fałszywego przekrocze
 | **Miesięcznie** | odświeżenie ERP Damodarana | cichy zapis |
 | **Styczeń** | bety, WACC sektorowy, marże, tabele fade | cichy zapis |
 | **Codziennie** | **ping do zewnętrznego monitora** | brak pingu = alarm |
+
+Etap lokalny (do przeniesienia na VPS): przebieg główny uruchamia owner ręcznie po wgraniu historii transakcji, zwykle raz w tygodniu; artefakt to raport lokalny; Slack i zewnętrzny dead-man nieaktywne — ich rolę pełnią sekcje DATA FAILURE i świeżość T28 w raporcie.
 
 **M66.** Godzina 04:30 UTC omija zmierzoną anomalię obciążenia VPS o 06:00 UTC (§7.1). Przebieg sobotni o 07:00 UTC działa na domkniętym tygodniu wszystkich giełd.
 
