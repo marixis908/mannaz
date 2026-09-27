@@ -10,6 +10,7 @@ from decimal import Decimal
 import pytest
 
 from mannaz.risk import (
+    RATCHET_INIT_DATE,
     aggregate_risk_budgets,
     chandelier_hold,
     chandelier_series,
@@ -18,11 +19,13 @@ from mannaz.risk import (
     compute_theme_budgets,
     compute_weighted_entry_price,
     gbp_pence_factor,
+    holding_period_start,
     is_breached,
     is_regime,
     is_risk_budget_eligible,
     is_warning,
     kontraktowy_account_value,
+    layer_factor_after,
     level1_check,
     level3_check,
     log_returns,
@@ -30,6 +33,7 @@ from mannaz.risk import (
     ratchet_extreme,
     resolve_default_date,
     resolve_fx_rate,
+    resolve_ratchet_start,
     rolling_max,
     rolling_min,
     simple_moving_average,
@@ -559,3 +563,119 @@ def test_check_kontraktowy_coverage_ok_cases_do_not_raise():
     check_kontraktowy_coverage(n_rows=5, max_date=date(2026, 9, 25), has_open_futures=True, as_of=date(2026, 9, 25))
     # historia sprzed D, ale brak otwartych kontraktow -> nie ma czego rozliczac codziennie
     check_kontraktowy_coverage(n_rows=5, max_date=date(2026, 9, 20), has_open_futures=False, as_of=date(2026, 9, 25))
+
+
+# ---------------------------------------------------------------------------
+# layer_factor_after (brief CC-S, S3, naprawa F3) — przejscie warstwy "na D"
+# -> *_split_adj
+# ---------------------------------------------------------------------------
+
+
+def test_layer_factor_after_no_events_after_d_is_one():
+    events = [{"date": date(2024, 1, 1), "ratio": Decimal(10)}]  # przed D
+    assert layer_factor_after(events, date(2024, 6, 1)) == Decimal(1)
+
+
+def test_layer_factor_after_multiple_events_after_d_multiply():
+    events = [
+        {"date": date(2024, 7, 1), "ratio": Decimal(10)},
+        {"date": date(2024, 8, 1), "ratio": Decimal(2)},
+    ]
+    assert layer_factor_after(events, date(2024, 6, 1)) == Decimal(20)
+
+
+def test_layer_factor_after_invariance_split_after_d_risk_and_value_identical():
+    """Split 1:10 PO D — wartosc pozycji w PLN, ryzyko (compute_risk_native) i
+    stop_2n wzgledem close na D identyczne w warstwie "na D" (raw) i w
+    warstwie split_adj (raw/10 przed data splitu), tak jak wymaga S3."""
+    d = date(2024, 6, 1)
+    split_date = date(2024, 6, 10)  # po D
+    events = [{"date": split_date, "ratio": Decimal(10)}]
+    f = layer_factor_after(events, d)
+    assert f == Decimal(10)
+
+    qty_d = Decimal(10)      # "na D" (positions_as_of)
+    entry_d = Decimal(100)   # "na D" (compute_weighted_entry_price)
+    atr20_d = Decimal(5)     # ATR w tej samej warstwie co entry_d
+    close_d = Decimal(150)
+
+    qty_adj = qty_d * f
+    entry_adj = entry_d / f
+    atr20_adj = atr20_d / f  # linowosc Wildera: stale skalowanie calej serii cen skaluje ATR tak samo
+    close_adj = close_d / f
+
+    stop_raw = two_n_stop(entry_d, atr20_d, is_short=False)
+    stop_adj = two_n_stop(entry_adj, atr20_adj, is_short=False)
+    assert stop_adj == stop_raw / f
+
+    risk_raw, below_raw = compute_risk_native(close_d, stop_raw, qty_d, Decimal(1), is_short=False)
+    risk_adj, below_adj = compute_risk_native(close_adj, stop_adj, qty_adj, Decimal(1), is_short=False)
+    assert risk_adj == risk_raw
+    assert below_adj == below_raw
+
+    assert qty_d * close_d == qty_adj * close_adj  # wartosc PLN niezalezna od warstwy
+
+
+# ---------------------------------------------------------------------------
+# holding_period_start / resolve_ratchet_start (brief CC-S, S5, naprawa F4 —
+# zapadka deterministyczna, bez zaleznosci od risk_daily)
+# ---------------------------------------------------------------------------
+
+
+def test_holding_period_start_open_then_partial_sell_unchanged():
+    rows = [
+        {"date": date(2024, 1, 1), "type": "kupno", "qty": Decimal(10)},
+        {"date": date(2024, 2, 1), "type": "sprzedaz", "qty": Decimal(4)},
+    ]
+    assert holding_period_start(rows, events=[]) == date(2024, 1, 1)
+
+
+def test_holding_period_start_close_and_reopen_uses_reopen_date():
+    rows = [
+        {"date": date(2024, 1, 1), "type": "kupno", "qty": Decimal(10)},
+        {"date": date(2024, 2, 1), "type": "sprzedaz", "qty": Decimal(10)},  # domkniecie do zera
+        {"date": date(2024, 3, 1), "type": "kupno", "qty": Decimal(5)},  # ponowne otwarcie
+    ]
+    assert holding_period_start(rows, events=[]) == date(2024, 3, 1)
+
+
+def test_holding_period_start_short_open_on_kontraktowy():
+    rows = [{"date": date(2024, 1, 1), "type": "sprzedaz", "qty": Decimal(3)}]  # swiadome otwarcie krotkiej
+    assert holding_period_start(rows, events=[]) == date(2024, 1, 1)
+
+
+def test_holding_period_start_fully_closed_returns_none():
+    rows = [
+        {"date": date(2024, 1, 1), "type": "kupno", "qty": Decimal(10)},
+        {"date": date(2024, 2, 1), "type": "sprzedaz", "qty": Decimal(10)},
+    ]
+    assert holding_period_start(rows, events=[]) is None
+
+
+def test_holding_period_start_split_does_not_change_sign_or_reset_start():
+    rows = [{"date": date(2024, 1, 1), "type": "kupno", "qty": Decimal(10)}]
+    events = [{"date": date(2024, 3, 1), "ratio": Decimal(25)}]  # split nie zeruje/nie zmienia znaku
+    assert holding_period_start(rows, events) == date(2024, 1, 1)
+
+
+def test_resolve_ratchet_start_before_init_date_is_d_itself():
+    rows = [{"date": date(2020, 1, 1), "type": "kupno", "qty": Decimal(1)}]
+    d = date(2020, 1, 2)
+    assert d < RATCHET_INIT_DATE
+    assert resolve_ratchet_start(rows, events=[], as_of=d) == d
+
+
+def test_resolve_ratchet_start_long_held_position_clamped_to_init_date():
+    rows = [{"date": date(2020, 1, 1), "type": "kupno", "qty": Decimal(1)}]
+    d = date(2026, 9, 25)
+    assert resolve_ratchet_start(rows, events=[], as_of=d) == RATCHET_INIT_DATE
+
+
+def test_resolve_ratchet_start_reopened_after_init_date_uses_reopen_date():
+    rows = [
+        {"date": date(2020, 1, 1), "type": "kupno", "qty": Decimal(10)},
+        {"date": date(2026, 9, 25), "type": "sprzedaz", "qty": Decimal(10)},
+        {"date": date(2026, 9, 26), "type": "kupno", "qty": Decimal(5)},
+    ]
+    d = date(2026, 9, 26)
+    assert resolve_ratchet_start(rows, events=[], as_of=d) == date(2026, 9, 26)

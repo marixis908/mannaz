@@ -4,7 +4,7 @@
 from datetime import date
 from decimal import Decimal
 
-from mannaz.fifo import compute_position, resolve_effective_qty_after_expiry
+from mannaz.fifo import compute_position, resolve_effective_qty_after_expiry, resolve_position_as_of
 
 
 def test_simple_buy_then_partial_sell():
@@ -175,3 +175,148 @@ def test_expired_future_already_flat_is_not_counted_as_closure():
     )
     assert qty == Decimal(0)
     assert closed is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_position_as_of — brief CC-S, S2 (naprawa F1: look-ahead w run_risk;
+# F2: wykup certyfikatu bez filtra as_of w podzapytaniu max(transaction_date))
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_position_as_of_sold_after_d_is_open_on_d_and_closed_on_sale_date():
+    rows = [
+        {"date": date(2024, 1, 1), "row_type": "kupno", "qty": Decimal(10), "amount": Decimal(100)},
+        {"date": date(2024, 3, 1), "row_type": "sprzedaz", "qty": Decimal(10), "amount": Decimal(150)},
+    ]
+    # D przed sprzedaza -> pozycja wciaz otwarta (F1: bez look-ahead na sprzedaz)
+    pos, effective_qty, closed = resolve_position_as_of(
+        rows, events=[], as_of=date(2024, 2, 1), instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert effective_qty == Decimal(10)
+    assert closed is False
+
+    # data sprzedazy wlacznie -> pozycja domknieta
+    pos, effective_qty, closed = resolve_position_as_of(
+        rows, events=[], as_of=date(2024, 3, 1), instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert effective_qty == Decimal(0)
+
+
+def test_resolve_position_as_of_split_after_d_does_not_scale_qty_on_d():
+    rows = [
+        {"date": date(2024, 1, 1), "row_type": "kupno", "qty": Decimal(10), "amount": Decimal(1000)},
+    ]
+    events = [{"date": date(2024, 6, 1), "ratio": Decimal(10)}]  # split 10:1, po D
+
+    pos, effective_qty, closed = resolve_position_as_of(
+        rows, events, as_of=date(2024, 3, 1), instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert effective_qty == Decimal(10)  # split jeszcze nie mial miejsca "z perspektywy D"
+    assert closed is False
+
+    pos, effective_qty, closed = resolve_position_as_of(
+        rows, events, as_of=date(2024, 7, 1), instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert effective_qty == Decimal(100)  # po dacie splitu -> juz przeskalowane
+
+
+def test_resolve_position_as_of_share_exchange_flips_on_exchange_date():
+    exchange_date = date(2024, 5, 1)
+    # instrument X (wydawany w zamianie) — otwarty od 2024-01-01, wydanie na exchange_date
+    rows_x = [
+        {"date": date(2024, 1, 1), "row_type": "kupno", "qty": Decimal(10), "amount": Decimal(100)},
+        {"date": exchange_date, "row_type": "zamiana_wydanie", "qty": Decimal(10), "amount": Decimal(120)},
+    ]
+    # instrument Y (przyjmowany w zamianie) — istnieje tylko od exchange_date
+    rows_y = [
+        {"date": exchange_date, "row_type": "zamiana_przyjecie", "qty": Decimal(10), "amount": Decimal(120)},
+    ]
+
+    day_before = date(2024, 4, 30)
+
+    _, qty_x_before, closed_x_before = resolve_position_as_of(
+        rows_x, events=[], as_of=day_before, instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert qty_x_before == Decimal(10) and closed_x_before is False
+
+    _, qty_y_before, closed_y_before = resolve_position_as_of(
+        rows_y, events=[], as_of=day_before, instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert qty_y_before == Decimal(0)  # Y jeszcze nie istnieje
+
+    _, qty_x_on, closed_x_on = resolve_position_as_of(
+        rows_x, events=[], as_of=exchange_date, instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert qty_x_on == Decimal(0)  # X domkniety wydaniem
+
+    _, qty_y_on, closed_y_on = resolve_position_as_of(
+        rows_y, events=[], as_of=exchange_date, instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert qty_y_on == Decimal(10) and closed_y_on is False  # Y otwarty
+
+
+def test_resolve_position_as_of_bilans_otwarcia_absent_before_balance_date():
+    balance_date = date(2024, 1, 1)
+    rows = [
+        {"date": balance_date, "row_type": "bilans_otwarcia", "qty": Decimal(5), "amount": Decimal(500)},
+    ]
+
+    _, qty_before, _ = resolve_position_as_of(
+        rows, events=[], as_of=date(2023, 12, 31), instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert qty_before == Decimal(0)
+
+    _, qty_on, _ = resolve_position_as_of(
+        rows, events=[], as_of=balance_date, instrument_type="equity",
+        contract_expiry=None, certificate_redemption_dates=[],
+    )
+    assert qty_on == Decimal(5)
+
+
+def test_resolve_position_as_of_certificate_redemption_after_d_does_not_close_on_d():
+    rows = [
+        {"date": date(2024, 1, 1), "row_type": "kupno", "qty": Decimal(10), "amount": Decimal(1000)},
+    ]
+    redemption_date = date(2024, 6, 1)
+
+    _, effective_qty, closed = resolve_position_as_of(
+        rows, events=[], as_of=date(2024, 3, 1), instrument_type="certificate",
+        contract_expiry=None, certificate_redemption_dates=[redemption_date],
+    )
+    assert effective_qty == Decimal(10)
+    assert closed is False
+
+    # na/po dacie wykupu (bez kolejnej transakcji) -> domkniete
+    _, effective_qty, closed = resolve_position_as_of(
+        rows, events=[], as_of=redemption_date, instrument_type="certificate",
+        contract_expiry=None, certificate_redemption_dates=[redemption_date],
+    )
+    assert effective_qty == Decimal(0)
+    assert closed is True
+
+
+def test_resolve_position_as_of_f2_later_repurchase_after_as_of_does_not_mask_redemption():
+    """F2: stary kod liczyl max(transaction_date) bez filtra <= as_of — pozniejszy
+    odkup (data > as_of, ale <= 'dzis') falszywie maskowal wykup widoczny na D."""
+    redemption_date = date(2024, 6, 1)
+    rows = [
+        {"date": date(2024, 1, 1), "row_type": "kupno", "qty": Decimal(10), "amount": Decimal(1000)},
+        {"date": date(2024, 9, 1), "row_type": "kupno", "qty": Decimal(5), "amount": Decimal(500)},  # po D
+    ]
+    d = date(2024, 7, 1)  # miedzy wykupem a pozniejszym odkupem
+
+    _, effective_qty, closed = resolve_position_as_of(
+        rows, events=[], as_of=d, instrument_type="certificate",
+        contract_expiry=None, certificate_redemption_dates=[redemption_date],
+    )
+    assert closed is True
+    assert effective_qty == Decimal(0)

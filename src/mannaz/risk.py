@@ -28,15 +28,46 @@ first/last date z KOŃCOWEGO stanu kolejki lotów, nie z bieżącego licznika.
 POPRAWKA (sesja główna 2026-09-26, §19.3 "dzień zero na żywej książce"):
 `stop_chandelier_D` (główny stop, wchodzi do `stop_effective`) NIE jest już
 ratchetowany od pierwszego POZOSTAŁEGO LOTU (historyczne wejście) — zapadka
-zaczyna się od INICJALIZACJI SYSTEMU dla tej pozycji, czyli od najwcześniejszej
-`risk_date` już zapisanej dla niej w `risk_daily` sprzed D. Brak takiego wiersza
-(pierwszy dzień, w którym ta pozycja jest w ogóle liczona) -> RATCHET_START = D,
-czyli wartość BEZ zapadki (`max(high,22) - 3*ATR22_D`, jeden dzień). Ratchet
-rośnie o jeden dzień z każdym kolejnym uruchomieniem `risk` (RATCHET_START =
-najwcześniejszy dotychczasowy dzień pomiaru, nie data wejścia w pozycję).
+zaczyna się od INICJALIZACJI SYSTEMU dla tej pozycji.
+POPRAWKA (brief CC-S, S5, naprawa F4 — niedeterminizm): pierwotna wersja tej
+poprawki liczyła RATCHET_START jako najwcześniejszą `risk_date` już zapisaną
+dla pozycji w `risk_daily` sprzed D (`_earliest_prior_risk_date`, USUNIĘTA) —
+zależność od tabeli POCHODNEJ, więc wynik na D zależał od tego, które dni już
+przeliczono (niedeterministyczne) i nie resetował się po zamknięciu i ponownym
+otwarciu pozycji. Teraz RATCHET_START(pozycja, D) =
+`max(RATCHET_INIT_DATE, holding_period_start(D))`, gdzie `holding_period_start`
+= najpóźniejsza data ≤ D, w której ilość pozycji przeszła z 0 na ≠0 (z tych
+samych wierszy transakcji ≤ D co FIFO/`compute_weighted_entry_price`, splity
+nie zmieniają znaku/zera — patrz `fifo.compute_position`/`holding_period_start`),
+oraz `RATCHET_INIT_DATE = 2026-09-24` (data inicjalizacji systemu — [Z] jedyna
+i pierwsza data w `risk_daily` sprzed tej zmiany). D < RATCHET_INIT_DATE
+(system jeszcze nie działał) -> zapadka zaczyna się w D (jeden dzień, brak
+zapadki) — patrz `resolve_ratchet_start`. Stop na D zależy WYŁĄCZNIE od cen
+≤ D i transakcji ≤ D, zero zależności od `risk_daily`.
 Stary wariant ("zapadka od pierwszego pozostałego lotu") jest ZACHOWANY jako
 kolumna informacyjna `chandelier_from_entry` (+ `below_chandelier_from_entry`)
-— NIE wchodzi do `stop_effective`. Patrz `_earliest_prior_risk_date`.
+— NIE wchodzi do `stop_effective`.
+
+CC-S, S2/S3 (naprawa F1/F3 — look-ahead na dzień D): pozycje wejściowe do
+`run_risk` pochodzą z `fifo.positions_as_of(D)` (FIFO liczone PUNKTOWO na D z
+`transactions`/`corporate_events`), NIE z `positions_fifo` (stan zawsze "na
+dziś" — pozycja zamknięta po D by tam już nie istniała, split po D by już
+przeskalował ilość). Ilość/cena wejścia z `positions_as_of(D)` żyją w warstwie
+cen "na D" (bez wiedzy o zdarzeniach po D); ATR/stopy/Chandelier/close liczone
+są (jak zawsze, patrz wyżej) w warstwie `*_split_adj` z `prices.py` (seria
+Yahoo "dziś", uwzględnia WSZYSTKIE splity, także te po D). Żeby oba nie
+mieszały się w jednym wierszu, ilość/cenę wejścia przelicza się czynnikiem
+`f = layer_factor_after(events, D)` (iloczyn `ratio` zdarzeń split/reverse_split
+instrumentu WYCENIANEGO z `event_date > D` — te same typy zdarzeń, których
+używa `prices.reconstruct_raw`): `qty_adj = qty_D * f`, `entry_adj = entry_D / f`.
+Dla kontraktów terminowych (wyceniane na bazie instrumentu, ale `qty`/`entry`
+liczone na transakcjach SAMEGO kontraktu) `f = 1` — kontrakt nie ma własnych
+splitów, jego ilość jest w jednostkach kontraktu, nie serii cenowej bazy.
+Ta konwersja to WYŁĄCZNIE normalizacja warstwy cen (`f` nie niesie żadnej
+informacji o przyszłości do wyniku na D) — wartość pozycji w PLN na D jest
+z definicji niezależna od `f`: `qty_D * close_raw(D) == qty_adj * close_split_adj(D)`.
+`risk_daily` zapisuje `qty`/`entry_price` już w warstwie split_adj (`qty_adj`/
+`entry_adj`), spójnie z resztą wiersza.
 
 P4.2 (kontrakty terminowe): ATR/stopy/REGIME liczone na instrumencie BAZOWYM
 (`instruments.base_symbol` -> `instruments.yahoo_symbol` drugiego wiersza),
@@ -68,13 +99,13 @@ import math
 import statistics
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 import psycopg
 
-from mannaz.fifo import KONTRAKTOWY_PREFIX
+from mannaz.fifo import KONTRAKTOWY_PREFIX, positions_as_of
 
 # ---------------------------------------------------------------------------
 # Stałe (§19 dokumentu projektowego + brief P4.1/P4.2)
@@ -95,6 +126,13 @@ TWO_N_ATR_MULT = Decimal(2)
 LEVEL1_PCT = Decimal(1)
 LEVEL2_PCT = Decimal(3)
 LEVEL3_PCT = Decimal(15)
+
+# S5 (brief CC-S, F4): dzień inicjalizacji systemu ryzyka — [Z] jedyna i
+# pierwsza data w `risk_daily` PRZED tą zmianą. Zapadka Chandeliera
+# (RATCHET_START, patrz `resolve_ratchet_start`) nigdy nie zaczyna się wcześniej
+# niż ta data — system nie liczył ryzyka przed nią, więc nie ma czego
+# ratchetować wstecz.
+RATCHET_INIT_DATE = date(2026, 9, 24)
 
 # Splity GPW z jednostką w pensach (GBp) zamiast funtów — patrz corp_actions.py
 # `_pence_adjustment_factor` dla identycznej heurystyki (symbol '.L' + waluta
@@ -641,6 +679,99 @@ def compute_weighted_entry_price(
 
 
 # ---------------------------------------------------------------------------
+# Warstwa cen "na D" -> `*_split_adj` (brief CC-S, S3, naprawa F3) — patrz
+# akapit CC-S w docstringu modułu.
+# ---------------------------------------------------------------------------
+
+
+def layer_factor_after(events: list[dict[str, Any]], as_of: date) -> Decimal:
+    """S3 (brief CC-S): czynnik przejścia ilości/ceny z warstwy "na D" (FIFO
+    punktowy, `positions_as_of`/`compute_weighted_entry_price`) do warstwy
+    `*_split_adj` (`prices.py`) — iloczyn `ratio` zdarzeń z `event_date > D`.
+    events: [{'date','ratio'}] — DOKŁADNIE ten sam zestaw, którego używa
+    `prices.reconstruct_raw`/`cumulative_ratio_after` (`corporate_events`,
+    `ratio IS NOT NULL`, `event_type IN ('split', 'reverse_split')` — NIE
+    wszystkie zdarzenia ze znanym ratio jak przy FIFO, gdzie liczy się też
+    `share_exchange`). Kierunek identyczny jak `cumulative_ratio_after`: Yahoo
+    dzieli historyczne ceny przez `ratio` przy każdym kolejnym splicie, więc
+    `qty_adj = qty_D * f`, `entry_adj = entry_D / f`."""
+    factor = Decimal(1)
+    for e in events:
+        if e["date"] > as_of:
+            factor *= e["ratio"]
+    return factor
+
+
+# ---------------------------------------------------------------------------
+# Zapadka Chandeliera — RATCHET_START deterministyczny (brief CC-S, S5,
+# naprawa F4). Patrz akapit POPRAWKA (S5) w docstringu modułu.
+# ---------------------------------------------------------------------------
+
+
+def holding_period_start(rows: list[dict[str, Any]], events: list[dict[str, Any]]) -> date | None:
+    """Najpóźniejsza data, w której ILOŚĆ pozycji przeszła z 0 na ≠0 — tylko
+    wśród `rows`/`events` PRZEKAZANYCH przez wywołującego (żadnego filtra
+    `as_of` tutaj — ten sam wzorzec co `fifo.compute_position`: wywołujący
+    przekazuje już przefiltrowane dane `<= D`). `None` gdy pozycja jest
+    domknięta (qty końcowe == 0) — nie powinno się zdarzyć dla pozycji z
+    `qty != 0` na D, ale funkcja jest obronna.
+
+    rows: [{'date','type':'kupno'|'sprzedaz','qty'}] (te same dane co FIFO —
+    `_entry_transactions`/`compute_weighted_entry_price`, pole 'amount'/'price'
+    nieużywane tutaj). events: [{'date','ratio'}] (wszystkie zdarzenia ze
+    znanym ratio, jak w FIFO — nie tylko split/reverse_split, patrz
+    `layer_factor_after` dla kontrastu).
+
+    Algorytm: chronologiczny przebieg zdarzeń+transakcji (identyczna kolejność
+    scalania jak `compute_position`), śledzący TYLKO sumę ilości (nie
+    poszczególne loty — dla sumy netowanie FIFO jest tożsamościowo równe
+    zwykłej sumie podpisanej, splity mnożą całość przez `ratio` i NIGDY nie
+    zmieniają znaku/zera — stąd nie trzeba replikować pełnej struktury lotów)."""
+    rows_sorted = sorted(rows, key=lambda r: r["date"])
+    events_sorted = sorted(events, key=lambda e: e["date"])
+
+    qty = Decimal(0)
+    last_zero_to_nonzero: date | None = None
+    i, j = 0, 0
+    while i < len(events_sorted) or j < len(rows_sorted):
+        take_event = i < len(events_sorted) and (
+            j >= len(rows_sorted) or events_sorted[i]["date"] <= rows_sorted[j]["date"]
+        )
+        if take_event:
+            qty *= events_sorted[i]["ratio"]
+            i += 1
+            continue
+
+        r = rows_sorted[j]
+        prev_qty = qty
+        signed = r["qty"] if r["type"] == "kupno" else -r["qty"]
+        qty += signed
+        if prev_qty == 0 and qty != 0:
+            last_zero_to_nonzero = r["date"]
+        j += 1
+
+    if qty == 0:
+        return None
+    return last_zero_to_nonzero
+
+
+def resolve_ratchet_start(rows: list[dict[str, Any]], events: list[dict[str, Any]], as_of: date) -> date:
+    """RATCHET_START(pozycja, D) (brief CC-S, S5) = `max(RATCHET_INIT_DATE,
+    holding_period_start)`. `rows`/`events` MUSZĄ już być przefiltrowane do
+    `<= as_of` przez wywołującego (ten sam zestaw, co dla FIFO na D).
+    `as_of < RATCHET_INIT_DATE` -> system jeszcze nie działał -> zapadka
+    zaczyna się w `as_of` (jeden dzień, brak zapadki). Brak
+    `holding_period_start` (obronnie, nie powinno wystąpić dla pozycji z
+    qty != 0 na D) -> również `as_of`."""
+    if as_of < RATCHET_INIT_DATE:
+        return as_of
+    start = holding_period_start(rows, events)
+    if start is None:
+        return as_of
+    return max(RATCHET_INIT_DATE, start)
+
+
+# ---------------------------------------------------------------------------
 # Domyślne D — brief P4.1 [Z]: ostatnia sesja, dla której WSZYSTKIE instrumenty
 # satelity Z CENAMI NA TĘ DATĘ mają niepusty close_split_adj. Instrument bez
 # wiersza na daną datę (np. dane przestały napływać) NIE blokuje tej daty —
@@ -746,23 +877,46 @@ def resolve_default_risk_date(conn: psycopg.Connection) -> date | None:
     return resolve_default_date([(d, bool(any_null)) for d, any_null in rows])
 
 
-def _open_positions(cur: psycopg.Cursor) -> list[dict[str, Any]]:
-    cur.execute(
-        """
-        SELECT pf.rachunek, pf.instrument_id, pf.currency AS settlement_currency, pf.qty,
-               i.broker_ticker, i.instrument_type, i.is_core, i.base_symbol, i.multiplier,
-               i.yahoo_symbol, i.currency AS quote_currency, i.theme
-        FROM positions_fifo pf
-        JOIN instruments i ON i.id = pf.instrument_id
-        ORDER BY pf.rachunek, i.broker_ticker
-        """
-    )
-    cols = (
-        "rachunek", "instrument_id", "settlement_currency", "qty",
-        "broker_ticker", "instrument_type", "is_core", "base_symbol", "multiplier",
-        "yahoo_symbol", "quote_currency", "theme",
-    )
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
+    """S2/S3 (brief CC-S, F1 fix): pozycje na dzień D przez `fifo.positions_as_of`
+    (FIFO liczone punktowo na D, bez look-ahead) — zamiast czytania bieżącego
+    stanu `positions_fifo`. Atrybuty instrumentu JOIN z `instruments`, te same
+    klucze dict co dawne `_open_positions` (reszta `run_risk` bez zmian).
+    `qty` tutaj to ilość w warstwie "na D" (jeszcze nie w `*_split_adj`) —
+    patrz `layer_factor_after` w `run_risk`."""
+    positions = positions_as_of(cur, as_of)
+    out: list[dict[str, Any]] = []
+    for p in positions:
+        cur.execute(
+            """
+            SELECT broker_ticker, instrument_type, is_core, base_symbol, multiplier,
+                   yahoo_symbol, currency, theme
+            FROM instruments WHERE id = %s
+            """,
+            (p["instrument_id"],),
+        )
+        row = cur.fetchone()
+        if row is None:
+            continue  # obronnie — FK gwarantuje istnienie, nie powinno wystapic
+        broker_ticker, instrument_type, is_core, base_symbol, multiplier, yahoo_symbol, quote_currency, theme = row
+        out.append(
+            {
+                "rachunek": p["rachunek"],
+                "instrument_id": p["instrument_id"],
+                "settlement_currency": p["currency"],
+                "qty": p["qty"],
+                "broker_ticker": broker_ticker,
+                "instrument_type": instrument_type,
+                "is_core": is_core,
+                "base_symbol": base_symbol,
+                "multiplier": multiplier,
+                "yahoo_symbol": yahoo_symbol,
+                "quote_currency": quote_currency,
+                "theme": theme,
+            }
+        )
+    out.sort(key=lambda d: (d["rachunek"], d["broker_ticker"]))
+    return out
 
 
 def _base_instrument(cur: psycopg.Cursor, base_symbol: str | None) -> dict[str, Any] | None:
@@ -835,22 +989,24 @@ def _entry_transactions(
     ]
 
 
-def _earliest_prior_risk_date(
-    cur: psycopg.Cursor, rachunek: str, instrument_id: int, settlement_currency: str, before_date: date
-) -> date | None:
-    """RATCHET_START (poprawka §19.3): najwcześniejsza `risk_date` już
-    zapisana dla tej pozycji w `risk_daily` PRZED `before_date`. `None` gdy
-    brak takiego wiersza -> dzień zero dla tej pozycji, ratchet zaczyna się
-    dopiero od `before_date` samego (brak zapadki na pierwszym pomiarze)."""
+def _instrument_layer_events(cur: psycopg.Cursor, instrument_id: int) -> list[dict[str, Any]]:
+    """S3 (brief CC-S, F3): zdarzenia dla `layer_factor_after` — DOKŁADNIE ten
+    sam zestaw, którego używa `prices.reconstruct_raw`/`cumulative_ratio_after`
+    (`ratio IS NOT NULL`, `event_type IN ('split', 'reverse_split')`) — inny
+    (węższy) zestaw niż `_instrument_split_events` (FIFO: wszystkie zdarzenia
+    ze znanym ratio, także `share_exchange`). Bez filtra `as_of` w SQL —
+    `layer_factor_after` sam filtruje `event_date > as_of`, bo tu chodzi
+    właśnie o zdarzenia PO D."""
     cur.execute(
         """
-        SELECT MIN(risk_date) FROM risk_daily
-        WHERE rachunek = %s AND instrument_id = %s AND settlement_currency = %s AND risk_date < %s
+        SELECT event_date, ratio FROM corporate_events
+        WHERE instrument_id = %s AND ratio IS NOT NULL
+          AND event_type IN ('split', 'reverse_split')
+        ORDER BY event_date
         """,
-        (rachunek, instrument_id, settlement_currency, before_date),
+        (instrument_id,),
     )
-    row = cur.fetchone()
-    return row[0] if row else None
+    return [{"date": d, "ratio": r} for d, r in cur.fetchall()]
 
 
 def _kontraktowy_rows(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
@@ -891,7 +1047,9 @@ def _fx_rate_on_or_before(cur: psycopg.Cursor, currency: str, target_date: date)
     return row[1], row[0]
 
 
-def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary:
+def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool = True) -> RiskSummary:
+    """`commit=False` (brief CC-S, S4): nie wywołuje `conn.commit()` — do
+    testów bazodanowych z rollbackiem (zero trwałych zmian)."""
     if as_of is None:
         as_of = resolve_default_risk_date(conn)
         if as_of is None:
@@ -900,7 +1058,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
     summary = RiskSummary(risk_date=as_of)
 
     with conn.cursor() as cur:
-        positions = _open_positions(cur)
+        positions = _open_positions_as_of(cur, as_of)
         instrument_theme_by_id: dict[int, str] = {
             p["instrument_id"]: p["theme"] for p in positions if p["theme"] is not None
         }
@@ -916,8 +1074,11 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
             rachunek = pos["rachunek"]
             instrument_type = pos["instrument_type"]
             is_core = bool(pos["is_core"])
-            qty = pos["qty"]
-            is_short = qty < 0
+            # qty_d: ilość w warstwie "na D" (positions_as_of, FIFO bez
+            # look-ahead) — przeliczana do warstwy split_adj niżej, jak tylko
+            # znany jest instrument wyceniany (S3, brief CC-S, F1+F3).
+            qty_d = pos["qty"]
+            is_short = qty_d < 0  # znak niezmienny pod skalowaniem dodatnim czynnikiem f
             position_kind = "short" if is_short else "long"
             note = ""
             multiplier_missing = False
@@ -930,7 +1091,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                     computed.append(
                         _empty_row(
                             rachunek, pos["instrument_id"], broker_ticker, pos["settlement_currency"],
-                            None, instrument_type, is_core, qty, position_kind,
+                            None, instrument_type, is_core, qty_d, position_kind,
                             note="base_instrument_not_found", multiplier_missing=True,
                         )
                     )
@@ -942,20 +1103,30 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                 multiplier = pos["multiplier"]
                 if multiplier is None:
                     multiplier_missing = True
+                # Kontrakt terminowy nie ma własnych splitów — jego ilość jest
+                # w jednostkach kontraktu, nie serii cenowej bazy (S3).
+                layer_factor = Decimal(1)
             elif instrument_type in ("equity", "etf"):
                 price_instrument_id = pos["instrument_id"]
                 quote_currency = pos["quote_currency"]
                 yahoo_symbol = pos["yahoo_symbol"]
+                layer_events = _instrument_layer_events(cur, price_instrument_id)
+                layer_factor = layer_factor_after(layer_events, as_of)
             else:
                 computed.append(
                     _empty_row(
                         rachunek, pos["instrument_id"], broker_ticker, pos["settlement_currency"],
-                        pos["quote_currency"], instrument_type, is_core, qty, position_kind,
+                        pos["quote_currency"], instrument_type, is_core, qty_d, position_kind,
                         note="unsupported_instrument_type", multiplier_missing=False,
                     )
                 )
                 summary.excluded_no_price_tickers.append(broker_ticker)
                 continue
+
+            # qty: warstwa split_adj (S3) — spójna z ATR/stopami/close niżej.
+            # Wartość PLN na D jest z definicji niezależna od layer_factor
+            # (qty_d * close_raw(D) == qty * close_split_adj(D)).
+            qty = qty_d * layer_factor
 
             series = _price_series(cur, price_instrument_id, as_of)
             dates = series["dates"]
@@ -1009,8 +1180,17 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
             txn_rows = _entry_transactions(cur, rachunek, pos["instrument_id"], pos["settlement_currency"], as_of)
             entry_result = compute_weighted_entry_price(txn_rows, events, allow_short=allow_short)
 
-            if entry_result.qty != qty:
-                note = (note + ";" if note else "") + "entry_qty_mismatch_vs_positions_fifo"
+            # Porównanie w TEJ SAMEJ warstwie ("na D") — entry_result.qty i
+            # qty_d pochodzą oba z FIFO punktowego na D (S3, brief CC-S).
+            if entry_result.qty != qty_d:
+                note = (note + ";" if note else "") + "entry_qty_mismatch_vs_positions_as_of"
+
+            # entry_price z compute_weighted_entry_price jest w warstwie "na D"
+            # (te same events <= as_of co dla qty_d) — przeliczenie do
+            # split_adj tym samym layer_factor co qty (S3).
+            entry_price_adj = (
+                entry_result.entry_price / layer_factor if entry_result.entry_price is not None else None
+            )
 
             first_idx = None
             last_idx = None
@@ -1020,17 +1200,13 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                 last_idx = _index_on_or_before(dates, entry_result.last_remaining_date)
 
             atr20_at_last_entry = atr20[last_idx] if last_idx is not None else None
-            stop_2n = two_n_stop(entry_result.entry_price, atr20_at_last_entry, is_short)
+            stop_2n = two_n_stop(entry_price_adj, atr20_at_last_entry, is_short)
 
-            # --- stop_chandelier_D: zapadka od RATCHET_START = najwcześniejsza
-            # risk_date już zapisana dla tej pozycji PRZED D (§19.3 poprawka,
-            # sesja główna 2026-09-26). Brak wcześniejszego wiersza -> dzień
-            # zero -> RATCHET_START = D (wartość BEZ zapadki, jeden dzień). ---
-            ratchet_start_date = _earliest_prior_risk_date(
-                cur, rachunek, pos["instrument_id"], pos["settlement_currency"], as_of
-            )
-            if ratchet_start_date is None:
-                ratchet_start_date = as_of
+            # --- stop_chandelier_D: zapadka od RATCHET_START deterministyczny
+            # (brief CC-S, S5, naprawa F4) — tylko z cen/transakcji <= D, zero
+            # zależności od risk_daily. txn_rows/events już przefiltrowane do
+            # <= as_of (_entry_transactions/_instrument_split_events). ---
+            ratchet_start_date = resolve_ratchet_start(txn_rows, events, as_of)
             ratchet_start_idx = _index_on_or_after(dates, ratchet_start_date)
             if ratchet_start_idx is None:
                 ratchet_start_idx = d_idx
@@ -1072,7 +1248,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                 is_core=is_core,
                 qty=qty,
                 position_kind=position_kind,
-                entry_price=entry_result.entry_price,
+                entry_price=entry_price_adj,
                 close_d=close_d,
                 atr20=atr20_d,
                 atr22=atr22_d,
@@ -1224,14 +1400,35 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None) -> RiskSummary
                     nominal > 0 and Decimal("1e4") <= nominal <= Decimal("1e6")
                 )
 
-        # --- zapis do risk_daily ---
+        # --- zapis do risk_daily jako CAŁOŚĆ (brief CC-S, S4, naprawa F6):
+        # DELETE wszystkich wierszy D, potem zwykły INSERT każdego wiersza
+        # przebiegu (bez ON CONFLICT — po DELETE kluczy nie ma czym
+        # kolidować), jeden `computed_at` dla całego przebiegu, na końcu
+        # asercja liczby wierszy == liczba pozycji z positions_as_of(D)
+        # (wiersze "puste" z _empty_row TEŻ są wierszami pozycji — w
+        # risk_daily nie ma osobnych wierszy agregatów, patrz RiskSummary/
+        # `_write_row`/`_write_empty_row` — jeden wiersz per pozycja). Przy
+        # niezgodności: wyjątek PRZED commitem (rollback, brak trwałego
+        # zapisu). ---
+        cur.execute("DELETE FROM risk_daily WHERE risk_date = %s", (summary.risk_date,))
+        computed_at = datetime.now(timezone.utc)
         for row in computed:
             if isinstance(row, dict):
-                _write_empty_row(cur, summary.risk_date, row)
+                _write_empty_row(cur, summary.risk_date, row, computed_at)
                 continue
-            _write_row(cur, summary.risk_date, row)
+            _write_row(cur, summary.risk_date, row, computed_at)
 
-        conn.commit()
+        cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (summary.risk_date,))
+        actual_count = cur.fetchone()[0]
+        if actual_count != len(positions):
+            conn.rollback()
+            raise RuntimeError(
+                f"risk_daily: D={summary.risk_date} liczba wierszy po zapisie ({actual_count}) "
+                f"!= liczba pozycji z positions_as_of ({len(positions)}) — rollback (S4, brief CC-S)."
+            )
+
+        if commit:
+            conn.commit()
 
     summary.rows = [r for r in computed if not isinstance(r, dict)]
     return summary
@@ -1297,7 +1494,12 @@ def _empty_row(
     }
 
 
-def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow) -> None:
+def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, computed_at: datetime) -> None:
+    """S4 (brief CC-S): zwykły INSERT (bez ON CONFLICT — `run_risk` robi
+    DELETE FROM risk_daily WHERE risk_date=D PRZED zapisem całego przebiegu,
+    więc w obrębie D nie ma z czym kolidować). `computed_at` jeden dla
+    całego przebiegu, przekazany jawnie (kolumna ma DEFAULT now(), ale wtedy
+    każdy wiersz dostałby inną wartość)."""
     cur.execute(
         """
         INSERT INTO risk_daily (
@@ -1308,7 +1510,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow) -> No
             chandelier_from_entry, below_chandelier_from_entry,
             position_kind, risk_native, fx_rate, fx_rate_date, risk_pln,
             risk_pct_satellite_capital, level1_breach,
-            regime, warning, multiplier_missing, note
+            regime, warning, multiplier_missing, note, computed_at
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s,
@@ -1317,37 +1519,8 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow) -> No
             %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s,
-            %s, %s, %s, %s
+            %s, %s, %s, %s, %s
         )
-        ON CONFLICT (rachunek, instrument_id, settlement_currency, risk_date) DO UPDATE SET
-            atr20 = EXCLUDED.atr20,
-            atr22 = EXCLUDED.atr22,
-            sma200 = EXCLUDED.sma200,
-            chandelier_stop = EXCLUDED.chandelier_stop,
-            two_n_stop = EXCLUDED.two_n_stop,
-            risk_state = EXCLUDED.risk_state,
-            quote_currency = EXCLUDED.quote_currency,
-            qty = EXCLUDED.qty,
-            entry_price = EXCLUDED.entry_price,
-            close_d = EXCLUDED.close_d,
-            stop_effective = EXCLUDED.stop_effective,
-            stop_source = EXCLUDED.stop_source,
-            chandelier_hold = EXCLUDED.chandelier_hold,
-            below_chandelier_hold = EXCLUDED.below_chandelier_hold,
-            chandelier_from_entry = EXCLUDED.chandelier_from_entry,
-            below_chandelier_from_entry = EXCLUDED.below_chandelier_from_entry,
-            position_kind = EXCLUDED.position_kind,
-            risk_native = EXCLUDED.risk_native,
-            fx_rate = EXCLUDED.fx_rate,
-            fx_rate_date = EXCLUDED.fx_rate_date,
-            risk_pln = EXCLUDED.risk_pln,
-            risk_pct_satellite_capital = EXCLUDED.risk_pct_satellite_capital,
-            level1_breach = EXCLUDED.level1_breach,
-            regime = EXCLUDED.regime,
-            warning = EXCLUDED.warning,
-            multiplier_missing = EXCLUDED.multiplier_missing,
-            note = EXCLUDED.note,
-            computed_at = now()
         """,
         (
             row.rachunek, row.instrument_id, risk_date, row.atr20, row.atr22, row.sma200,
@@ -1357,30 +1530,24 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow) -> No
             row.chandelier_from_entry, row.below_chandelier_from_entry,
             row.position_kind, row.risk_native, row.fx_rate, row.fx_rate_date, row.risk_pln,
             row.risk_pct_satellite_capital, row.level1_breach,
-            row.regime, row.warning, row.multiplier_missing, row.note,
+            row.regime, row.warning, row.multiplier_missing, row.note, computed_at,
         ),
     )
 
 
-def _write_empty_row(cur: psycopg.Cursor, risk_date: date, row: dict[str, Any]) -> None:
+def _write_empty_row(cur: psycopg.Cursor, risk_date: date, row: dict[str, Any], computed_at: datetime) -> None:
+    """S4: jak `_write_row` — zwykły INSERT, jeden `computed_at` per przebieg."""
     cur.execute(
         """
         INSERT INTO risk_daily (
             rachunek, instrument_id, risk_date,
             settlement_currency, quote_currency, qty, position_kind,
-            multiplier_missing, note
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (rachunek, instrument_id, settlement_currency, risk_date) DO UPDATE SET
-            quote_currency = EXCLUDED.quote_currency,
-            qty = EXCLUDED.qty,
-            position_kind = EXCLUDED.position_kind,
-            multiplier_missing = EXCLUDED.multiplier_missing,
-            note = EXCLUDED.note,
-            computed_at = now()
+            multiplier_missing, note, computed_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             row["rachunek"], row["instrument_id"], risk_date,
             row["settlement_currency"], row["quote_currency"], row["qty"], row["position_kind"],
-            row["multiplier_missing"], row["note"],
+            row["multiplier_missing"], row["note"], computed_at,
         ),
     )

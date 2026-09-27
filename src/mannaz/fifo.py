@@ -22,6 +22,19 @@ tworzy nowy lot:
     wcześniejszego kupna to prawdopodobnie luka w historii, nie świadomy
     short) -> nowy lot ujemny z umownym kosztem zerowym (nie znamy kosztu
     historycznego), liczony osobno jako `oversell_events`.
+
+Brief CC-S, S2 (naprawa F1/F2 — look-ahead w `run_risk`): `positions_as_of`
+liczy pozycje PUNKTOWO na dowolny dzień `as_of` (nie tylko "dziś") wprost z
+`transactions`/`corporate_events` — bez czytania `positions_fifo` (ten stan
+jest zawsze "na dziś", niezależnie od tego, jaki `as_of` interesuje
+wywołującego). `run_fifo` i `positions_as_of` dzielą JEDEN rdzeń
+(`_compute_positions`/`_resolve_position`/`resolve_position_as_of`) — `run_fifo`
+dodatkowo zapisuje wynik do `positions_fifo` (stan "na dziś", jak dotychczas).
+F2: wykup certyfikatu domyka pozycję tylko, gdy zdarzenie jest NIE WCZEŚNIEJSZE
+niż OSTATNIA transakcja kupna/sprzedaży ZNANA NA `as_of` (podzapytanie
+max(transaction_date) filtrowane `<= as_of` — wcześniej filtr ten brakował,
+więc late-arriving repurchase (transakcja po `as_of`) mogła fałszywie maskować
+wykup, który z perspektywy `as_of` już domykał pozycję).
 """
 
 from __future__ import annotations
@@ -143,6 +156,202 @@ def resolve_effective_qty_after_expiry(
     return qty, False
 
 
+# Mapowanie row_type -> typ FIFO ('kupno'/'sprzedaz') — bilans otwarcia i
+# wymiana instrumentu (zamiana_wydanie/zamiana_przyjecie) są dla FIFO
+# równoważne kupnu/sprzedaży (brief CC-P P2.5, przekrój B/R/K).
+_ROW_TYPE_TO_FIFO_TYPE = {
+    "bilans_otwarcia": "kupno",
+    "zamiana_przyjecie": "kupno",
+    "zamiana_wydanie": "sprzedaz",
+}
+_FIFO_ROW_TYPES = ("kupno", "sprzedaz", "bilans_otwarcia", "zamiana_przyjecie", "zamiana_wydanie")
+
+
+def resolve_position_as_of(
+    rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    as_of: date,
+    instrument_type: str,
+    contract_expiry: date | None,
+    certificate_redemption_dates: list[date],
+    allow_short: bool = False,
+) -> tuple[PositionResult, Decimal, bool]:
+    """Czysty rdzeń pozycji NA DZIEŃ `as_of` (brief CC-S, S2) — bez bazy,
+    testowalny wprost (żadna zależność od kursora SQL). Sam filtruje
+    `rows`/`events` do `date <= as_of` (dzięki temu wywołujący może przekazać
+    całą historię instrumentu i dostać poprawny wynik dla dowolnego `as_of`).
+
+    rows: [{'date','row_type','qty','amount'}], row_type NIEZMAPOWANY (jak w
+    `transactions.row_type` — mapowanie na 'kupno'/'sprzedaz' odbywa się tu, tak
+    samo jak w `run_fifo`/`_entry_transactions`). Wiersze o innym row_type są
+    ignorowane (jak w oryginalnym filtrze SQL `row_type IN (...)`).
+    events: [{'date','ratio'}] — zdarzenia korporacyjne ze znanym ratio (jak w
+    `run_fifo`, WSZYSTKIE typy, nie tylko split/reverse_split — tu chodzi o
+    skalowanie lotów FIFO, nie o warstwę cen, patrz `risk.py` S3).
+    certificate_redemption_dates: daty zdarzeń `certificate_redemption` dla
+    tego instrumentu (dowolna liczba, nieposortowane).
+
+    Zwraca (PositionResult, effective_qty, expired_closed) — `effective_qty`
+    już uwzględnia wygaśnięcie kontraktu terminowego i wykup certyfikatu
+    (F2 fix: oba sprawdzenia ograniczone do `<= as_of`, więc zdarzenie/
+    transakcja PO `as_of` nigdy nie wpływa na wynik na `as_of` — brak
+    look-ahead)."""
+    rows_f = [r for r in rows if r["date"] <= as_of]
+    events_f = [e for e in events if e["date"] <= as_of]
+
+    fifo_rows = [
+        {
+            "date": r["date"],
+            "type": _ROW_TYPE_TO_FIFO_TYPE.get(r["row_type"], r["row_type"]),
+            "qty": r["qty"],
+            "amount": abs(r["amount"]),
+        }
+        for r in rows_f
+        if r["row_type"] in _FIFO_ROW_TYPES
+    ]
+    pos = compute_position(fifo_rows, events_f, allow_short=allow_short)
+
+    effective_qty, expired_closed = resolve_effective_qty_after_expiry(
+        pos.qty, instrument_type, contract_expiry, as_of
+    )
+
+    if not expired_closed and effective_qty != 0:
+        # F2: wykup certyfikatu domyka pozycję, gdy nie ma PO NIM (a do
+        # `as_of` włącznie) żadnej transakcji kupna/sprzedaży — obie granice
+        # (transakcje i zdarzenie) liczone WYŁĄCZNIE z perspektywy `as_of`.
+        buy_sell_dates = [r["date"] for r in rows_f if r["row_type"] in ("kupno", "sprzedaz")]
+        max_txn_date = max(buy_sell_dates) if buy_sell_dates else None
+        if max_txn_date is not None and any(
+            max_txn_date <= d <= as_of for d in certificate_redemption_dates
+        ):
+            effective_qty, expired_closed = Decimal(0), True
+
+    return pos, effective_qty, expired_closed
+
+
+def _resolve_position(
+    cur: psycopg.Cursor, rachunek: str, instrument_id: int, currency: str, as_of: date
+) -> dict[str, Any]:
+    """Wrapper DB nad `resolve_position_as_of` dla jednej grupy (rachunek,
+    instrument, waluta rozliczenia) — pobiera CAŁĄ historię do `as_of`
+    (transakcje/zdarzenia/wykup) i deleguje liczenie do rdzenia czystego."""
+    allow_short = rachunek.upper().startswith(KONTRAKTOWY_PREFIX)
+
+    cur.execute(
+        """
+        SELECT transaction_date, row_type, qty, amount
+        FROM transactions
+        WHERE rachunek = %s AND instrument_id = %s AND currency = %s
+          AND row_type IN ('kupno', 'sprzedaz', 'bilans_otwarcia', 'zamiana_przyjecie', 'zamiana_wydanie')
+          AND transaction_date <= %s
+        ORDER BY transaction_date, id
+        """,
+        (rachunek, instrument_id, currency, as_of),
+    )
+    rows = [
+        {"date": d, "row_type": rt, "qty": qty, "amount": amount}
+        for d, rt, qty, amount in cur.fetchall()
+    ]
+
+    cur.execute(
+        """
+        SELECT event_date, ratio FROM corporate_events
+        WHERE instrument_id = %s AND ratio IS NOT NULL AND event_date <= %s
+        ORDER BY event_date
+        """,
+        (instrument_id, as_of),
+    )
+    events = [{"date": d, "ratio": ratio} for d, ratio in cur.fetchall()]
+
+    cur.execute(
+        "SELECT broker_ticker, instrument_type, contract_expiry FROM instruments WHERE id = %s",
+        (instrument_id,),
+    )
+    broker_ticker, instrument_type, contract_expiry = cur.fetchone()
+
+    cur.execute(
+        "SELECT event_date FROM corporate_events WHERE instrument_id = %s AND event_type = 'certificate_redemption'",
+        (instrument_id,),
+    )
+    certificate_redemption_dates = [row[0] for row in cur.fetchall()]
+
+    pos, effective_qty, expired_closed = resolve_position_as_of(
+        rows, events, as_of, instrument_type, contract_expiry,
+        certificate_redemption_dates, allow_short=allow_short,
+    )
+
+    return {
+        "rachunek": rachunek,
+        "instrument_id": instrument_id,
+        "currency": currency,
+        "pos": pos,
+        "broker_ticker": broker_ticker,
+        "instrument_type": instrument_type,
+        "allow_short": allow_short,
+        "effective_qty": effective_qty,
+        "expired_closed": expired_closed,
+    }
+
+
+def _compute_positions(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
+    """Rdzeń DB (brief CC-S, S2): jedna implementacja pętli FIFO dzielona przez
+    `run_fifo` (as_of=dziś, zapis do `positions_fifo`) i `positions_as_of`
+    (odczyt punktowy, bez zapisu). Zwraca surowe składniki per grupa (rachunek,
+    instrument, waluta) — filtrowanie na "otwarte na as_of" robi wywołujący."""
+    cur.execute(
+        """
+        SELECT DISTINCT t.rachunek, t.instrument_id, t.currency
+        FROM transactions t
+        WHERE t.row_type IN ('kupno', 'sprzedaz', 'bilans_otwarcia', 'zamiana_przyjecie', 'zamiana_wydanie')
+          AND t.instrument_id IS NOT NULL
+          AND t.transaction_date <= %s
+        """,
+        (as_of,),
+    )
+    groups = cur.fetchall()
+    return [
+        _resolve_position(cur, rachunek, instrument_id, currency, as_of)
+        for rachunek, instrument_id, currency in groups
+    ]
+
+
+def positions_as_of(conn_or_cur: psycopg.Connection | psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
+    """S2 (brief CC-S, F1 fix): pozycje otwarte na KONIEC DNIA `as_of`, liczone
+    punktowo z `transactions`/`corporate_events` (nie z `positions_fifo`, który
+    jest zawsze stanem "na dziś" — pozycja zamknięta po `as_of` by tam już nie
+    istniała, split po `as_of` by już przeskalował ilość). Zwraca listę dictów
+    z tymi samymi kluczami co wiersz `positions_fifo`: rachunek, instrument_id,
+    currency, qty, residual_cost, first_entry_date, last_entry_date. Pomija
+    pozycje domknięte na `as_of` (qty==0 albo domknięte przez wygaśnięcie
+    kontraktu/wykup certyfikatu, patrz `resolve_position_as_of`).
+    `conn_or_cur`: połączenie LUB istniejący kursor (przydatne w testach
+    bazodanowych z jedną transakcją)."""
+
+    def _run(cur: psycopg.Cursor) -> list[dict[str, Any]]:
+        out = []
+        for item in _compute_positions(cur, as_of):
+            if item["expired_closed"] or item["effective_qty"] == 0:
+                continue
+            pos = item["pos"]
+            out.append(
+                {
+                    "rachunek": item["rachunek"],
+                    "instrument_id": item["instrument_id"],
+                    "currency": item["currency"],
+                    "qty": pos.qty,
+                    "residual_cost": pos.residual_cost,
+                    "first_entry_date": pos.first_entry_date,
+                    "last_entry_date": pos.last_entry_date,
+                }
+            )
+        return out
+
+    if hasattr(conn_or_cur, "cursor"):
+        with conn_or_cur.cursor() as cur:  # type: ignore[union-attr]
+            return _run(cur)
+    return _run(conn_or_cur)  # type: ignore[arg-type]
+
+
 @dataclass
 class FifoSummary:
     open_positions_per_rachunek: dict[str, int] = field(default_factory=dict)
@@ -182,6 +391,10 @@ def ensure_contract_expiry_populated(conn: psycopg.Connection) -> int:
 
 
 def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary:
+    """Brief CC-S, S2: pętla FIFO nie jest już zduplikowana tutaj — liczy przez
+    ten sam rdzeń co `positions_as_of` (`_compute_positions`), z `as_of`
+    domyślnie dzisiejszym (jak dotychczas). Zapis do `positions_fifo` (te same
+    kolumny/DELETE dla zamkniętych) bez zmian względem poprzedniej wersji."""
     if as_of is None:
         as_of = date.today()
 
@@ -189,77 +402,23 @@ def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary
     ensure_contract_expiry_populated(conn)
 
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT t.rachunek, t.instrument_id, t.currency
-            FROM transactions t
-            WHERE t.row_type IN ('kupno', 'sprzedaz', 'bilans_otwarcia', 'zamiana_przyjecie', 'zamiana_wydanie') AND t.instrument_id IS NOT NULL
-            """
-        )
-        groups = cur.fetchall()
-
         open_counts: dict[str, int] = {}
         negative_map: dict[str, list[str]] = {}
         oversell_map: dict[str, list[str]] = {}
         expired_counts: dict[str, int] = {}
 
-        for rachunek, instrument_id, currency in groups:
-            allow_short = rachunek.upper().startswith(KONTRAKTOWY_PREFIX)
-
-            cur.execute(
-                """
-                SELECT transaction_date, row_type, qty, amount
-                FROM transactions
-                WHERE rachunek = %s AND instrument_id = %s AND currency = %s
-                  AND row_type IN ('kupno', 'sprzedaz', 'bilans_otwarcia', 'zamiana_przyjecie', 'zamiana_wydanie')
-                ORDER BY transaction_date, id
-                """,
-                (rachunek, instrument_id, currency),
-            )
-            rows = [
-                {"date": d, "type": {"bilans_otwarcia": "kupno", "zamiana_przyjecie": "kupno", "zamiana_wydanie": "sprzedaz"}.get(rt, rt), "qty": qty, "amount": abs(amount)}
-                for d, rt, qty, amount in cur.fetchall()
-            ]
-
-            cur.execute(
-                """
-                SELECT event_date, ratio FROM corporate_events
-                WHERE instrument_id = %s AND ratio IS NOT NULL
-                ORDER BY event_date
-                """,
-                (instrument_id,),
-            )
-            events = [{"date": d, "ratio": ratio} for d, ratio in cur.fetchall()]
-
-            pos = compute_position(rows, events, allow_short=allow_short)
-
-            cur.execute(
-                "SELECT broker_ticker, instrument_type, contract_expiry FROM instruments WHERE id = %s",
-                (instrument_id,),
-            )
-            broker_ticker, instrument_type, contract_expiry = cur.fetchone()
+        for item in _compute_positions(cur, as_of):
+            rachunek = item["rachunek"]
+            instrument_id = item["instrument_id"]
+            currency = item["currency"]
+            pos = item["pos"]
+            broker_ticker = item["broker_ticker"]
+            allow_short = item["allow_short"]
+            effective_qty = item["effective_qty"]
+            expired_closed = item["expired_closed"]
 
             if not allow_short and pos.oversell_events > 0:
                 oversell_map.setdefault(rachunek, []).append(broker_ticker)
-
-            effective_qty, expired_closed = resolve_effective_qty_after_expiry(
-                pos.qty, instrument_type, contract_expiry, as_of
-            )
-
-            # certificate redemption (wykup) closes the whole position when no
-            # transaction follows it
-            cur.execute(
-                """
-                SELECT 1 FROM corporate_events c
-                WHERE c.instrument_id = %s AND c.event_type = 'certificate_redemption'
-                  AND c.event_date <= %s
-                  AND c.event_date >= (SELECT max(transaction_date) FROM transactions
-                                       WHERE instrument_id = %s AND row_type IN ('kupno', 'sprzedaz'))
-                """,
-                (instrument_id, as_of, instrument_id),
-            )
-            if not expired_closed and effective_qty != 0 and cur.fetchone():
-                effective_qty, expired_closed = 0, True
 
             if expired_closed:
                 expired_counts[rachunek] = expired_counts.get(rachunek, 0) + 1
