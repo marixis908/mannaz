@@ -8,6 +8,8 @@ _incoming/
 *.dump
 *.sql.gz
 backups/
+# wynik dashboardu (dane portfela) — nigdy w repo
+out/
 # sekrety
 .env
 .env.*
