@@ -16,11 +16,10 @@ bazy). Kontrakt danych — autorytatywny, rozstrzyga wątpliwości:
 ## Uruchomienie (PowerShell, z dowolnego katalogu)
 
 ```powershell
-& C:\Users\MariuszBrysik\projects\Mannaz\.venv\Scripts\python.exe C:\Users\MariuszBrysik\projects\Mannaz-dashboard\scripts\dashboard\generate.py --date 2026-09-25 --risk-date 2026-09-25 --out C:\Users\MariuszBrysik\projects\Mannaz\tmp\dashboard\out\dashboard-2026-09-25.html
+& C:\Users\MariuszBrysik\projects\Mannaz\.venv\Scripts\python.exe C:\Users\MariuszBrysik\projects\Mannaz\scripts\dashboard\generate.py --date <D> --risk-date <D> --out C:\Users\MariuszBrysik\projects\Mannaz\tmp\dashboard\out\dashboard-<D>.html
 ```
 
-Po merge do `main`: ścieżkę skryptu zamienić na
-`C:\Users\MariuszBrysik\projects\Mannaz\scripts\dashboard\generate.py`.
+`<D>` = data w formacie `RRRR-MM-DD` (np. `2026-09-25`) — podstawić przed uruchomieniem.
 Wynik zawsze do katalogu ignorowanego (`tmp\` albo `out\`) — nigdy do indeksu git.
 
 `--date` (D składu) i `--risk-date` (D ryzyka) są WYMAGANE, bez wartości
