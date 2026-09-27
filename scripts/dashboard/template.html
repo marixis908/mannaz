@@ -365,10 +365,21 @@
     grid.appendChild(kpi(
       "Najstarsza cena SAT",
       m.freshness.oldest_sat_price_age_days === null ? null : (m.freshness.oldest_sat_price_age_days + " dni"),
-      "Maksymalny wiek ceny (D - price_date) wśród pozycji SAT"
+      "Maksymalny wiek ceny (D - price_date_used) wśród pozycji SAT"
     ));
     grid.appendChild(kpi("Data FX (max)", formatDate(m.freshness.fx_date_max), "Najświeższa data kursu NBP A użyta w przeliczeniach"));
     grid.appendChild(kpi("Ostatni fetch źródeł", formatDate(m.freshness.max_source_run_fetched_at), "max(source_runs.fetched_at)"));
+
+    grid.appendChild(kpi(
+      "T27: pokrycie ceny (ok / stale / incomplete)",
+      m.freshness.t27_coverage.ok + " / " + m.freshness.t27_coverage.stale + " / " + m.freshness.t27_coverage.incomplete,
+      "Wszystkie pozycje przed konsolidacją (" + m.freshness.t27_coverage.total + "), reguła T27: forward-fill maks. 2 sesje, tylko rynek zamknięty, zawsze flaga"
+    ));
+    grid.appendChild(kpi(
+      "Najstarsza price_date_used",
+      formatDate(m.freshness.oldest_price_date_used),
+      "Najstarsza data ceny faktycznie użytej (T27) wśród wszystkich pozycji"
+    ));
 
     grid.appendChild(kpi(
       "Liczba pozycji SAT",
@@ -378,12 +389,16 @@
     grid.appendChild(kpi(
       "Wartość satelity (BW)",
       m.bw === null ? null : formatPl(m.bw, 2) + " PLN",
-      "BW = Σ wartość rynkowa PLN pozycji SAT (po konsolidacji), NBP A ≤ D, bez gotówki (B-17)"
+      m.bw === null
+        ? "brak pomiaru: BW niekompletne wg T27 (" + m.bw_coverage.n + "/" + m.bw_coverage.N + " pozycji SAT z ceną)"
+        : "BW = Σ wartość rynkowa PLN pozycji SAT (po konsolidacji), NBP A ≤ D, bez gotówki (B-17)"
     ));
     grid.appendChild(kpi(
       "Udział satelity",
       m.sat_share_of_calosc === null ? null : formatPct(m.sat_share_of_calosc * 100, 2),
-      "BW / CAŁOŚĆ (CAŁOŚĆ = BW + rdzeń), bez gotówki i rachunku KONTRAKTOWY"
+      m.sat_share_of_calosc === null
+        ? "brak pomiaru: BW " + m.bw_coverage.n + "/" + m.bw_coverage.N + "; CORE " + m.core_value_coverage.n + "/" + m.core_value_coverage.N
+        : "BW / CAŁOŚĆ (CAŁOŚĆ = BW + rdzeń), bez gotówki i rachunku KONTRAKTOWY"
     ));
 
     grid.appendChild(kpi(
@@ -607,6 +622,7 @@
     { key: "qty", label: "Ilość", type: "num", decimals: 4 },
     { key: "close_raw", label: "Cena ≤ D", type: "num", decimals: 4 },
     { key: "price_age_days", label: "Wiek ceny", type: "num", decimals: 0 },
+    { key: "price_status", label: "Cena (T27)", type: "str" },
     { key: "value_pln", label: "Wartość PLN", type: "num", decimals: 2 },
     { key: "weight", label: "Waga (BW)", type: "pct", decimals: 2 },
     { key: "result_a", label: "Wynik (a)", type: "resulta" },
@@ -754,8 +770,32 @@
       tr.appendChild(numCell(r.qty, { decimals: 4 }));
       tr.appendChild(numCell(r.close_raw, { decimals: 4, reason: "brak ceny ≤ D w prices_daily", title: r.price_date ? ("na " + formatDate(r.price_date)) : "" }));
       tr.appendChild(numCell(r.price_age_days, { decimals: 0 }));
+
+      // Cena wg T27 (kontrakt §3/§4): status pozycji scalonej = najgorszy ze
+      // składowych (już wyliczone w model.consolidate_positions).
+      var tdPriceStatus = el("td");
+      if (r.price_status === "incomplete") {
+        tdPriceStatus.appendChild(naSpan("brak pomiaru: " + r.incomplete_reason + " (T27)"));
+      } else if (r.price_status === "stale") {
+        tdPriceStatus.appendChild(el("span", {
+          cls: "tag warn", text: "cena nieświeża (T27)",
+          title: "price_date_used: " + (formatDate(r.price_date_used) || "—"),
+        }));
+      } else {
+        tdPriceStatus.appendChild(el("span", {
+          cls: "tag ok", text: "ok",
+          title: "price_date_used: " + (formatDate(r.price_date_used) || "—"),
+        }));
+      }
+      tr.appendChild(tdPriceStatus);
+
       tr.appendChild(numCell(r.value_pln, { decimals: 2, reason: r.value_pln_brak }));
-      tr.appendChild(numCell(r.weight, { pct: true, decimals: 2, reason: r.set !== "SAT" ? "poza mianownikiem wag BW (tylko SAT)" : r.value_pln_brak }));
+      tr.appendChild(numCell(r.weight, {
+        pct: true, decimals: 2,
+        reason: r.set !== "SAT"
+          ? "poza mianownikiem wag BW (tylko SAT)"
+          : (r.value_pln_brak || ("brak pomiaru: BW niekompletne wg T27 (" + DATA.meta.bw_coverage.n + "/" + DATA.meta.bw_coverage.N + " pozycji SAT z ceną)")),
+      }));
 
       // Wynik (a)
       var ra = r.result_a;
@@ -785,6 +825,7 @@
         tdState.appendChild(tag);
         if (risk.regime) tdState.appendChild(el("span", { cls: "tag warn", text: "REGIME", title: "close<SMA200, SMA200 opada" }));
         if (risk.warning) tdState.appendChild(el("span", { cls: "tag warn", text: "OSTRZ.", title: "σ20>2×σ60 lub blisko 252d minimum" }));
+        if (risk.price_is_stale) tdState.appendChild(el("span", { cls: "tag warn", text: "cena nieświeża (T27)", title: "price_date_used (ryzyko): " + (formatDate(risk.price_date_used) || "—") }));
       }
       tr.appendChild(tdState);
 
@@ -825,19 +866,26 @@
     var risk = DATA.risk;
     var prov = risk.provenance;
 
-    var banner = el("div", { cls: "risk-banner " + (prov.passed ? "ok" : "bad") });
-    banner.appendChild(el("div", {
-      text: prov.passed ? "Pochodzenie: test zachowania, bez SHA w bazie — PASS (3/3)" : "Pochodzenie: FAIL",
-    }));
-    if (!prov.passed) {
-      var ul = el("ul", { cls: "plain" });
-      prov.failed_tests.forEach(function (t) { ul.appendChild(el("li", { text: t })); });
-      banner.appendChild(ul);
+    var overall = prov.overall_status || (prov.passed ? "PASS" : "FAIL");
+    var banner = el("div", { cls: "risk-banner " + (overall === "PASS" ? "ok" : "bad") });
+    var headline = overall === "PASS"
+      ? "Pochodzenie: test zachowania, bez SHA w bazie — PASS"
+      : (overall === "NIEROZSTRZYGNIETY" ? "Pochodzenie: NIEROZSTRZYGNIETY" : "Pochodzenie: FAIL");
+    banner.appendChild(el("div", { text: headline }));
+
+    var ul = el("ul", { cls: "plain" });
+    (prov.tests || []).forEach(function (t) { ul.appendChild(el("li", { text: t.name + ": " + t.status })); });
+    banner.appendChild(ul);
+
+    if (prov.note) {
+      banner.appendChild(el("div", { cls: "note", text: prov.note }));
+    }
+    if (overall !== "PASS") {
       banner.appendChild(el("div", { cls: "note", text: "Sekcja ryzyka i kolumny ryzyka w tabeli pozycji: brak pomiaru (patrz testy powyżej)." }));
     }
     panel.appendChild(banner);
 
-    if (!prov.passed) return;
+    if (overall !== "PASS") return;
 
     var grid = el("div", { cls: "grid grid-3" });
 
@@ -872,11 +920,19 @@
       box.appendChild(el("div", { cls: "label", text: "Pokrycie cen (SAT+FUT, D ryzyka)" }));
       var v = el("div", { cls: "value" });
       if (!risk.price_coverage) { v.appendChild(naSpan()); }
+      else { v.textContent = risk.price_coverage.n + " / " + risk.price_coverage.N; }
+      box.appendChild(v);
+      return box;
+    })());
+
+    grid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Ceny nieświeże w risk_daily (SAT+FUT)" }));
+      var v = el("div", { cls: "value" });
+      if (!risk.stale_coverage) { v.appendChild(naSpan()); }
       else {
-        v.textContent = risk.price_coverage.n + " / " + risk.price_coverage.N;
-        if (risk.price_coverage.n < risk.price_coverage.N) {
-          box.appendChild(el("div", { cls: "tag warn", text: "zaniżone — niepełne ceny (B-19)" }));
-        }
+        v.textContent = risk.stale_coverage.n + " / " + risk.stale_coverage.N;
+        v.title = "price_is_stale=true wśród wierszy SAT+FUT / wszystkie SAT+FUT na D ryzyka (zastępuje etykietę B-19)";
       }
       box.appendChild(v);
       return box;
@@ -1004,9 +1060,8 @@
     var q = DATA.quality_footer;
 
     var items = [
-      ["Brak FX ≤ D (waluta obsługiwana, brak kursu na D)", q.brak_fx],
-      ["Brak ceny ≤ D", q.brak_cena],
-      ["Wiek ceny > 3 dni", q.wiek_ceny_gt_3],
+      ["Brak kursu krzyżowego rozliczenia (wynik a)", q.brak_fx_rozliczenia],
+      ["Cena T27 stale (pozycje, przed konsolidacją)", q.t27_stale_count],
       ["Brak ISIN", q.brak_isin],
       ["Scalenia wykonane", q.scalenia_wykonane],
       ["Scalenia niejednoznaczne (nie scalono)", q.scalenia_niejednoznaczne],
@@ -1023,6 +1078,26 @@
     items.forEach(function (pair) {
       ul.appendChild(el("li", { text: pair[0] + ": " + pair[1] }));
     });
+
+    Object.keys(q.t27_incomplete_by_reason).sort().forEach(function (reason) {
+      ul.appendChild(el("li", { text: "Cena T27 incomplete (" + reason + "): " + q.t27_incomplete_by_reason[reason] }));
+    });
+    if (Object.keys(q.t27_incomplete_by_reason).length === 0) {
+      ul.appendChild(el("li", { text: "Cena T27 incomplete: 0" }));
+    }
+
+    if (q.risk_price_stale) {
+      ul.appendChild(el("li", { text: "Ceny nieświeże w risk_daily (SAT+FUT): " + q.risk_price_stale.n + "/" + q.risk_price_stale.N }));
+    } else {
+      var liStale = el("li", { text: "Ceny nieświeże w risk_daily (SAT+FUT): " });
+      liStale.appendChild(naSpan("sekcja ryzyka: brak pomiaru"));
+      ul.appendChild(liStale);
+    }
+
+    (q.provenance_tests || []).forEach(function (t) {
+      ul.appendChild(el("li", { text: "Test pochodzenia — " + t.name + ": " + t.status }));
+    });
+
     ul.appendChild(el("li", { text: "Uzgodnienie z migawką brokera: " + q.broker_reconciliation_note }));
     ul.appendChild(el("li", { text: "Atrybuty instrumentów: " + q.attrs_without_history_note }));
     panel.appendChild(ul);

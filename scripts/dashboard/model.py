@@ -18,7 +18,7 @@ wprost (to detal warstwy prezentacji), tylko `None`/pola statusowe.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -169,6 +169,21 @@ def consolidation_key(isin: str | None, broker_ticker: str, market: str) -> tupl
     return ("ticker_market", broker_ticker, market)
 
 
+# ---------------------------------------------------------------------------
+# Status ceny pozycji wg T27 (kontrakt §3/§4) — "ok" < "stale" < "incomplete"
+# ranga rosnąca; status pozycji scalonej = najgorszy ze składowych.
+# ---------------------------------------------------------------------------
+
+_PRICE_STATUS_RANK = {"ok": 0, "stale": 1, "incomplete": 2}
+
+
+def worst_price_status(statuses: list[str]) -> str:
+    """Najgorszy status ceny ze zbioru (kontrakt §4: `incomplete` > `stale` >
+    `ok`). Pusta lista -> `KeyError` się nie zdarza (wywołujący zawsze woła to
+    z co najmniej jednym elementem — grupa konsolidacji ma >=1 wiersz)."""
+    return max(statuses, key=lambda s: _PRICE_STATUS_RANK[s])
+
+
 @dataclass
 class ConsolidationResult:
     positions: list[dict[str, Any]]
@@ -245,6 +260,9 @@ def consolidate_positions(rows: list[dict[str, Any]]) -> ConsolidationResult:
                 "mixed_currency": mixed_currency,
                 "components": group,
                 "settlement_currency": next(iter(currencies)) if not mixed_currency else None,
+                # Status ceny pozycji scalonej = najgorszy ze składowych
+                # (kontrakt §4) — nie tylko pierwszego komponentu.
+                "price_status": worst_price_status([g["price_status"] for g in group]),
             }
         )
         out.append(merged)
@@ -270,6 +288,32 @@ def compute_weights(rows: list[dict[str, Any]], bw: Decimal | None) -> list[Deci
     if not bw:
         return [None for _ in rows]
     return [(r["value_pln"] / bw) if r["value_pln"] is not None else None for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Liczniki n/N i sumy "wszystko-albo-nic" (kontrakt §2/§3/§7): gdy choć jedna
+# pozycja zbioru ma cenę T27 `incomplete` (brak wartości PLN), suma (BW,
+# wartość CORE, nominał FUT) jest `brak pomiaru` z licznikiem n/N — NIGDY
+# suma częściowa, pozycja NIGDY nie wypada z mianownika N.
+# ---------------------------------------------------------------------------
+
+
+def count_complete(rows: list[dict[str, Any]], field_name: str = "value_pln") -> tuple[int, int]:
+    """n = liczba wierszy z `field_name` policzalnym (not None), N = liczba
+    wszystkich wierszy zbioru (mianownik NIGDY nie maleje)."""
+    n = sum(1 for r in rows if r.get(field_name) is not None)
+    return n, len(rows)
+
+
+def compute_sum_if_complete(rows: list[dict[str, Any]], field_name: str = "value_pln") -> Decimal | None:
+    """Suma `field_name` po wierszach WYŁĄCZNIE, gdy KAŻDY wiersz zbioru ma tę
+    wielkość policzalną (n == N); inaczej `None` (kontrakt: „nie liczyć sum
+    częściowych"). Zbiór pusty (N=0) -> suma pusta = 0 (wszystko policzone,
+    bo nie ma czego liczyć)."""
+    n, big_n = count_complete(rows, field_name)
+    if n < big_n:
+        return None
+    return sum((r[field_name] for r in rows), Decimal(0))
 
 
 # ---------------------------------------------------------------------------
@@ -323,53 +367,125 @@ def compute_result_a(
 # ---------------------------------------------------------------------------
 
 
-def evaluate_test1_single_run(distinct_computed_at_count: int) -> bool:
-    return distinct_computed_at_count == 1
+def evaluate_test1_single_run(computed_at_values: list[datetime]) -> bool:
+    """Test 1 rew. 3 (kontrakt §5): PASS gdy WSZYSTKIE wiersze `risk_daily`
+    D ryzyka dzielą jeden `computed_at` ALBO rozrzut (max-min) <= 5 s.
+    Pusta lista (brak wierszy na D ryzyka) -> FAIL (nie ma przebiegu)."""
+    if not computed_at_values:
+        return False
+    lo = min(computed_at_values)
+    hi = max(computed_at_values)
+    return (hi - lo).total_seconds() <= 5
 
 
 def evaluate_test2_position_set_match(risk_daily_keys: set, positions_keys: set) -> bool:
     return risk_daily_keys == positions_keys
 
 
-def evaluate_test3_closed_positions_provenance(closed_positions: list[dict[str, Any]]) -> bool:
-    """`closed_positions`: pozycje otwarte na D ryzyka, nieobecne TERAZ w
+def evaluate_test3_closed_positions_provenance(
+    has_transactions_after_risk_date: bool,
+    closed_positions: list[dict[str, Any]],
+) -> str:
+    """Test 3 rew. 3 z decyzją ownera (nadpisuje wcześniejszą wersję bez
+    `has_transactions_after_risk_date`, kontrakt §5): kontrola dodatnia —
+    `closed_positions`: pozycje otwarte na D ryzyka, nieobecne TERAZ w
     `positions_fifo` (qty<>0). Każdy dict: {'has_risk_daily_row': bool,
     'computed_at': datetime|None, 'max_sell_created_at': datetime|None}.
-    PASS gdy dla KAŻDEJ: ma wiersz w risk_daily, a jego `computed_at` jest
-    późniejszy niż ostatnia znana transakcja zamykająca. Pusta lista -> PASS
-    (nie ma czego sprawdzać)."""
+    `has_transactions_after_risk_date`: czy w `transactions` istnieje
+    JAKIKOLWIEK wiersz z `transaction_date > D ryzyka` (dowolny rachunek/
+    instrument/typ). Zwraca:
+      - `"nie_dotyczy"` — brak jakichkolwiek transakcji po D ryzyka w ogóle;
+        kontrola dodatnia nie ma czego sprawdzić Z DEFINICJI (nie blokuje
+        PASS zbiorczego, o ile testy 1/2 PASS);
+      - `"niedostepna"` — transakcje po D ryzyka ISTNIEJĄ, ale żadna pozycja
+        otwarta na D ryzyka nie została odnaleziona jako zamknięta TERAZ —
+        kontrola dodatnia nie mogła się wykonać MIMO danych po D (traktowane
+        jak FAIL przy renderowaniu, ale to ODDZIELNY status: overall
+        "NIEROZSTRZYGNIETY", nie "FAIL");
+      - `"pass"` — dla KAŻDEJ znalezionej pozycji zamkniętej: ma wiersz w
+        risk_daily, a jego `computed_at` jest późniejszy niż ostatnia znana
+        transakcja zamykająca;
+      - `"fail"` — inaczej."""
+    if not has_transactions_after_risk_date:
+        return "nie_dotyczy"
+    if not closed_positions:
+        return "niedostepna"
     for item in closed_positions:
         if not item["has_risk_daily_row"]:
-            return False
+            return "fail"
         if item["computed_at"] is None or item["max_sell_created_at"] is None:
-            return False
+            return "fail"
         if not (item["computed_at"] > item["max_sell_created_at"]):
-            return False
-    return True
+            return "fail"
+    return "pass"
+
+
+@dataclass
+class ProvenanceTest:
+    name: str
+    status: str  # "PASS" | "FAIL" | "nie dotyczy" | "niedostepna"
 
 
 @dataclass
 class ProvenanceResult:
-    passed: bool
+    passed: bool  # True WYŁĄCZNIE gdy overall_status == "PASS" (brama renderowania sekcji ryzyka)
+    overall_status: str = "PASS"  # "PASS" | "FAIL" | "NIEROZSTRZYGNIETY"
+    tests: list[ProvenanceTest] = field(default_factory=list)
     failed_tests: list[str] = field(default_factory=list)
+    note: str | None = None
 
 
 _TEST_NAMES = {
-    1: "test 1: jeden przebieg na D ryzyka (count(distinct computed_at)=1)",
-    2: "test 2: zbiór pozycji risk_daily(D) = positions_as_of(D)",
-    3: "test 3: pochodzenie wiersza pozycji zamkniętej po D ryzyka",
+    1: "test 1: jeden przebieg na D ryzyka (jeden computed_at albo rozrzut <=5s)",
+    2: "test 2: zbior pozycji risk_daily(D) = positions_as_of(D)",
+    3: "test 3: kontrola dodatnia - pochodzenie wiersza pozycji zamknietej po D ryzyka",
+}
+
+_TEST3_LABELS = {
+    "pass": "PASS",
+    "fail": "FAIL",
+    "nie_dotyczy": "nie dotyczy",
+    "niedostepna": "niedostepna",
 }
 
 
-def evaluate_provenance(test1_ok: bool, test2_ok: bool, test3_ok: bool) -> ProvenanceResult:
-    failed = []
-    if not test1_ok:
-        failed.append(_TEST_NAMES[1])
-    if not test2_ok:
-        failed.append(_TEST_NAMES[2])
-    if not test3_ok:
-        failed.append(_TEST_NAMES[3])
-    return ProvenanceResult(passed=not failed, failed_tests=failed)
+def evaluate_provenance(test1_ok: bool, test2_ok: bool, test3_status: str) -> ProvenanceResult:
+    """Status zbiorczy (kontrakt §5 rew. 3 + decyzja ownera): FAIL gdy
+    KTORYKOLWIEK test zwrocil FAIL (test1/test2 bool, test3 == "fail").
+    Inaczej: test3 == "niedostepna" (transakcje po D ryzyka są, ale kontrola
+    dodatnia nie znalazła czego sprawdzić) -> overall "NIEROZSTRZYGNIETY",
+    traktowany PRZY RENDEROWANIU jak FAIL (sekcja ryzyka i kolumny ryzyka =
+    brak pomiaru), ale to ODDZIELNA etykieta od "FAIL". Inaczej (test3 in
+    {"pass", "nie_dotyczy"}) -> "PASS". `test3_status`: patrz
+    `evaluate_test3_closed_positions_provenance`."""
+    test3_label = _TEST3_LABELS[test3_status]
+    tests = [
+        ProvenanceTest(_TEST_NAMES[1], "PASS" if test1_ok else "FAIL"),
+        ProvenanceTest(_TEST_NAMES[2], "PASS" if test2_ok else "FAIL"),
+        ProvenanceTest(_TEST_NAMES[3], test3_label),
+    ]
+    any_fail = (not test1_ok) or (not test2_ok) or (test3_status == "fail")
+    if any_fail:
+        overall = "FAIL"
+    elif test3_status == "niedostepna":
+        overall = "NIEROZSTRZYGNIETY"
+    else:
+        overall = "PASS"
+
+    failed = [t.name for t in tests if t.status == "FAIL"]
+    note = None
+    if test3_status == "nie_dotyczy":
+        note = "kontrola dodatnia nie dotyczy: brak danych po D"
+    elif test3_status == "niedostepna":
+        note = "kontrola dodatnia niedostepna mimo danych po D"
+
+    return ProvenanceResult(
+        passed=(overall == "PASS"),
+        overall_status=overall,
+        tests=tests,
+        failed_tests=failed,
+        note=note,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +521,15 @@ def price_coverage(rows: list[dict[str, Any]], is_eligible) -> tuple[int, int]:
     eligible = [r for r in rows if is_eligible(r["instrument_type"], r["is_core"])]
     n = sum(1 for r in eligible if r["close_d"] is not None)
     return n, len(eligible)
+
+
+def count_stale_risk_rows(rows: list[dict[str, Any]], is_eligible) -> tuple[int, int]:
+    """Licznik cen nieświeżych w `risk_daily` (kontrakt §5, zastępuje
+    etykietę B-19): n = wiersze SAT+FUT z `price_is_stale = True`, N =
+    wszystkie wiersze SAT+FUT na D ryzyka."""
+    eligible = [r for r in rows if is_eligible(r["instrument_type"], r["is_core"])]
+    n_stale = sum(1 for r in eligible if r.get("price_is_stale"))
+    return n_stale, len(eligible)
 
 
 def group_risk_pct_by_theme(rows: list[dict[str, Any]], is_eligible) -> dict[str, Decimal]:

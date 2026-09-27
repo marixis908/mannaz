@@ -164,6 +164,7 @@ def _syn_row(**kwargs):
         "residual_cost": Decimal("800"),
         "rachunek": "ZAGRANICZNY",
         "instrument_id": 1,
+        "price_status": "ok",  # T27 (kontrakt §3/§4) — domyślnie kompletna
     }
     base.update(kwargs)
     return base
@@ -226,6 +227,80 @@ def test_consolidate_positions_no_merge_when_single_row_per_key():
     result = model.consolidate_positions(rows)
     assert result.count_before == result.count_after == 2
     assert result.merge_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Status ceny wg T27 (kontrakt §3/§4): pozycja scalona = najgorszy ze
+# składowych ("incomplete" > "stale" > "ok").
+# ---------------------------------------------------------------------------
+
+
+def test_worst_price_status_incomplete_wins_over_everything():
+    assert model.worst_price_status(["ok", "stale", "incomplete"]) == "incomplete"
+    assert model.worst_price_status(["ok", "incomplete"]) == "incomplete"
+
+
+def test_worst_price_status_stale_wins_over_ok():
+    assert model.worst_price_status(["ok", "stale"]) == "stale"
+
+
+def test_worst_price_status_all_ok_is_ok():
+    assert model.worst_price_status(["ok", "ok"]) == "ok"
+
+
+def test_consolidate_positions_merged_status_is_worst_of_components_incomplete():
+    rows = [
+        _syn_row(price_status="ok", value_pln=Decimal("1000")),
+        _syn_row(price_status="incomplete", value_pln=None),
+    ]
+    merged = model.consolidate_positions(rows).positions[0]
+    assert merged["consolidated"] is True
+    assert merged["price_status"] == "incomplete"
+    # T27 (kontrakt §3): pozycja incomplete NIE ma cicho zsumowanej wartości —
+    # suma jest None, gdy choć jeden komponent nie ma value_pln.
+    assert merged["value_pln"] is None
+
+
+def test_consolidate_positions_merged_status_is_worst_of_components_stale():
+    rows = [
+        _syn_row(price_status="ok", value_pln=Decimal("1000")),
+        _syn_row(price_status="stale", value_pln=Decimal("500")),
+    ]
+    merged = model.consolidate_positions(rows).positions[0]
+    assert merged["price_status"] == "stale"
+    assert merged["value_pln"] == Decimal("1500")
+
+
+# ---------------------------------------------------------------------------
+# Liczniki n/N i sumy "wszystko-albo-nic" (kontrakt §2/§3/§7): BW/CORE/
+# nominał FUT — brak wartości jednej pozycji zbioru -> suma = brak pomiaru
+# (None), NIGDY suma częściowa; pozycja NIGDY nie wypada z mianownika N.
+# ---------------------------------------------------------------------------
+
+
+def test_count_complete_counts_priced_rows():
+    rows = [{"value_pln": Decimal("100")}, {"value_pln": None}, {"value_pln": Decimal("50")}]
+    assert model.count_complete(rows, "value_pln") == (2, 3)
+
+
+def test_compute_sum_if_complete_returns_none_when_any_incomplete():
+    rows = [{"value_pln": Decimal("100")}, {"value_pln": None}]
+    assert model.compute_sum_if_complete(rows, "value_pln") is None
+
+
+def test_compute_sum_if_complete_sums_when_all_complete():
+    rows = [{"value_pln": Decimal("100")}, {"value_pln": Decimal("50")}]
+    assert model.compute_sum_if_complete(rows, "value_pln") == Decimal("150")
+
+
+def test_compute_sum_if_complete_empty_set_is_zero():
+    assert model.compute_sum_if_complete([], "value_pln") == Decimal(0)
+
+
+def test_compute_sum_if_complete_generic_field_name_for_fut_nominal():
+    rows = [{"nominal_pln": Decimal("1000")}, {"nominal_pln": None}]
+    assert model.compute_sum_if_complete(rows, "nominal_pln") is None
+    assert model.count_complete(rows, "nominal_pln") == (1, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -327,29 +402,76 @@ def test_compute_result_a_missing_cross_rate_is_brak():
 # ---------------------------------------------------------------------------
 
 
-def test_evaluate_provenance_all_pass():
-    result = model.evaluate_provenance(True, True, True)
+def test_evaluate_provenance_all_pass_test3_pass():
+    result = model.evaluate_provenance(True, True, "pass")
+    assert result.overall_status == "PASS"
     assert result.passed is True
     assert result.failed_tests == []
+    assert result.note is None
 
 
-def test_evaluate_provenance_test1_fail():
-    result = model.evaluate_provenance(False, True, True)
+def test_evaluate_provenance_all_pass_test3_nie_dotyczy():
+    # Decyzja ownera: "nie dotyczy" (brak transakcji po D ryzyka w ogóle) NIE
+    # blokuje PASS zbiorczego, o ile testy 1/2 PASS.
+    result = model.evaluate_provenance(True, True, "nie_dotyczy")
+    assert result.overall_status == "PASS"
+    assert result.passed is True
+    assert result.note == "kontrola dodatnia nie dotyczy: brak danych po D"
+
+
+def test_evaluate_provenance_test3_niedostepna_is_nierozstrzygniety_not_fail():
+    # Decyzja ownera: transakcje po D ryzyka ISTNIEJĄ, ale kontrola dodatnia
+    # nie znalazła czego sprawdzić -> "NIEROZSTRZYGNIETY", ODDZIELNY status od
+    # "FAIL" (choć renderowanie traktuje go jak FAIL — `passed` = False).
+    result = model.evaluate_provenance(True, True, "niedostepna")
+    assert result.overall_status == "NIEROZSTRZYGNIETY"
+    assert result.passed is False
+    assert result.failed_tests == []  # "niedostepna" to NIE "FAIL"
+    assert result.note == "kontrola dodatnia niedostepna mimo danych po D"
+
+
+def test_evaluate_provenance_test1_fail_overrides_niedostepna_to_fail():
+    result = model.evaluate_provenance(False, True, "niedostepna")
+    assert result.overall_status == "FAIL"
     assert result.passed is False
     assert len(result.failed_tests) == 1
     assert "test 1" in result.failed_tests[0]
 
 
+def test_evaluate_provenance_test3_fail():
+    result = model.evaluate_provenance(True, True, "fail")
+    assert result.overall_status == "FAIL"
+    assert result.passed is False
+    assert len(result.failed_tests) == 1
+    assert "test 3" in result.failed_tests[0]
+
+
 def test_evaluate_provenance_multiple_fail():
-    result = model.evaluate_provenance(False, False, True)
+    result = model.evaluate_provenance(False, False, "pass")
+    assert result.overall_status == "FAIL"
     assert result.passed is False
     assert len(result.failed_tests) == 2
 
 
-def test_evaluate_test1_single_run():
-    assert model.evaluate_test1_single_run(1) is True
-    assert model.evaluate_test1_single_run(2) is False
-    assert model.evaluate_test1_single_run(0) is False
+def test_evaluate_test1_single_run_identical_timestamps_pass():
+    ts = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    assert model.evaluate_test1_single_run([ts, ts, ts]) is True
+
+
+def test_evaluate_test1_single_run_within_5s_tolerance_pass():
+    lo = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    hi = datetime(2026, 9, 25, 10, 0, 5, tzinfo=timezone.utc)
+    assert model.evaluate_test1_single_run([lo, hi]) is True
+
+
+def test_evaluate_test1_single_run_exceeds_5s_tolerance_fails():
+    lo = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    hi = datetime(2026, 9, 25, 10, 0, 6, tzinfo=timezone.utc)
+    assert model.evaluate_test1_single_run([lo, hi]) is False
+
+
+def test_evaluate_test1_single_run_empty_is_false():
+    assert model.evaluate_test1_single_run([]) is False
 
 
 def test_evaluate_test2_position_set_match():
@@ -358,13 +480,28 @@ def test_evaluate_test2_position_set_match():
     assert model.evaluate_test2_position_set_match(keys, set()) is False
 
 
-def test_evaluate_test3_empty_list_passes():
-    assert model.evaluate_test3_closed_positions_provenance([]) is True
+def test_evaluate_test3_nie_dotyczy_when_no_transactions_after_risk_date():
+    # Decyzja ownera: "nie dotyczy" rozstrzyga PIERWSZE (brak transakcji po D
+    # ryzyka w ogóle) — niezależnie od tego, co by dała kontrola dodatnia.
+    assert model.evaluate_test3_closed_positions_provenance(False, []) == "nie_dotyczy"
+    items = [{
+        "has_risk_daily_row": True,
+        "computed_at": datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc),
+        "max_sell_created_at": datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc),
+    }]
+    assert model.evaluate_test3_closed_positions_provenance(False, items) == "nie_dotyczy"
+
+
+def test_evaluate_test3_niedostepna_when_transactions_after_but_no_closed_position():
+    # Transakcje po D ryzyka ISTNIEJĄ, ale kontrola dodatnia nie znalazła
+    # żadnej pozycji zamkniętej do sprawdzenia -> "niedostepna" (decyzja
+    # ownera), ODDZIELNE od "nie_dotyczy" i od "fail".
+    assert model.evaluate_test3_closed_positions_provenance(True, []) == "niedostepna"
 
 
 def test_evaluate_test3_missing_risk_daily_row_fails():
     items = [{"has_risk_daily_row": False, "computed_at": None, "max_sell_created_at": None}]
-    assert model.evaluate_test3_closed_positions_provenance(items) is False
+    assert model.evaluate_test3_closed_positions_provenance(True, items) == "fail"
 
 
 def test_evaluate_test3_computed_at_before_sell_fails():
@@ -373,7 +510,7 @@ def test_evaluate_test3_computed_at_before_sell_fails():
         "computed_at": datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc),
         "max_sell_created_at": datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc),
     }]
-    assert model.evaluate_test3_closed_positions_provenance(items) is False
+    assert model.evaluate_test3_closed_positions_provenance(True, items) == "fail"
 
 
 def test_evaluate_test3_computed_at_after_sell_passes():
@@ -382,7 +519,7 @@ def test_evaluate_test3_computed_at_after_sell_passes():
         "computed_at": datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc),
         "max_sell_created_at": datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc),
     }]
-    assert model.evaluate_test3_closed_positions_provenance(items) is True
+    assert model.evaluate_test3_closed_positions_provenance(True, items) == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +537,7 @@ def _risk_row(**kwargs):
         "level1_breach": False,
         "close_d": Decimal("100"),
         "theme": "tech",
+        "price_is_stale": False,  # kontrakt §5: cena użyta w ryzyku (T27)
     }
     base.update(kwargs)
     return base
@@ -429,6 +567,19 @@ def test_price_coverage_counts_eligible_rows_with_price():
     ]
     n, big_n = model.price_coverage(rows, is_risk_budget_eligible)
     assert (n, big_n) == (1, 2)
+
+
+def test_count_stale_risk_rows_counts_eligible_stale_only():
+    # kontrakt §5: licznik cen nieświeżych w risk_daily zastępuje etykietę
+    # B-19 — n = wiersze SAT+FUT z price_is_stale=True, N = wszystkie SAT+FUT.
+    rows = [
+        _risk_row(price_is_stale=True),
+        _risk_row(price_is_stale=False),
+        _risk_row(is_core=True, price_is_stale=True),  # core -> wykluczone z N
+        _risk_row(instrument_type="future", price_is_stale=True),
+    ]
+    n, big_n = model.count_stale_risk_rows(rows, is_risk_budget_eligible)
+    assert (n, big_n) == (2, 3)
 
 
 def test_group_risk_pct_by_theme_groups_none_as_bez_tematu():
@@ -503,6 +654,7 @@ def test_result_a_and_provenance_are_asdict_friendly():
     d = asdict(res)
     assert set(d.keys()) == {"amount", "pct", "cross_rate_flag", "brak_opis"}
 
-    prov = model.evaluate_provenance(True, True, True)
+    prov = model.evaluate_provenance(True, True, "pass")
     d2 = asdict(prov)
-    assert set(d2.keys()) == {"passed", "failed_tests"}
+    assert set(d2.keys()) == {"passed", "overall_status", "tests", "failed_tests", "note"}
+    assert all(set(asdict_t.keys()) == {"name", "status"} for asdict_t in d2["tests"])
