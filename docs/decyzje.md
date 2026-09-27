@@ -33,3 +33,4 @@ wskazuje, co zastępuje.
 | 2026-09-26 | Mnożniki serii kontraktów ze specyfikacji GPW (sql/007), heurystyka odrzucona | nadzorca | brak mnożnika = błąd z nazwą serii; `instruments.multiplier_source` z URL/komunikatem GPW |
 | 2026-09-27 | Rew. 4.2: zasada dane ≤ D (M77) i semantyka zapadki per okres posiadania (brief CC-S) | nadzorca | §19 M77, §19.3 rew. 4.2; pomiar CC-S: P1 EXACT, determinizm zapadki, 0 wierszy pozycji nieobecnych |
 | 2026-09-27 | Pozycja bez ceny na D nigdy nie wypada po cichu z kapitału ani ryzyka — reguła szczegółowa w briefie B-19 | nadzorca | CC-S S7 P2: 2026-09-25, 23 pozycje `no_price_on_d` poza kapitałem i heat bez błędu |
+| 2026-09-27 | Rew. 4.3: forward-fill T27 przy odczycie, flaga w risk_daily | nadzorca | brief CC-U: `run_risk` stosuje T27, tabela cen tylko z realnymi sesjami; `risk_daily.price_is_stale`, `price_date_used` (sql/008) |

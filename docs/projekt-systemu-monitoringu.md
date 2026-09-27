@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.2 · 2026-09-27**
+**Rewizja 4.3 · 2026-09-27**
 
 ---
 
@@ -27,7 +27,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 3.1 | 2026-09-25 | Stooq po pomiarze: dostęp skryptowy zablokowany JS proof-of-work, ścieżka `get_apikey` nie wydaje klucza; Stooq przechodzi do roli źródła ręcznego (§9.2, §9.3, §12, §25.2, §25.3, O-12, R-01, P-02, nowy P-12) |
 | 4 | 2026-09-26 | Klucz przypisania archetypu §14.1 (kalibracja 17/20), archetyp A0, reguła „klucz proponuje, rejestracja decyduje" (§12, M76), progi klucza T34–T37, instrumenty pochodne §19.4, erratum §19.3 (zapadka Chandeliera od inicjalizacji), O-45 |
 | 4.1 | 2026-09-26 | §19.4: wartość rachunku KONTRAKTOWY w kapitale satelity = środki ogółem łącznie z depozytem zablokowanym; wynik zmienny rozliczany dziennie w środkach, bez osobnego doliczania (pomiar CC-R K2) |
-| **4.2** | **2026-09-27** | **§19 M77: zasada „dane ≤ D” dla wielkości liczonych na dzień D; §19.3: zapadka Chandeliera per okres posiadania (brief CC-S)** |
+| 4.2 | 2026-09-27 | §19 M77: zasada „dane ≤ D” dla wielkości liczonych na dzień D; §19.3: zapadka Chandeliera per okres posiadania (brief CC-S) |
+| **4.3** | **2026-09-27** | **T27: forward-fill przy odczycie (`run_risk`), tabela cen tylko z realnymi sesjami, flaga nieświeżości i data użytej ceny w `risk_daily` (brief CC-U)** |
 
 ### 0.3 Oznaczenia
 
@@ -609,7 +610,7 @@ Kurs zamknięcia pozycji amerykańskiej przeliczasz kursem sprzed jej sesji — 
 
 **T26.** Siatka wspólna, gdy jest potrzebna: **suma kalendarzy, nie przecięcie**. Przecięcie dziewięciu giełd wycina kilkanaście procent dni i tworzy nierówne odstępy, na których potem liczy się zwroty tak, jakby odstępy były równe.
 
-**T27.** Forward-fill maksymalnie 1–2 dni, wyłącznie dla rynku faktycznie zamkniętego, **zawsze z flagą `is_stale`**. Nigdy w przód poza ostatnią realną sesję — to jest mechanizm, przez który system rysuje płaski szereg i cicho przestaje generować alerty.
+**T27.** Forward-fill maksymalnie 1–2 dni, wyłącznie dla rynku faktycznie zamkniętego, **zawsze z flagą `is_stale`**. Nigdy w przód poza ostatnią realną sesję — to jest mechanizm, przez który system rysuje płaski szereg i cicho przestaje generować alerty. Forward-fill jest wykonywany przy odczycie (run_risk), nie w tabeli cen: tabela cen przechowuje wyłącznie realne sesje, a flaga nieświeżości i data użytej ceny są zapisywane w risk_daily (price_is_stale, price_date_used).
 
 **T28.** Dead-man switch sprawdza **wiek najświeższego wiersza per rynek**, nie sam fakt przebiegu.
 
