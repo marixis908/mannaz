@@ -23,17 +23,30 @@ from mannaz.risk import (
 
 @pytest.fixture
 def db_conn():
-    """U4 (brief CC-U): baza testowa NIE ma jeszcze migracji sql/008
-    (price_is_stale/price_date_used) — aplikujemy jej treść w TEJ SAMEJ
-    transakcji przed testem (DDL w Postgresie jest transakcyjny), żeby
-    `run_risk`/`_write_row` mogły zapisywać te kolumny. Po teście: rollback
-    (obronnie, testy i tak robią własny rollback) + weryfikacja przez
-    information_schema, że kolumny NIE zostały trwale dodane."""
+    """U4 (brief CC-U): kolumny sql/008 (price_is_stale/price_date_used) —
+    jeśli migracja nie jest jeszcze zastosowana w bazie, aplikujemy jej treść
+    w TEJ SAMEJ transakcji przed testem (DDL w Postgresie jest transakcyjny),
+    żeby `run_risk`/`_write_row` mogły zapisywać te kolumny. Po teście:
+    rollback + weryfikacja przez information_schema, że stan kolumn jest taki
+    sam jak przed testem (zero trwałych zmian niezależnie od tego, czy 008
+    była już zastosowana)."""
     try:
         conn = get_connection()
     except Exception as exc:  # brak .env/hasla/serwera -> caly test pomijamy
         pytest.skip(f"mannaz.db.get_connection() niedostepne: {exc}")
         return
+
+    def _stale_columns():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'risk_daily' AND column_name IN ('price_is_stale', 'price_date_used') "
+                "ORDER BY column_name"
+            )
+            return cur.fetchall()
+
+    columns_before = _stale_columns()
+    conn.rollback()
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE risk_daily ADD COLUMN IF NOT EXISTS price_is_stale BOOLEAN NOT NULL DEFAULT FALSE")
         cur.execute("ALTER TABLE risk_daily ADD COLUMN IF NOT EXISTS price_date_used DATE")
@@ -41,16 +54,11 @@ def db_conn():
         yield conn
     finally:
         conn.rollback()  # obronnie — testy robia wlasny rollback, ale gdyby nie zrobily
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'risk_daily' AND column_name IN ('price_is_stale', 'price_date_used')"
-            )
-            leftover_columns = cur.fetchall()
+        columns_after = _stale_columns()
         conn.close()
-        assert leftover_columns == [], (
-            "U4 (brief CC-U): migracja 008 nie zostala w pelni cofnieta po tescie — "
-            f"kolumny nadal istnieja trwale: {leftover_columns}"
+        assert columns_after == columns_before, (
+            "U4 (brief CC-U): stan kolumn sql/008 zmienil sie trwale w tescie — "
+            f"przed: {columns_before}, po: {columns_after}"
         )
 
 
@@ -216,31 +224,63 @@ def test_s5_run_risk_unaffected_by_transactions_and_prices_after_d(db_conn):
 
 
 @pytest.mark.db
-def test_u5_2026_09_25_incomplete_market_open_no_price_zero_writes(db_conn):
-    """U5 (7): run_risk(2026-09-25, commit=False) na obecnej bazie ->
-    IncompleteRiskDateError; wszystkie pozycje niekompletne z ta sama
-    przyczyna 'rynek otwarty bez ceny' (market_open_no_price — GPW/gieldy w
-    tym dniu byly otwarte, ale 22 instrumenty maja swiece bez zamkniecia);
-    count(risk_daily WHERE risk_date=D) identyczny przed i po (run_risk robi
-    conn.rollback() PRZED rzuceniem, zero zapisu, S4/U2)."""
+def test_u5_open_market_gap_on_real_data_raises_and_writes_nothing(db_conn):
+    """U5 (7), kontrolka ujemna na danych rzeczywistych: na najpóźniejszej
+    kompletnej dacie D usuwamy (w transakcji, rollback) zamknięcie wszystkich
+    instrumentów GPW na D — GPW jest w D otwarte, więc każda pozycja wyceniana
+    na GPW (także kontrakty przez bazę) ma być niekompletna z przyczyną
+    'market_open_no_price'; `run_risk` rzuca `IncompleteRiskDateError`, nie
+    zapisuje nic dla D (count przed == po), a rollback przywraca ceny.
+    Nie zależy od chwilowej luki importu (CC-U U6 uzupełniło 2026-09-25)."""
     conn = db_conn
-    d = date(2026, 9, 25)
     try:
+        d = resolve_default_risk_date(conn)
+        assert d is not None, "brak kompletnej daty w bazie testowej"
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
             count_before = cur.fetchone()[0]
+            cur.execute(
+                "SELECT count(*) FROM prices_daily WHERE price_date = %s AND close_split_adj IS NOT NULL", (d,)
+            )
+            prices_before = cur.fetchone()[0]
+            cur.execute(
+                """
+                UPDATE prices_daily p SET close_split_adj = NULL
+                FROM instruments i
+                WHERE i.id = p.instrument_id AND upper(i.exchange) = 'GPW' AND p.price_date = %s
+                """,
+                (d,),
+            )
+            n_nulled = cur.rowcount
+            expected_gpw = set()
+            for pos in positions_as_of(cur, d):
+                cur.execute(
+                    "SELECT broker_ticker, instrument_type, base_symbol, exchange FROM instruments WHERE id = %s",
+                    (pos["instrument_id"],),
+                )
+                ticker, itype, base_symbol, exch = cur.fetchone()
+                if itype == "future":
+                    cur.execute("SELECT exchange FROM instruments WHERE yahoo_symbol = %s", (base_symbol,))
+                    row = cur.fetchone()
+                    exch = row[0] if row else None
+                if (exch or "").upper() == "GPW":
+                    expected_gpw.add(ticker)
+        assert n_nulled > 0 and expected_gpw, "brak instrumentow GPW z cena na D w bazie testowej"
 
         with pytest.raises(IncompleteRiskDateError) as exc_info:
             run_risk(conn, as_of=d, commit=False)
 
         items = exc_info.value.items
-        assert len(items) == 23
+        assert {it.broker_ticker for it in items} == expected_gpw
         assert all(it.reason == "market_open_no_price" for it in items)
 
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
-            count_after = cur.fetchone()[0]
-        assert count_after == count_before
+            assert cur.fetchone()[0] == count_before
+            cur.execute(
+                "SELECT count(*) FROM prices_daily WHERE price_date = %s AND close_split_adj IS NOT NULL", (d,)
+            )
+            assert cur.fetchone()[0] == prices_before, "rollback w run_risk powinien przywrocic ceny"
     finally:
         conn.rollback()
 
