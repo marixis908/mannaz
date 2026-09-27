@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import sys
 from dataclasses import asdict
@@ -613,6 +614,17 @@ def render_template(payload: dict[str, Any]) -> str:
         raise RuntimeError(f"template.html nie zawiera punktu wstrzyknięcia {JSON_PLACEHOLDER!r}")
     json_str = json.dumps(payload, default=_json_default, ensure_ascii=False)
     json_str_safe = json_str.replace("</", "<\\/")
+    # Pin w statycznym HTML (nie tylko w JS) — D6/D7 czytają go bez uruchamiania skryptu.
+    pin = payload["meta"]["pin"]
+    risk_ca = pin["risk_computed_at"]
+    pin_text = (
+        f"source_runs.id<={pin['max_source_run_id']}; "
+        f"risk_daily.computed_at={_json_default(risk_ca) if risk_ca is not None else 'brak'}"
+    )
+    empty_meta = '<meta name="mannaz-pin" content="">'
+    if empty_meta not in template:
+        raise RuntimeError("template.html nie zawiera pustego meta mannaz-pin")
+    template = template.replace(empty_meta, f'<meta name="mannaz-pin" content="{html.escape(pin_text)}">')
     return template.replace(JSON_PLACEHOLDER, json_str_safe)
 
 
@@ -641,8 +653,11 @@ def main(argv: list[str] | None = None) -> int:
 
     html_out = render_template(payload)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(html_out, encoding="utf-8")
-    sha = hashlib.sha256(html_out.encode("utf-8")).hexdigest()
+    # Bajty zapisywane wprost (bez translacji \n -> \r\n na Windows), żeby
+    # wypisany sha256 był sha256 pliku na dysku.
+    data = html_out.encode("utf-8")
+    out_path.write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()
 
     print(f"D skladu: {d.isoformat()}")
     print(f"D ryzyka: {d_risk.isoformat()}")
