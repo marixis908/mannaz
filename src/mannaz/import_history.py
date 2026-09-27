@@ -20,6 +20,7 @@ from __future__ import annotations
 import glob
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import psycopg
@@ -33,6 +34,29 @@ from mannaz.parse_history import (
 
 
 @dataclass
+class FileRachunekImportResult:
+    """Liczniki per (plik, rachunek) — brief CC-C, C2: potrzebne do bramki
+    ciągłości i sekcji HEARTBEAT raportu cyklu (`cycle.py`), których stary
+    `run_import` (bez liczników per plik) nie dostarczał."""
+
+    rachunek: str
+    new: int = 0
+    duplicate: int = 0
+    min_date: date | None = None
+    max_date: date | None = None
+
+
+@dataclass
+class FileImportResult:
+    """Wynik importu JEDNEGO pliku źródłowego — brief CC-C, C2."""
+
+    path: Path
+    sha256: str
+    rows_total: int = 0
+    per_rachunek: dict[str, FileRachunekImportResult] = field(default_factory=dict)
+
+
+@dataclass
 class ImportSummary:
     rows_in: int = 0
     rows_unique: int = 0
@@ -42,6 +66,10 @@ class ImportSummary:
     unknown_title_patterns: dict[str, int] = field(default_factory=dict)
     unknown_title_count: int = 0
     corporate_events_detected: int = 0
+    # brief CC-C, C2: liczniki per plik/per rachunek (nowe, zdublowane, zakres
+    # dat) — `per_rachunek` powyżej pozostaje NIETKNIĘTE (agregat CAŁEJ bazy
+    # po imporcie, liczony na końcu `run_import`, jak dotychczas).
+    per_file: list[FileImportResult] = field(default_factory=list)
 
 
 class InstrumentRegistry:
@@ -140,10 +168,15 @@ def _normalize_title_pattern(title: str) -> str:
     return re.sub(r"\d+", "#", title)
 
 
-def run_import(data_dir: Path, conn: psycopg.Connection) -> ImportSummary:
-    files = find_source_files(data_dir)
-    parsed_files: list[ParsedFile] = [parse_source_file(f) for f in files]
-
+def import_parsed_files(
+    parsed_files: list[ParsedFile], conn: psycopg.Connection, commit: bool = True
+) -> ImportSummary:
+    """Brief CC-C, C2: wydzielone z `run_import` — ta sama logika dwuprzebiegowa
+    (rejestr instrumentów z kupna/sprzedaży, potem insert transakcji +
+    zdarzenia korporacyjne + source_runs), ale z licznikami PER PLIK i PER
+    RACHUNEK (`ImportSummary.per_file`) potrzebnymi cyklowi (bramka ciągłości,
+    HEARTBEAT). `commit=False` — do testów DB z rollbackiem (jak
+    `prices.run_prices_fetch`/`risk.run_risk`)."""
     summary = ImportSummary()
 
     with conn.cursor() as cur:
@@ -169,6 +202,8 @@ def run_import(data_dir: Path, conn: psycopg.Connection) -> ImportSummary:
             summary.in_file_duplicate_occurrences += sum(
                 1 for r in pf.rows if r.occurrence_no > 1
             )
+
+            file_result = FileImportResult(path=pf.path, sha256=pf.sha256, rows_total=pf.row_count)
 
             for row in pf.rows:
                 p = row.parsed
@@ -214,12 +249,29 @@ def run_import(data_dir: Path, conn: psycopg.Connection) -> ImportSummary:
                     ),
                 )
                 inserted = cur.fetchone()
+
+                rachunek_result = file_result.per_rachunek.setdefault(
+                    row.rachunek, FileRachunekImportResult(rachunek=row.rachunek)
+                )
+                rachunek_result.min_date = (
+                    row.transaction_date
+                    if rachunek_result.min_date is None
+                    else min(rachunek_result.min_date, row.transaction_date)
+                )
+                rachunek_result.max_date = (
+                    row.transaction_date
+                    if rachunek_result.max_date is None
+                    else max(rachunek_result.max_date, row.transaction_date)
+                )
+
                 if inserted is not None:
                     summary.rows_unique += 1
                     transaction_id = inserted[0]
+                    rachunek_result.new += 1
                 else:
                     summary.rejected_cross_file_duplicates += 1
                     transaction_id = None
+                    rachunek_result.duplicate += 1
 
                 if p.row_type == "unknown":
                     pattern = _normalize_title_pattern(row.title_raw)
@@ -263,7 +315,10 @@ def run_import(data_dir: Path, conn: psycopg.Connection) -> ImportSummary:
                 (pf.path.name, pf.row_count, pf.sha256),
             )
 
-        conn.commit()
+            summary.per_file.append(file_result)
+
+        if commit:
+            conn.commit()
 
         cur.execute(
             """
@@ -284,3 +339,9 @@ def run_import(data_dir: Path, conn: psycopg.Connection) -> ImportSummary:
             }
 
     return summary
+
+
+def run_import(data_dir: Path, conn: psycopg.Connection, commit: bool = True) -> ImportSummary:
+    files = find_source_files(data_dir)
+    parsed_files: list[ParsedFile] = [parse_source_file(f) for f in files]
+    return import_parsed_files(parsed_files, conn, commit=commit)

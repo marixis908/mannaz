@@ -1302,6 +1302,7 @@ def resolve_default_risk_date(
     conn: psycopg.Connection,
     max_candidates: int = 30,
     calendar_facts_fn: Callable[[str | None, date], CalendarFacts] = _default_calendar_facts,
+    today: date | None = None,
 ) -> date | None:
     """U3 (brief CC-U): najpóźniejsza data `<= dziś`, dla której reguła T27
     (U2) daje komplet dla WSZYSTKICH pozycji z `positions_as_of` tej daty
@@ -1310,8 +1311,13 @@ def resolve_default_risk_date(
     najpóźniejszych dat z `prices_daily` (malejąco, ograniczone rozsądnie);
     zatrzymuje się na pierwszej kompletnej (kandydaci już malejący, więc to
     od razu najpóźniejsza). Brak kompletu w oknie -> `None` (`run_risk`
-    wtedy rzuca `RuntimeError` jak dotychczas)."""
-    today = date.today()
+    wtedy rzuca `RuntimeError` jak dotychczas).
+
+    `today` (brief CC-C, C6): opcjonalny, domyślnie `date.today()` jak
+    dotychczas — wstrzykiwalny, żeby cykl (`cycle.py`) i testy mogły podać
+    dzień przebiegu bez podmiany zegara systemowego."""
+    if today is None:
+        today = date.today()
     with conn.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT price_date FROM prices_daily WHERE price_date <= %s ORDER BY price_date DESC LIMIT %s",

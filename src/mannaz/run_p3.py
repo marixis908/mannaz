@@ -23,9 +23,18 @@ NIGDY per-pozycji ilości/koszty/kwoty (zasada projektu)."""
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date
+from pathlib import Path
 
 from mannaz.calendar_check import run_calendar_check
+from mannaz.cycle import (
+    DEFAULT_INCOMING_DIR,
+    DEFAULT_RAW_ARCHIVE_DIR,
+    DEFAULT_REPORTS_DIR,
+    run_cycle,
+    safe_print,
+)
 from mannaz.db import get_connection
 from mannaz.fx import DEFAULT_START as FX_DEFAULT_START
 from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
@@ -178,6 +187,38 @@ def cmd_risk(args: argparse.Namespace) -> None:
     print(f"stale_capital_pct_kapital_satelity: {summary.stale_capital_pct}")
 
 
+def cmd_cycle(args: argparse.Namespace) -> None:
+    conn = get_connection()
+    try:
+        result = run_cycle(
+            conn,
+            incoming_dir=args.incoming_dir,
+            raw_archive_dir=args.raw_archive_dir,
+            reports_dir=args.reports_dir,
+            today=args.today,
+        )
+    finally:
+        conn.close()
+
+    # Q3 (poprawka po przeglądzie, po STOP przebiegu #2): raport pod
+    # `result.report_path` jest już zapisany na dysku (albo wcale, gdy
+    # check-ignore odmówiło — `result.error_message`) ZANIM cokolwiek tu
+    # drukujemy. `safe_print` zamiast `print`, żeby konsola w kodowaniu bez
+    # pełnego pokrycia Unicode (np. cp1250) nigdy nie wywaliła się na
+    # UnicodeEncodeError.
+    if result.error_message is not None:
+        safe_print(result.error_message)
+        sys.exit(result.exit_code)
+
+    # Wyłącznie ścieżka raportu i krótkie podsumowanie agregatów — bez
+    # ilości/kwot per pozycja (zasada projektu).
+    safe_print(f"raport: {result.report_path}")
+    safe_print(f"D: {result.state.d}")
+    safe_print(f"kod_wyjscia: {result.exit_code}")
+    safe_print(f"data_failure: {result.exit_code != 0}")
+    sys.exit(result.exit_code)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Brief CC-P, faza P3 (ceny i FX)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -212,6 +253,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="D; domyslnie ostatnia sesja z kompletnymi close_split_adj dla satelity"
     )
     p_risk.set_defaults(func=cmd_risk)
+
+    p_cycle = sub.add_parser(
+        "cycle", help="C2-C7 — cykl tygodniowy: import -> FIFO -> bramka rejestracji -> ceny/FX -> ryzyko -> raport"
+    )
+    p_cycle.add_argument("--incoming-dir", type=Path, default=DEFAULT_INCOMING_DIR)
+    p_cycle.add_argument("--raw-archive-dir", type=Path, default=DEFAULT_RAW_ARCHIVE_DIR)
+    p_cycle.add_argument("--reports-dir", type=Path, default=DEFAULT_REPORTS_DIR)
+    p_cycle.add_argument("--today", type=_parse_date, default=None)
+    p_cycle.set_defaults(func=cmd_cycle)
 
     return parser
 

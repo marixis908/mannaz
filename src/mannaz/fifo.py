@@ -365,11 +365,13 @@ class FifoSummary:
 KONTRAKTOWY_PREFIX = "KONTRAKTOWY"
 
 
-def ensure_contract_expiry_populated(conn: psycopg.Connection) -> int:
+def ensure_contract_expiry_populated(conn: psycopg.Connection, commit: bool = True) -> int:
     """Uzupełnia instruments.contract_expiry dla instrumentów typu 'future',
     których kod serii da się rozpoznać (cykl kwartalny H/M/U/Z), a kolumna
     jest jeszcze pusta. Zwraca liczbę zaktualizowanych wierszy. Idempotentne —
-    bezpieczne do wywołania na starcie każdego run_fifo."""
+    bezpieczne do wywołania na starcie każdego run_fifo. `commit=False` (brief
+    CC-C, C2) — do testów DB z rollbackiem, tak jak `prices.run_prices_fetch`/
+    `risk.run_risk`."""
     updated = 0
     with conn.cursor() as cur:
         cur.execute(
@@ -386,20 +388,22 @@ def ensure_contract_expiry_populated(conn: psycopg.Connection) -> int:
                 (expiry, instrument_id),
             )
             updated += 1
-    conn.commit()
+    if commit:
+        conn.commit()
     return updated
 
 
-def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary:
+def run_fifo(conn: psycopg.Connection, as_of: date | None = None, commit: bool = True) -> FifoSummary:
     """Brief CC-S, S2: pętla FIFO nie jest już zduplikowana tutaj — liczy przez
     ten sam rdzeń co `positions_as_of` (`_compute_positions`), z `as_of`
     domyślnie dzisiejszym (jak dotychczas). Zapis do `positions_fifo` (te same
-    kolumny/DELETE dla zamkniętych) bez zmian względem poprzedniej wersji."""
+    kolumny/DELETE dla zamkniętych) bez zmian względem poprzedniej wersji.
+    `commit=False` (brief CC-C, C2) — do testów DB z rollbackiem."""
     if as_of is None:
         as_of = date.today()
 
     summary = FifoSummary()
-    ensure_contract_expiry_populated(conn)
+    ensure_contract_expiry_populated(conn, commit=commit)
 
     with conn.cursor() as cur:
         open_counts: dict[str, int] = {}
@@ -462,7 +466,8 @@ def run_fifo(conn: psycopg.Connection, as_of: date | None = None) -> FifoSummary
                     (rachunek, instrument_id, currency),
                 )
 
-        conn.commit()
+        if commit:
+            conn.commit()
 
         cur.execute(
             "SELECT rachunek, min(transaction_date), max(transaction_date) FROM transactions GROUP BY rachunek"
