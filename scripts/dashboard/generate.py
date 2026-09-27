@@ -574,8 +574,9 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
                 "brak_wiersza_ryzyka": brak_wiersza_ryzyka,
                 "multiplier_missing": multiplier_missing,
                 "theme_null": theme_null,
-                "value_quality_trend_brak_count": len(rows),
-                "conviction_nieprzypisana_count": len(rows),
+                # = wiersze tabeli pozycji (po konsolidacji, wszystkie zbiory), nie wiersze surowe
+                "value_quality_trend_brak_count": sum(len(v.positions) for v in consolidated.values()),
+                "conviction_nieprzypisana_count": sum(len(v.positions) for v in consolidated.values()),
                 "broker_reconciliation_note": "czeka: owner (B-16)",
                 "attrs_without_history_note": "atrybuty instrumentów (np. theme) są BIEŻĄCE, bez historii (B-20)",
             },
