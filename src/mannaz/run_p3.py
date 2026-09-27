@@ -70,10 +70,18 @@ def cmd_prices(args: argparse.Namespace) -> None:
     finally:
         conn.close()
     print(f"T7: {summary.t7_pass}/{summary.t7_total} currency match")
+    # I3 (brief CC-I, B-21): liczniki instrumentów wg statusu bezpiecznika wiersza/odpowiedzi.
+    print(
+        f"T12: instruments_ok={summary.instruments_ok} "
+        f"instruments_with_rejected_rows={summary.instruments_with_rejected_rows} "
+        f"instruments_empty_response={summary.instruments_empty_response} "
+        f"rows_rejected_total={summary.rows_rejected_total}"
+    )
     for r in summary.results:
         print(
             f"  id={r.instrument_id} symbol={r.yahoo_symbol} rows_fetched={r.rows_fetched} "
-            f"rows_inserted={r.rows_inserted} currency_check={r.currency_check} "
+            f"rows_inserted={r.rows_inserted} rows_rejected={r.rows_rejected} status={r.status} "
+            f"currency_check={r.currency_check} "
             f"adjustment_convention={r.adjustment_convention} "
             f"t8_outliers={len(r.log_return_outliers)} note={r.note}"
         )

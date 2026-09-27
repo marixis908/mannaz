@@ -47,14 +47,26 @@ utożsamiany z GBP (pułapka 100x z dokumentacji yfinance, patrz §9.4).
 T8 (sanity-check rzędu wielkości, §T8): `detect_log_return_outliers` —
 kontrolka dodatnia/ujemna w `tests/test_prices.py` (kopia jednej serii,
 OSTATNIA sesja ×100 -> dokładnie 1 trafienie, bo nie ma sesji PO niej, która
-utworzyłaby drugi próg zwrotu)."""
+utworzyłaby drugi próg zwrotu).
+
+T12 (bezpiecznik importera, brief CC-I B-21, I2/I3): "zero wierszy albo same
+NaN -> nie zapisuj, zaloguj do `ingest_errors`". `validate_price_row` +
+`split_valid_and_rejected` dzielą odpowiedź `fetch_ohlc` na wiersze do
+zapisu i odrzucone (None/NaN/±Infinity w `high_split_adj`/`low_split_adj`/
+`close_split_adj` — `close_raw` jest z nich odtwarzany, więc pusty
+`close_split_adj` pociąga za sobą pusty `close_raw`). Wiersz odrzucony NIGDY
+nie trafia do `INSERT ... ON CONFLICT DO UPDATE` — stąd gwarancja I4: wiersz
+już zapisany z pełną ceną nie jest nigdy nadpisany pustą wartością. Migracja
+`sql/009_ingest_errors.sql` (I5) jest WYMAGANA — jej brak w bazie przerywa
+`run_prices_fetch` czytelnym błędem PRZED jakimkolwiek zapisem cen (nie
+chcemy cicho pomijać logowania T12)."""
 
 from __future__ import annotations
 
 import hashlib
 import math
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -65,6 +77,10 @@ DEFAULT_START = date(2023, 10, 1)
 LOG_RETURN_THRESHOLD = Decimal(4)
 
 CurrencyCheck = Literal["match", "gbp_pence_conversion_needed", "mismatch", "no_data"]
+# I3 (brief CC-I): status agregatu wierszy jednego instrumentu w jednym przebiegu.
+SymbolPricesStatus = Literal["ok", "rows_rejected", "empty_response"]
+# I2: kolumny, których pustość/nieskończoność dyskwalifikuje cały wiersz.
+_REQUIRED_PRICE_COLUMNS = ("high_split_adj", "low_split_adj", "close_split_adj")
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +100,13 @@ class OhlcRow:
 
 
 def _to_decimal(value: Any) -> Decimal | None:
+    """I2 (brief CC-I): NaN ORAZ ±Infinity (np. `float('inf')`, dzielenie
+    przez zero po stronie Yahoo) -> None. Bez tego ±Infinity przechodziłby
+    dalej jako `Decimal('Infinity')` i mógłby trafić do zapisu."""
     if value is None:
         return None
     try:
-        if isinstance(value, float) and math.isnan(value):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
             return None
         return Decimal(str(value))
     except (ValueError, TypeError, ArithmeticError):
@@ -130,6 +149,45 @@ def fetch_currency(symbol: str) -> str | None:
         return fast.get("currency")
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# I2 (brief CC-I, B-21) — bezpiecznik wiersza: walidacja + podział odpowiedzi
+# ---------------------------------------------------------------------------
+
+
+def validate_price_row(row: OhlcRow) -> list[str]:
+    """Zwraca listę nazw kolumn spośród `high_split_adj`/`low_split_adj`/
+    `close_split_adj`, które są `None` albo nieskończone (`Decimal.is_finite()
+    == False` — pokrywa NaN i ±Infinity; `_to_decimal` już zamienia oba na
+    None dla wejść typu `float`, ale wiersz może też trafić tu skonstruowany
+    wprost, np. w testach, z `Decimal('Infinity')`). Pusta lista -> wiersz do
+    zapisu. `close_raw`/`open_raw`/`high_raw`/`low_raw` są odtwarzane z
+    kolumn `*_split_adj` (`reconstruct_raw`), więc pusty `close_split_adj`
+    pociąga za sobą pusty `close_raw` — nie trzeba go sprawdzać osobno."""
+    bad: list[str] = []
+    for col_name in _REQUIRED_PRICE_COLUMNS:
+        value: Decimal | None = getattr(row, col_name)
+        if value is None or not value.is_finite():
+            bad.append(col_name)
+    return bad
+
+
+def split_valid_and_rejected(
+    rows: list[OhlcRow],
+) -> tuple[list[OhlcRow], list[tuple[OhlcRow, list[str]]]]:
+    """Dzieli odpowiedź `fetch_ohlc` na (do_zapisu, odrzucone) wg
+    `validate_price_row` (I2). `odrzucone` = `[(row, [nazwy_zlych_kolumn]), ...]`
+    — zachowuje wiersz razem z powodem odrzucenia, do wpisu w `ingest_errors`."""
+    valid: list[OhlcRow] = []
+    rejected: list[tuple[OhlcRow, list[str]]] = []
+    for row in rows:
+        bad_cols = validate_price_row(row)
+        if bad_cols:
+            rejected.append((row, bad_cols))
+        else:
+            valid.append(row)
+    return valid, rejected
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +257,8 @@ class SymbolPricesResult:
     yahoo_symbol: str
     rows_fetched: int = 0
     rows_inserted: int = 0
+    rows_rejected: int = 0  # I2/I3 — wiersze odrzucone przez validate_price_row
+    status: SymbolPricesStatus = "ok"  # I3 — "ok" / "rows_rejected" / "empty_response"
     currency_check: CurrencyCheck = "no_data"
     log_return_outliers: list[tuple[date, Decimal]] = field(default_factory=list)
     adjustment_convention: str = "yahoo_split_adjusted"
@@ -210,6 +270,11 @@ class PricesSummary:
     results: list[SymbolPricesResult] = field(default_factory=list)
     t7_pass: int = 0
     t7_total: int = 0
+    # I3 — liczniki instrumentów wg statusu tego przebiegu, + suma wierszy odrzuconych.
+    instruments_ok: int = 0
+    instruments_with_rejected_rows: int = 0
+    instruments_empty_response: int = 0
+    rows_rejected_total: int = 0
 
 
 def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -> list[dict[str, Any]]:
@@ -255,22 +320,81 @@ def _instrument_split_events(cur: psycopg.Cursor, instrument_id: int) -> list[tu
     return [(d, r) for d, r in cur.fetchall()]
 
 
+class MissingIngestErrorsTableError(RuntimeError):
+    """I5 (brief CC-I, B-21): tabela `ingest_errors` nie istnieje w bazie —
+    migracja `sql/009_ingest_errors.sql` nie została zastosowana.
+    `run_prices_fetch` rzuca ten wyjątek PRZED jakimkolwiek zapisem do
+    `prices_daily` (nie chcemy cicho pomijać logowania T12 tylko dlatego, że
+    tabela na logi jeszcze nie istnieje)."""
+
+
+def _ensure_ingest_errors_table(cur: psycopg.Cursor) -> None:
+    cur.execute("SELECT to_regclass('ingest_errors')")
+    if cur.fetchone()[0] is None:
+        raise MissingIngestErrorsTableError(
+            "Tabela ingest_errors nie istnieje — zastosuj sql/009_ingest_errors.sql "
+            "(I5, brief CC-I) przed uruchomieniem run_prices_fetch."
+        )
+
+
+def _log_ingest_error(
+    cur: psycopg.Cursor,
+    *,
+    source: str,
+    instrument_id: int | None,
+    price_date: date | None,
+    error_type: str,
+    detail: str,
+    run_started_at: datetime,
+) -> None:
+    """Append-only wpis do `ingest_errors` (I2/I3/I5) — `degraded_state`
+    zawsze FALSE, o degradacji stanu decyduje warstwa odczytu (`risk_daily`)."""
+    cur.execute(
+        """
+        INSERT INTO ingest_errors (
+            source, instrument_id, price_date, error_type, detail,
+            degraded_state, run_started_at
+        ) VALUES (%s, %s, %s, %s, %s, FALSE, %s)
+        """,
+        (source, instrument_id, price_date, error_type, detail, run_started_at),
+    )
+
+
 def run_prices_fetch(
     conn: psycopg.Connection,
     instrument_ids: list[int] | None = None,
     start: date = DEFAULT_START,
     end: date | None = None,
+    commit: bool = True,
 ) -> PricesSummary:
     """Pobiera i zapisuje `prices_daily` dla instrumentów z wypełnionym
     `yahoo_symbol` (P3.1). `instrument_ids=None` -> WSZYSTKIE zmapowane
     instrumenty (pełne pobranie — brief zastrzega, że wykonuje je inny agent);
-    lista id -> próba na wybranym podzbiorze (brief P3.2: 2 symbole)."""
+    lista id -> próba na wybranym podzbiorze (brief P3.2: 2 symbole).
+
+    Okno domyślne (I4, brief CC-I): `start=DEFAULT_START` (2023-10-01) ->
+    `end=dzisiaj`, czyli PEŁNA historia przy każdym przebiegu (upsert) —
+    ZNACZNIE szersze niż okno samonaprawy D-5 z M67 dokumentu projektowego
+    ("dane sesji D są odświeżane w oknie D-5 przy każdym przebiegu"). Okno
+    ZOSTAJE bez zmian: M67 opisuje MINIMALNE okno samonaprawy dla przebiegu
+    codziennego ("straży cenowej"), nie ogranicza zakresu tego pełnego
+    pobrania — a I2 gwarantuje, że nawet przy pełnej historii wiersz w bazie
+    z kompletną ceną nigdy nie zostanie nadpisany wierszem pustym/NaN/
+    Infinity, bo taki wiersz w ogóle nie dociera do INSERT/UPDATE poniżej.
+
+    I5: wymaga istnienia tabeli `ingest_errors` (sql/009) — jej brak przerywa
+    przebieg PRZED jakimkolwiek zapisem cen (`MissingIngestErrorsTableError`).
+
+    `commit=False` (jak `run_risk`, brief CC-S) — do testów DB z rollbackiem."""
     if end is None:
         end = date.today()
 
+    run_started_at = datetime.now(timezone.utc)
     summary = PricesSummary()
 
     with conn.cursor() as cur:
+        _ensure_ingest_errors_table(cur)  # I5 — przed jakimkolwiek zapisem cen
+
         instruments = _mapped_instruments(cur, instrument_ids)
 
         for inst in instruments:
@@ -298,8 +422,64 @@ def run_prices_fetch(
             closes_for_t8 = [(r.price_date, r.close_split_adj) for r in rows]
             result.log_return_outliers = detect_log_return_outliers(closes_for_t8)
 
+            # I2/I3 — bezpiecznik wiersza/odpowiedzi (brief CC-I, B-21).
+            valid_rows, rejected_rows = split_valid_and_rejected(rows)
+            result.rows_rejected = len(rejected_rows)
+
+            if not rows:
+                # I3 [S]: brak jakiejkolwiek odpowiedzi -> jeden wpis
+                # 'empty_response', zero prób zapisu.
+                _log_ingest_error(
+                    cur,
+                    source="yahoo",
+                    instrument_id=instrument_id,
+                    price_date=None,
+                    error_type="empty_response",
+                    detail="fetch_ohlc zwrocil zero wierszy",
+                    run_started_at=run_started_at,
+                )
+                result.status = "empty_response"
+                summary.instruments_empty_response += 1
+            elif not valid_rows:
+                # I3 [S]: WSZYSTKIE wiersze odrzucone w I2 traktujemy jak
+                # pustą odpowiedź — JEDEN wpis 'empty_response' z liczbą
+                # odrzuconych w treści, zamiast N wpisów 'row_missing_price'
+                # (byłby to szum: cały instrument i tak nie ma nic do
+                # zapisania, interesuje nas fakt "zero użytecznych danych",
+                # nie lista N identycznych powodów).
+                _log_ingest_error(
+                    cur,
+                    source="yahoo",
+                    instrument_id=instrument_id,
+                    price_date=None,
+                    error_type="empty_response",
+                    detail=f"wszystkie {len(rejected_rows)} wierszy odrzucone przez walidacje I2 (brief CC-I)",
+                    run_started_at=run_started_at,
+                )
+                result.status = "empty_response"
+                summary.instruments_empty_response += 1
+                summary.rows_rejected_total += len(rejected_rows)
+            else:
+                for bad_row, bad_cols in rejected_rows:
+                    _log_ingest_error(
+                        cur,
+                        source="yahoo",
+                        instrument_id=instrument_id,
+                        price_date=bad_row.price_date,
+                        error_type="row_missing_price",
+                        detail="puste/niepoprawne kolumny: " + ", ".join(bad_cols),
+                        run_started_at=run_started_at,
+                    )
+                summary.rows_rejected_total += len(rejected_rows)
+                if rejected_rows:
+                    result.status = "rows_rejected"
+                    summary.instruments_with_rejected_rows += 1
+                else:
+                    result.status = "ok"
+                    summary.instruments_ok += 1
+
             inserted = 0
-            for row in rows:
+            for row in valid_rows:
                 close_raw = reconstruct_raw(row.close_split_adj, row.price_date, events)
                 open_raw = reconstruct_raw(row.open_split_adj, row.price_date, events)
                 high_raw = reconstruct_raw(row.high_split_adj, row.price_date, events)
@@ -363,6 +543,7 @@ def run_prices_fetch(
 
             summary.results.append(result)
 
-        conn.commit()
+        if commit:
+            conn.commit()
 
     return summary
