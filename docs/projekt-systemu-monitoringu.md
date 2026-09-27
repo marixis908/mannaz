@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.3 · 2026-09-27**
+**Rewizja 4.4 · 2026-09-27**
 
 ---
 
@@ -28,7 +28,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4 | 2026-09-26 | Klucz przypisania archetypu §14.1 (kalibracja 17/20), archetyp A0, reguła „klucz proponuje, rejestracja decyduje" (§12, M76), progi klucza T34–T37, instrumenty pochodne §19.4, erratum §19.3 (zapadka Chandeliera od inicjalizacji), O-45 |
 | 4.1 | 2026-09-26 | §19.4: wartość rachunku KONTRAKTOWY w kapitale satelity = środki ogółem łącznie z depozytem zablokowanym; wynik zmienny rozliczany dziennie w środkach, bez osobnego doliczania (pomiar CC-R K2) |
 | 4.2 | 2026-09-27 | §19 M77: zasada „dane ≤ D” dla wielkości liczonych na dzień D; §19.3: zapadka Chandeliera per okres posiadania (brief CC-S) |
-| **4.3** | **2026-09-27** | **T27: forward-fill przy odczycie (`run_risk`), tabela cen tylko z realnymi sesjami, flaga nieświeżości i data użytej ceny w `risk_daily` (brief CC-U)** |
+| 4.3 | 2026-09-27 | T27: forward-fill przy odczycie (`run_risk`), tabela cen tylko z realnymi sesjami, flaga nieświeżości i data użytej ceny w `risk_daily` (brief CC-U) |
+| **4.4** | **2026-09-27** | **T12: zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie (T27); §8.2/§8.3: `prices_eod` → `prices_daily`, kolumny zgodne z bazą, bez `is_stale` (brief CC-I)** |
 
 ### 0.3 Oznaczenia
 
@@ -231,7 +232,7 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 
 **T11.** Przed każdym pomiarem mogącym zwrócić zero — **kontrolka dodatnia na tym samym typie wejścia**. Zielona kontrolka na innych danych jest kontrolką wadliwą, nawet gdy świeci.
 
-**T12.** Cache dyskowy z TTL 12–24 h dla źródeł bez SLA. **Circuit breaker**: zero wierszy albo same NaN → nie zapisuj, zaloguj do `ingest_errors`, użyj poprzedniego dnia z flagą `is_stale`.
+**T12.** Cache dyskowy z TTL 12–24 h dla źródeł bez SLA. **Circuit breaker**: zero wierszy albo same NaN → nie zapisuj, zaloguj do `ingest_errors`; zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie, według T27.
 
 **T13.** Throttling: SEC ≤ 10 req/s (twardy, z nagłówkiem User-Agent zawierającym kontakt), yfinance ~1 req/s z jitterem (token bucket), NBP z chunkowaniem po 93 dni.
 
@@ -430,7 +431,7 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 | `instruments` | instrument | ticker_local, isin, exchange (MIC), **currency**, archetype, base_ccy_reporting, first_listed | ręczny |
 | `positions` | instrument × data | qty, **cost_basis z historii transakcji**, target_weight, weight_band, conviction_floor, thesis_id | ręczny/import |
 | `transactions` | zdarzenie | data, instrument, qty, cena, prowizja, **kurs FX z datą i typem fixingu** | ręczny/import |
-| `prices_eod` | instrument × data × źródło | ohlcv, **currency**, **adjustment_convention**, source, fetched_at, is_stale | append |
+| `prices_daily` | instrument × data × źródło | open/high/low/close w dwóch warstwach (`*_raw`, `*_split_adj`), volume, **currency**, **adjustment_convention**, source, fetched_at | upsert (odświeżanie okna, M67) |
 | `corporate_actions` | instrument × data | typ (split/dywidenda/prawo poboru/scalenie), współczynnik, ex_date, source | append |
 | `fx_rates` | para × data × źródło | kurs, **fixing_id** (nbp_a / ecb_ref), source, fetched_at | append |
 | `fundamentals` | instrument × okres × **filed_at** | revenue, gross_profit, ebit, ebitda, fcf, sbc, shares_diluted, tbv, nopat, capex, wc, net_debt, **taxonomy**, **currency**, form_type, **available_at** | append |
@@ -445,7 +446,7 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 
 ### 8.3 Indeksy i ograniczenia
 
-- `prices_eod`: unikalny `(instrument_id, date, source, adjustment_convention)`; indeks `(instrument_id, date)`
+- `prices_daily`: unikalny `(instrument_id, price_date, source)`
 - `fundamentals`: unikalny `(instrument_id, period_end, filed_at, taxonomy)`
 - `fx_rates`: unikalny `(pair, date, fixing_id)`
 - `derived_metrics`: unikalny `(instrument_id, date, metric, code_version)`
