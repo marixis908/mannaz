@@ -78,6 +78,8 @@ from mannaz.risk import (
 
 TEMPLATE_PATH = _SCRIPT_DIR / "template.html"
 JSON_PLACEHOLDER = "__DASHBOARD_DATA_JSON__"
+# Etykieta "nie dotyczy" (nie luka) — szablon rozpoznaje ją po prefiksie "nie dotyczy".
+RESULT_A_FUT_NIE_DOTYCZY = "nie dotyczy: wynik rozliczany dziennie w środkach rachunku (§19.4)"
 
 
 class DashboardStop(Exception):
@@ -268,20 +270,12 @@ def _build_raw_position(
     if is_future:
         # Decyzja (pytanie otwarte, patrz raport końcowy): "wartość PLN"
         # generyczna (§3) nie jest liczona dla FUT — wielkość analogiczna to
-        # "nominał" (§7), z mnożnikiem, osobna sekcja Kontrakty. Podobnie
-        # "wynik (a)" nie jest liczony dla KONTRAKTOWY: `residual_cost` z
-        # `positions_as_of` dla futures pochodzi z `transactions.amount`,
-        # które dla wierszy kupno/sprzedaz KONTRAKTOWY nie jest ceną*ilość
-        # (patrz `risk.kontraktowy_account_value` — tam `amount` niesie
-        # notional zawierający już mnożnik, nie samą cenę) — zastosowanie
-        # wprost wzoru §3 wymagałoby decyzji metodologicznej, której nie
-        # podejmujemy tu samodzielnie.
+        # "nominał" (§7), z mnożnikiem, osobna sekcja Kontrakty. "Wynik (a)"
+        # dla KONTRAKTOWY nie dotyczy (decyzja planisty po raporcie D-r1):
+        # broker rozlicza wynik zmienny dziennie w środkach rachunku (§19.4),
+        # więc to nie jest luka danych — poza licznikami luk w stopce.
         value_pln_brak = "nie dotyczy FUT — patrz nominał w sekcji Kontrakty (§7)"
-        result_a = model.ResultA(
-            None, None, False,
-            "niezdefiniowane dla KONTRAKTOWY — residual_cost FIFO miesza jednostki notional/mnożnik "
-            "(patrz risk.kontraktowy_account_value); wymaga decyzji metodologicznej — pytanie otwarte",
-        )
+        result_a = model.ResultA(None, None, False, RESULT_A_FUT_NIE_DOTYCZY)
     elif price_status == "incomplete":
         # Kontrakt §3: pozycja ZOSTAJE w tabeli z ilością i flagą; wartość =
         # "brak pomiaru: <powód T27>"; NIE wypada z mianownika BW.
@@ -665,6 +659,10 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
             },
             "quality_footer": {
                 "brak_fx_rozliczenia": brak_fx_rozliczenia,
+                # poza licznikami luk (renderowane osobno jako "nie dotyczy")
+                "nie_dotyczy_result_a_fut": sum(
+                    1 for r in fut_rows if r["result_a"]["brak_opis"] == RESULT_A_FUT_NIE_DOTYCZY
+                ),
                 "t27_incomplete_by_reason": incomplete_by_reason,
                 "t27_stale_count": t27_stale,
                 "brak_isin": brak_isin,

@@ -92,6 +92,7 @@
   .kpi .value { font-size: 1.25rem; font-weight: 600; margin-top: 2px; }
   .kpi .value.small { font-size: 0.95rem; font-weight: 500; }
   .na { color: var(--na); font-style: italic; cursor: help; border-bottom: 1px dotted var(--na); }
+  .nd { color: var(--text-dim); font-size: 0.85em; }
   .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 0.72rem; font-weight: 600; }
   .tag.ok { background: rgba(31,157,85,0.15); color: var(--ok); }
   .tag.bad { background: rgba(208,57,43,0.15); color: var(--bad); }
@@ -800,7 +801,10 @@
       // Wynik (a)
       var ra = r.result_a;
       var tdA = el("td");
-      if (!ra || ra.amount === null) {
+      if (ra && ra.amount === null && String(ra.brak_opis || "").indexOf("nie dotyczy") === 0) {
+        // nie luka danych (np. kontrakty, §19.4) — bez "brak pomiaru", poza licznikami luk
+        tdA.appendChild(el("span", { cls: "nd", text: ra.brak_opis }));
+      } else if (!ra || ra.amount === null) {
         tdA.appendChild(naSpan(ra ? ra.brak_opis : null));
       } else {
         tdA.textContent = formatPl(ra.amount, 2) + (ra.pct !== null ? " (" + formatPct(ra.pct, 1) + ")" : "");
@@ -1101,6 +1105,13 @@
     ul.appendChild(el("li", { text: "Uzgodnienie z migawką brokera: " + q.broker_reconciliation_note }));
     ul.appendChild(el("li", { text: "Atrybuty instrumentów: " + q.attrs_without_history_note }));
     panel.appendChild(ul);
+
+    // Poza licznikami luk: pola, które z definicji nie dotyczą danej pozycji.
+    panel.appendChild(el("div", {
+      cls: "note",
+      text: "Nie dotyczy (nie luki): wynik (a) kontraktów — " + q.nie_dotyczy_result_a_fut +
+        " (wynik rozliczany dziennie w środkach rachunku, §19.4)"
+    }));
   }
 
   // =======================================================================
