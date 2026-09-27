@@ -31,3 +31,5 @@ wskazuje, co zastępuje.
 | 2026-09-25 (wieczór) | Repo `marixis908/mannaz` **publiczne**; dane finansowe poza gitem od pierwszego commita | owner | uchyla wpis 2026-09-25 „repo prywatne”; pomiar 2026-09-26: raw.githubusercontent.com/…/README.md → 200 bez uwierzytelnienia |
 | 2026-09-26 | Rew. 4.1: wartość rachunku KONTRAKTOWY = środki ogółem z depozytem, bez osobnego wyniku zmiennego (pomiar CC-R K2) | nadzorca | saldo z historii = PODSUMOWANIE brokera co do grosza; wynik zmienny rozliczany dziennie w środkach; §19.4 rew. 4.1 |
 | 2026-09-26 | Mnożniki serii kontraktów ze specyfikacji GPW (sql/007), heurystyka odrzucona | nadzorca | brak mnożnika = błąd z nazwą serii; `instruments.multiplier_source` z URL/komunikatem GPW |
+| 2026-09-27 | Rew. 4.2: zasada dane ≤ D (M77) i semantyka zapadki per okres posiadania (brief CC-S) | nadzorca | §19 M77, §19.3 rew. 4.2; pomiar CC-S: P1 EXACT, determinizm zapadki, 0 wierszy pozycji nieobecnych |
+| 2026-09-27 | Pozycja bez ceny na D nigdy nie wypada po cichu z kapitału ani ryzyka — reguła szczegółowa w briefie B-19 | nadzorca | CC-S S7 P2: 2026-09-25, 23 pozycje `no_price_on_d` poza kapitałem i heat bez błędu |

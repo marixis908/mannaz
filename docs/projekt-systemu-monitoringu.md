@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.1 · 2026-09-26**
+**Rewizja 4.2 · 2026-09-27**
 
 ---
 
@@ -26,7 +26,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 3.0 | 2026-09-25 | Stan infrastruktury po pomiarach: P-07 zamknięty, P-09 przeformułowany; §5.5 — osobny kontener PostgreSQL dla Mannaza zamiast wspólnej instancji z NocoDB; oryginał dokumentu w repo `mannaz` |
 | 3.1 | 2026-09-25 | Stooq po pomiarze: dostęp skryptowy zablokowany JS proof-of-work, ścieżka `get_apikey` nie wydaje klucza; Stooq przechodzi do roli źródła ręcznego (§9.2, §9.3, §12, §25.2, §25.3, O-12, R-01, P-02, nowy P-12) |
 | 4 | 2026-09-26 | Klucz przypisania archetypu §14.1 (kalibracja 17/20), archetyp A0, reguła „klucz proponuje, rejestracja decyduje" (§12, M76), progi klucza T34–T37, instrumenty pochodne §19.4, erratum §19.3 (zapadka Chandeliera od inicjalizacji), O-45 |
-| **4.1** | **2026-09-26** | **§19.4: wartość rachunku KONTRAKTOWY w kapitale satelity = środki ogółem łącznie z depozytem zablokowanym; wynik zmienny rozliczany dziennie w środkach, bez osobnego doliczania (pomiar CC-R K2)** |
+| 4.1 | 2026-09-26 | §19.4: wartość rachunku KONTRAKTOWY w kapitale satelity = środki ogółem łącznie z depozytem zablokowanym; wynik zmienny rozliczany dziennie w środkach, bez osobnego doliczania (pomiar CC-R K2) |
+| **4.2** | **2026-09-27** | **§19 M77: zasada „dane ≤ D” dla wielkości liczonych na dzień D; §19.3: zapadka Chandeliera per okres posiadania (brief CC-S)** |
 
 ### 0.3 Oznaczenia
 
@@ -943,6 +944,8 @@ Kategoryzacja startowa:
 
 ## 19. Ryzyko i sizing
 
+**M77.** Każda wielkość liczona na dzień D (pozycje, ilości, zdarzenia korporacyjne, ceny, FX, stan zapadki) korzysta wyłącznie z danych z datą ≤ D; wyjątkiem jest normalizacja warstwy cen skorygowanych o splity, która nie zmienia wartości w PLN; przeliczenie D zastępuje w całości poprzedni zapis dla D.
+
 ### 19.1 Hierarchia wyjść
 
 | Prio | Klasa | Reguła |
@@ -971,7 +974,7 @@ Poziom 3: suma otwartych ryzyk       ≤ 15%
 **M51.** System startuje na istniejących pozycjach z historycznymi wejściami, a wszystkie reguły są pisane dla wejść nowych. Semantyka inicjalizacji:
 
 - Pozycje **już poniżej** poziomu stopu w dniu pierwszym → stan `RISK = HIGH` i **jednorazowy raport inicjalizacyjny**, nie 31 alertów. Alert właściwy dopiero przy kolejnym przecięciu.
-- Stop 2N od historycznego wejścia dla pozycji z dużym zyskiem jest **martwy** — zastępowany przez Chandelier z §19.1 (`max(high,22) − 3×ATR22`), z zapadką „nigdy w dół" biegnącą od dnia inicjalizacji systemu.
+- Stop 2N od historycznego wejścia dla pozycji z dużym zyskiem jest **martwy** — zastępowany przez Chandelier z §19.1 (`max(high,22) − 3×ATR22`), z zapadką „nigdy w dół" biegnącą od dnia inicjalizacji systemu. Dla pozycji otwartej po dniu inicjalizacji zapadka biegnie od otwarcia bieżącego okresu posiadania; zamknięcie pozycji zeruje stan zapadki.
 - Raport inicjalizacyjny jest **poza limitem 15 alertów miesięcznie** i występuje dokładnie raz.
 
 ### 19.4 Instrumenty pochodne
