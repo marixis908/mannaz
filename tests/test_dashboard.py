@@ -658,3 +658,49 @@ def test_result_a_and_provenance_are_asdict_friendly():
     d2 = asdict(prov)
     assert set(d2.keys()) == {"passed", "overall_status", "tests", "failed_tests", "note"}
     assert all(set(asdict_t.keys()) == {"name", "status"} for asdict_t in d2["tests"])
+
+
+# ---------------------------------------------------------------------------
+# Import generate.py i sygnatury funkcji importowanych z mannaz (B-26)
+# ---------------------------------------------------------------------------
+# generate.py wywołuje je POZYCYJNIE (patrz wywołania w generate.py), więc
+# oczekiwane są dokładnie te nazwy wymaganych parametrów w tej kolejności;
+# parametry nadmiarowe muszą mieć wartość domyślną. Test wykrywa zmianę nazwy
+# lub parametrów; zmiany semantyki nie wykrywa (ujawni ją uruchomienie generatora).
+
+import inspect  # noqa: E402
+
+EXPECTED_REQUIRED_PARAMS = {
+    ("mannaz.risk", "_open_positions_as_of"): ["cur", "as_of"],
+    ("mannaz.risk", "_resolve_position_price_coverage"): ["cur", "pos", "as_of"],
+    ("mannaz.risk", "_kontraktowy_rows"): ["cur", "as_of"],
+    ("mannaz.risk", "check_kontraktowy_coverage"): ["n_rows", "max_date", "has_open_futures", "as_of"],
+    ("mannaz.risk", "kontraktowy_account_value"): ["rows", "as_of"],
+    ("mannaz.risk", "is_risk_budget_eligible"): ["instrument_type", "is_core"],
+    ("mannaz.fifo", "positions_as_of"): ["conn_or_cur", "as_of"],
+}
+
+
+def test_generate_importuje_sie_bez_bazy_i_uzywa_tych_samych_funkcji():
+    import importlib
+
+    import generate  # noqa: F401 — import modułu, bez uruchamiania main()
+
+    for (module_name, func_name) in EXPECTED_REQUIRED_PARAMS:
+        source = getattr(importlib.import_module(module_name), func_name)
+        assert getattr(generate, func_name) is source, f"generate.{func_name} nie wskazuje {module_name}.{func_name}"
+
+
+def test_sygnatury_funkcji_mannaz_zgodne_z_wywolaniami_generate():
+    import importlib
+
+    for (module_name, func_name), expected in EXPECTED_REQUIRED_PARAMS.items():
+        params = list(inspect.signature(getattr(importlib.import_module(module_name), func_name)).parameters.values())
+        positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        required = [p.name for p in positional if p.default is inspect.Parameter.empty]
+        assert required == expected, f"{module_name}.{func_name}: wymagane {required} != oczekiwane {expected}"
+        extra_required = [
+            p.name for p in params
+            if p.kind in (p.KEYWORD_ONLY,) and p.default is inspect.Parameter.empty
+        ]
+        assert not extra_required, f"{module_name}.{func_name}: nowe wymagane parametry keyword-only {extra_required}"
