@@ -1,0 +1,1044 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="mannaz-pin" content="">
+<title>Dashboard portfela satelity</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --bg-panel: #ffffff;
+    --bg-panel-2: #eef0f4;
+    --text: #1b1f27;
+    --text-dim: #5b6472;
+    --border: #d7dbe3;
+    --accent: #2f6fed;
+    --accent-2: #6c3ce9;
+    --ok: #1f9d55;
+    --warn: #c98a00;
+    --bad: #d0392b;
+    --na: #98a1ad;
+    --band-rdzen: rgba(47, 111, 237, 0.12);
+    --band-standard: rgba(108, 60, 233, 0.10);
+    --band-sonda: rgba(31, 157, 85, 0.10);
+    --shadow: 0 1px 3px rgba(20, 24, 32, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161c;
+      --bg-panel: #1c1f27;
+      --bg-panel-2: #242833;
+      --text: #e7e9ee;
+      --text-dim: #9aa3b2;
+      --border: #333947;
+      --accent: #6fa0ff;
+      --accent-2: #b199ff;
+      --ok: #4fd587;
+      --warn: #e5b04c;
+      --bad: #ff7a6e;
+      --na: #6b7280;
+      --band-rdzen: rgba(111, 160, 255, 0.14);
+      --band-standard: rgba(177, 153, 255, 0.12);
+      --band-sonda: rgba(79, 213, 135, 0.10);
+      --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161c;
+    --bg-panel: #1c1f27;
+    --bg-panel-2: #242833;
+    --text: #e7e9ee;
+    --text-dim: #9aa3b2;
+    --border: #333947;
+    --accent: #6fa0ff;
+    --accent-2: #b199ff;
+    --ok: #4fd587;
+    --warn: #e5b04c;
+    --bad: #ff7a6e;
+    --na: #6b7280;
+    --band-rdzen: rgba(111, 160, 255, 0.14);
+    --band-standard: rgba(177, 153, 255, 0.12);
+    --band-sonda: rgba(79, 213, 135, 0.10);
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.45;
+  }
+  body { padding: 0 16px 48px; max-width: 1280px; margin: 0 auto; overflow-x: hidden; }
+  h1 { font-size: 1.35rem; margin: 20px 0 4px; }
+  h2 { font-size: 1.08rem; margin: 0 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 0.95rem; margin: 16px 0 8px; color: var(--text-dim); }
+  section { margin-top: 28px; }
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: var(--shadow);
+  }
+  .grid { display: grid; gap: 14px; }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .grid-3 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .kpi { background: var(--bg-panel-2); border-radius: 8px; padding: 10px 12px; }
+  .kpi .label { font-size: 0.78rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
+  .kpi .value { font-size: 1.25rem; font-weight: 600; margin-top: 2px; }
+  .kpi .value.small { font-size: 0.95rem; font-weight: 500; }
+  .na { color: var(--na); font-style: italic; cursor: help; border-bottom: 1px dotted var(--na); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 0.72rem; font-weight: 600; }
+  .tag.ok { background: rgba(31,157,85,0.15); color: var(--ok); }
+  .tag.bad { background: rgba(208,57,43,0.15); color: var(--bad); }
+  .tag.warn { background: rgba(201,138,0,0.18); color: var(--warn); }
+  .tag.neutral { background: var(--bg-panel-2); color: var(--text-dim); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, th.txt, td.txt { text-align: left; white-space: normal; }
+  th { cursor: pointer; user-select: none; color: var(--text-dim); font-weight: 600; position: sticky; top: 0; background: var(--bg-panel); }
+  th.sorted::after { content: " \25BE"; }
+  th.sorted-desc::after { content: " \25B4"; }
+  tbody tr:hover { background: var(--bg-panel-2); }
+  .table-scroll { overflow-x: auto; border-radius: 8px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+  select, input[type=text] {
+    background: var(--bg-panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 0.85rem;
+  }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 0.82rem; }
+  .bar-label { width: 190px; flex: 0 0 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { flex: 1; position: relative; height: 16px; background: var(--bg-panel-2); border-radius: 4px; overflow: visible; }
+  .bar-fill { position: absolute; top: 0; left: 0; height: 100%; border-radius: 4px; background: var(--accent); }
+  .bar-value { width: 76px; flex: 0 0 76px; text-align: right; font-variant-numeric: tabular-nums; }
+  .band-bg { position: absolute; top: 0; bottom: 0; }
+  .floor-line { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--bad); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.78rem; color: var(--text-dim); margin-top: 6px; }
+  .legend-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .note { font-size: 0.8rem; color: var(--text-dim); margin-top: 8px; }
+  .stack { display: flex; width: 100%; height: 28px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+  .stack > div { height: 100%; }
+  footer.app-footer { margin-top: 36px; font-size: 0.76rem; color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 10px; }
+  .theme-toggle { float: right; font-size: 0.75rem; }
+  .theme-toggle button {
+    background: var(--bg-panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 9px; cursor: pointer; font-size: 0.75rem;
+  }
+  ul.plain { list-style: none; padding: 0; margin: 6px 0; }
+  ul.plain li { padding: 2px 0; font-size: 0.85rem; }
+  .risk-banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 0.9rem; }
+  .risk-banner.ok { background: rgba(31,157,85,0.12); border: 1px solid var(--ok); }
+  .risk-banner.bad { background: rgba(208,57,43,0.12); border: 1px solid var(--bad); }
+</style>
+</head>
+<body>
+<div class="theme-toggle">
+  <button id="theme-btn" type="button" title="Przełącz jasny/ciemny motyw (nadpisuje prefers-color-scheme)">motyw: auto</button>
+</div>
+<h1>Dashboard portfela satelity</h1>
+<div id="header-panel" class="panel"></div>
+
+<section id="sec-composition">
+  <h2>2. Skład</h2>
+  <div id="composition-panel" class="panel"></div>
+</section>
+
+<section id="sec-concentration">
+  <h2>3. Koncentracja</h2>
+  <div id="concentration-panel" class="panel"></div>
+</section>
+
+<section id="sec-positions">
+  <h2>4. Tabela pozycji</h2>
+  <div id="positions-panel" class="panel"></div>
+</section>
+
+<section id="sec-risk">
+  <h2>5. Ryzyko portfela</h2>
+  <div id="risk-panel" class="panel"></div>
+</section>
+
+<section id="sec-contracts">
+  <h2>6. Kontrakty</h2>
+  <div id="contracts-panel" class="panel"></div>
+</section>
+
+<section id="sec-footer">
+  <h2>7. Stopka jakości danych</h2>
+  <div id="footer-panel" class="panel"></div>
+</section>
+
+<footer class="app-footer" id="app-footer"></footer>
+
+<script type="application/json" id="dashboard-data">__DASHBOARD_DATA_JSON__</script>
+<script>
+(function () {
+  "use strict";
+
+  // -------------------------------------------------------------------
+  // Dane: osadzone przez generate.py jako JSON. Konwencja: KAŻDA liczba
+  // pochodząca z Decimal w Pythonie przychodzi tu jako STRING (zachowanie
+  // precyzji) — parsujemy przez Number()/parseFloat() dopiero do
+  // formatowania/wykresów. Daty/znaczniki czasu -> string ISO 8601.
+  // -------------------------------------------------------------------
+  var DATA = JSON.parse(document.getElementById("dashboard-data").textContent);
+
+  // ---------------------------------------------------------------------
+  // Motyw jasny/ciemny — respektuje prefers-color-scheme, z ręcznym
+  // przełącznikiem (localStorage, per-przeglądarka, nigdy nie wpływa na
+  // dane).
+  // ---------------------------------------------------------------------
+  (function initTheme() {
+    var btn = document.getElementById("theme-btn");
+    var root = document.documentElement;
+    var saved = null;
+    try { saved = localStorage.getItem("mannaz-dashboard-theme"); } catch (e) { /* private mode itp. */ }
+    if (saved === "light" || saved === "dark") {
+      root.setAttribute("data-theme", saved);
+      btn.textContent = "motyw: " + saved;
+    }
+    btn.addEventListener("click", function () {
+      var current = root.getAttribute("data-theme") || "auto";
+      var next = current === "dark" ? "light" : (current === "light" ? "auto" : "dark");
+      if (next === "auto") {
+        root.removeAttribute("data-theme");
+      } else {
+        root.setAttribute("data-theme", next);
+      }
+      btn.textContent = "motyw: " + next;
+      try { localStorage.setItem("mannaz-dashboard-theme", next); } catch (e) { /* ignorowane */ }
+    });
+  })();
+
+  // ---------------------------------------------------------------------
+  // Formatowanie PL — RĘCZNE (Intl pl-PL pomija grupowanie liczb
+  // 4-cyfrowych, patrz brief D4). Spacja co 3 cyfry od prawej, przecinek
+  // jako separator dziesiętny. Ten sam algorytm co
+  // scripts/dashboard/model.py::format_pl_number (dwie niezależne
+  // implementacje, reguła musi dawać identyczny wynik).
+  // ---------------------------------------------------------------------
+  function toNumber(v) {
+    if (v === null || v === undefined) return null;
+    var n = typeof v === "number" ? v : parseFloat(v);
+    return isFinite(n) ? n : null;
+  }
+
+  function formatPl(value, decimals) {
+    decimals = decimals || 0;
+    var n = toNumber(value);
+    if (n === null) return null;
+    var sign = n < 0 ? "-" : "";
+    var abs = Math.abs(n);
+    var fixed = abs.toFixed(decimals);
+    var parts = fixed.split(".");
+    var intPart = parts[0];
+    var fracPart = parts[1] || "";
+    var grouped = "";
+    var s = intPart;
+    while (s.length > 3) {
+      grouped = " " + s.slice(-3) + grouped;
+      s = s.slice(0, -3);
+    }
+    grouped = s + grouped;
+    return decimals > 0 ? (sign + grouped + "," + fracPart) : (sign + grouped);
+  }
+
+  function formatPct(value, decimals) {
+    var n = toNumber(value);
+    if (n === null) return null;
+    return formatPl(n, decimals === undefined ? 2 : decimals) + "%";
+  }
+
+  function formatDate(iso) {
+    if (!iso) return null;
+    // ISO "YYYY-MM-DD" albo znacznik czasu — pokazujemy w formie PL DD.MM.RRRR.
+    var datePart = String(iso).slice(0, 10);
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(datePart);
+    if (!m) return datePart;
+    return m[3] + "." + m[2] + "." + m[1];
+  }
+
+  // ---------------------------------------------------------------------
+  // Budowa elementów DOM WYŁĄCZNIE przez textContent (bez innerHTML na
+  // danych) — kontrakt: "escape all text inserted into DOM".
+  // ---------------------------------------------------------------------
+  function el(tag, opts) {
+    var e = document.createElement(tag);
+    opts = opts || {};
+    if (opts.cls) e.className = opts.cls;
+    if (opts.text !== undefined && opts.text !== null) e.textContent = opts.text;
+    if (opts.title) e.title = opts.title;
+    if (opts.attrs) {
+      for (var k in opts.attrs) { e.setAttribute(k, opts.attrs[k]); }
+    }
+    return e;
+  }
+
+  function naSpan(reason) {
+    return el("span", { cls: "na", text: "brak pomiaru", title: reason || "" });
+  }
+
+  function numCell(value, opts) {
+    opts = opts || {};
+    var td = el("td");
+    if (value === null || value === undefined) {
+      td.appendChild(naSpan(opts.reason));
+      return td;
+    }
+    var text = opts.pct ? formatPct(value, opts.decimals) : formatPl(value, opts.decimals);
+    td.textContent = text;
+    if (opts.title) td.title = opts.title;
+    return td;
+  }
+
+  function txtCell(value, opts) {
+    opts = opts || {};
+    var td = el("td", { cls: "txt" });
+    if (value === null || value === undefined || value === "") {
+      td.appendChild(naSpan(opts.reason));
+      return td;
+    }
+    td.textContent = value;
+    if (opts.title) td.title = opts.title;
+    return td;
+  }
+
+  function clearAndAppend(container, nodes) {
+    container.textContent = "";
+    nodes.forEach(function (n) { container.appendChild(n); });
+  }
+
+  // ---------------------------------------------------------------------
+  // SVG helper (jedyny dozwolony napis "http" w całym pliku — przestrzeń
+  // nazw SVG, wymagana przez createElementNS, kontrakt: brak URL-i).
+  // ---------------------------------------------------------------------
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(SVG_NS, tag);
+    for (var k in attrs) { e.setAttribute(k, attrs[k]); }
+    return e;
+  }
+
+  // =======================================================================
+  // 1. Nagłówek
+  // =======================================================================
+  function renderHeader() {
+    var m = DATA.meta;
+    var panel = document.getElementById("header-panel");
+    var grid = el("div", { cls: "grid grid-3" });
+
+    function kpi(label, valueNode, title) {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: label }));
+      var v = el("div", { cls: "value" });
+      if (typeof valueNode === "string" || valueNode === null) {
+        if (valueNode === null) { v.appendChild(naSpan(title)); }
+        else { v.textContent = valueNode; }
+      } else {
+        v.appendChild(valueNode);
+      }
+      if (title) v.title = title;
+      box.appendChild(v);
+      return box;
+    }
+
+    grid.appendChild(kpi("D składu", formatDate(m.d_composition), "Dzień, na który liczony jest skład portfela (positions_as_of)"));
+    grid.appendChild(kpi("D ryzyka", formatDate(m.d_risk), "Dzień, dla którego czytane jest risk_daily (osobny od D składu)"));
+    grid.appendChild(kpi("Wygenerowano", formatDate(m.generated_at) + " " + String(m.generated_at).slice(11, 19), "Znacznik czasu wygenerowania tego pliku"));
+
+    grid.appendChild(kpi(
+      "NBP (kurs)",
+      m.nbp.rate_date_max ? ("A, " + formatDate(m.nbp.rate_date_max)) : null,
+      "fixing_id=" + m.nbp.fixing_id + "; " + m.table_number_note
+    ));
+    grid.appendChild(kpi("Numer tabeli NBP", null, m.table_number_note));
+    grid.appendChild(kpi(
+      "Świeżość: sesje od D",
+      String(m.freshness.sessions_since_d),
+      "Dni robocze (bez świąt) między D składu a dniem generowania; STOP przy > 5"
+    ));
+
+    grid.appendChild(kpi(
+      "Najstarsza cena SAT",
+      m.freshness.oldest_sat_price_age_days === null ? null : (m.freshness.oldest_sat_price_age_days + " dni"),
+      "Maksymalny wiek ceny (D - price_date) wśród pozycji SAT"
+    ));
+    grid.appendChild(kpi("Data FX (max)", formatDate(m.freshness.fx_date_max), "Najświeższa data kursu NBP A użyta w przeliczeniach"));
+    grid.appendChild(kpi("Ostatni fetch źródeł", formatDate(m.freshness.max_source_run_fetched_at), "max(source_runs.fetched_at)"));
+
+    grid.appendChild(kpi(
+      "Liczba pozycji SAT",
+      String(m.counts.SAT.after),
+      "Po konsolidacji (ISIN/ticker+rynek); przed konsolidacją: " + m.counts.SAT.before
+    ));
+    grid.appendChild(kpi(
+      "Wartość satelity (BW)",
+      m.bw === null ? null : formatPl(m.bw, 2) + " PLN",
+      "BW = Σ wartość rynkowa PLN pozycji SAT (po konsolidacji), NBP A ≤ D, bez gotówki (B-17)"
+    ));
+    grid.appendChild(kpi(
+      "Udział satelity",
+      m.sat_share_of_calosc === null ? null : formatPct(m.sat_share_of_calosc * 100, 2),
+      "BW / CAŁOŚĆ (CAŁOŚĆ = BW + rdzeń), bez gotówki i rachunku KONTRAKTOWY"
+    ));
+
+    grid.appendChild(kpi(
+      "Kapitał satelity KS (§19.2)",
+      m.ks === null ? null : formatPl(m.ks, 2) + " PLN",
+      m.ks === null ? m.ks_error : "KS = BW + wartość rachunku KONTRAKTOWY (środki ogółem z depozytem)"
+    ));
+    grid.appendChild(kpi(
+      "CAŁOŚĆ",
+      m.calosc === null ? null : formatPl(m.calosc, 2) + " PLN",
+      "BW + Σ wartość pozycji CORE"
+    ));
+
+    var pinBox = el("div", { cls: "kpi" });
+    pinBox.appendChild(el("div", { cls: "label", text: "Pin przebiegu" }));
+    var pinVal = el("div", { cls: "value small" });
+    var pinText = "source_runs.id≤" + (m.pin.max_source_run_id === null ? "?" : m.pin.max_source_run_id);
+    pinText += " · risk computed_at: " + (m.pin.risk_computed_at ? formatDate(m.pin.risk_computed_at) + " " + String(m.pin.risk_computed_at).slice(11, 19) : "brak pomiaru");
+    pinVal.textContent = pinText;
+    pinVal.title = "max(source_runs.id) oraz risk_daily.computed_at dla D ryzyka — asercja A7 (stan bazy przy D6)";
+    pinBox.appendChild(pinVal);
+    grid.appendChild(pinBox);
+
+    clearAndAppend(panel, [grid]);
+
+    // <meta name="mannaz-pin"> — wypełniane w JS (jedyny punkt wstrzyknięcia
+    // danych to skrypt JSON; ten meta-tag jest pochodną tych samych danych).
+    var metaPin = document.querySelector('meta[name="mannaz-pin"]');
+    if (metaPin) {
+      metaPin.setAttribute(
+        "content",
+        "source_runs.id<=" + m.pin.max_source_run_id + "; risk_daily.computed_at=" + (m.pin.risk_computed_at || "brak")
+      );
+    }
+
+    var footer = document.getElementById("app-footer");
+    footer.textContent = "";
+    footer.appendChild(el("div", {
+      text: "Pin: max(source_runs.id) ≤ " + m.pin.max_source_run_id +
+        "; risk_daily.computed_at (D ryzyka) = " + (m.pin.risk_computed_at ? (formatDate(m.pin.risk_computed_at) + " " + String(m.pin.risk_computed_at).slice(11, 19)) : "brak pomiaru")
+    }));
+    footer.appendChild(el("div", { text: "Wygenerowano lokalnie, bez połączenia sieciowego. Dashboard prywatny — nie publikować." }));
+  }
+
+  // =======================================================================
+  // 2. Skład — podziały wg konta / rynku / waluty notowania (SAT)
+  // =======================================================================
+  function groupSum(rows, keyFn) {
+    var sums = {};
+    var order = [];
+    rows.forEach(function (r) {
+      if (r.value_pln === null || r.value_pln === undefined) return;
+      var key = keyFn(r) || "nieustalony";
+      if (!(key in sums)) { sums[key] = 0; order.push(key); }
+      sums[key] += toNumber(r.value_pln);
+    });
+    return order.map(function (k) { return { key: k, value: sums[k] }; }).sort(function (a, b) { return b.value - a.value; });
+  }
+
+  function renderBarGroup(container, title, groups, totalValue, noteText) {
+    container.appendChild(el("h3", { text: title }));
+    var wrap = el("div");
+    var maxV = Math.max.apply(null, groups.map(function (g) { return g.value; }).concat([1e-9]));
+    groups.forEach(function (g) {
+      var row = el("div", { cls: "bar-row" });
+      row.appendChild(el("div", { cls: "bar-label", text: g.key, title: g.key }));
+      var track = el("div", { cls: "bar-track" });
+      var fill = el("div", { cls: "bar-fill" });
+      fill.style.width = (Math.max(g.value, 0) / maxV * 100).toFixed(2) + "%";
+      track.appendChild(fill);
+      row.appendChild(track);
+      var pctOfTotal = totalValue ? (g.value / totalValue * 100) : null;
+      row.appendChild(el("div", {
+        cls: "bar-value",
+        text: (pctOfTotal === null ? "—" : formatPct(pctOfTotal, 1)),
+        attrs: { title: formatPl(g.value, 2) + " PLN" },
+      }));
+      wrap.appendChild(row);
+    });
+    container.appendChild(wrap);
+    if (noteText) container.appendChild(el("div", { cls: "note", text: noteText }));
+  }
+
+  function renderComposition() {
+    var panel = document.getElementById("composition-panel");
+    panel.textContent = "";
+    var sat = DATA.positions.SAT;
+    var bw = toNumber(DATA.meta.bw);
+
+    var grid = el("div", { cls: "grid grid-3" });
+    var byAccount = el("div");
+    var byMarket = el("div");
+    var byCurrency = el("div");
+    grid.appendChild(byAccount);
+    grid.appendChild(byMarket);
+    grid.appendChild(byCurrency);
+    panel.appendChild(grid);
+
+    renderBarGroup(byAccount, "Wg rachunku", groupSum(sat, function (r) { return r.rachunek; }), bw);
+    renderBarGroup(byMarket, "Wg rynku", groupSum(sat, function (r) { return r.market; }), bw,
+      "„nieustalony” liczony tylko wśród pozycji otwartych");
+    renderBarGroup(byCurrency, "Wg waluty notowania", groupSum(sat, function (r) { return r.quote_currency; }), bw);
+
+    panel.appendChild(el("h3", { text: "Pasmo wag SAT (proporcje wartości PLN)" }));
+    var stack = el("div", { cls: "stack" });
+    var sorted = sat.filter(function (r) { return r.value_pln !== null; })
+      .slice().sort(function (a, b) { return toNumber(b.value_pln) - toNumber(a.value_pln); });
+    var palette = ["#2f6fed", "#6c3ce9", "#1f9d55", "#c98a00", "#d0392b", "#0891b2", "#a3557a", "#7c8b9a"];
+    var shown = sorted.slice(0, 12);
+    var restSum = sorted.slice(12).reduce(function (s, r) { return s + toNumber(r.value_pln); }, 0);
+    shown.forEach(function (r, i) {
+      var seg = el("div", {
+        title: r.name + " — " + formatPl(toNumber(r.value_pln), 2) + " PLN (" + formatPct(toNumber(r.weight) * 100, 2) + ")",
+      });
+      seg.style.width = (bw ? (toNumber(r.value_pln) / bw * 100) : 0).toFixed(3) + "%";
+      seg.style.background = palette[i % palette.length];
+      stack.appendChild(seg);
+    });
+    if (restSum > 0) {
+      var restSeg = el("div", { title: "Pozostałe pozycje SAT — " + formatPl(restSum, 2) + " PLN", attrs: {} });
+      restSeg.style.width = (bw ? (restSum / bw * 100) : 0).toFixed(3) + "%";
+      restSeg.style.background = "var(--bg-panel-2)";
+      stack.appendChild(restSeg);
+    }
+    panel.appendChild(stack);
+    panel.appendChild(el("div", {
+      cls: "note",
+      text: "Konwencja: wartość rynkowa PLN, NBP A ≤ D, po konsolidacji, mianownik BW. Kolory bez znaczenia poza rozróżnieniem pozycji (najedź kursorem).",
+    }));
+  }
+
+  // =======================================================================
+  // 3. Koncentracja
+  // =======================================================================
+  function renderConcentration() {
+    var panel = document.getElementById("concentration-panel");
+    panel.textContent = "";
+    var sat = DATA.positions.SAT.filter(function (r) { return r.weight !== null; })
+      .slice().sort(function (a, b) { return toNumber(b.weight) - toNumber(a.weight); });
+
+    var legend = el("div", { cls: "legend" });
+    [
+      ["Rdzeń satelity 6–9%", "var(--band-rdzen)"],
+      ["Standard 3–5%", "var(--band-standard)"],
+      ["Sonda 1,5–2,5%", "var(--band-sonda)"],
+      ["Podłoga 1,5% (M53)", "var(--bad)"],
+    ].forEach(function (pair) {
+      var item = el("span");
+      var sw = el("span", { cls: "legend-swatch" });
+      sw.style.background = pair[1];
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(pair[0]));
+      legend.appendChild(item);
+    });
+    panel.appendChild(legend);
+
+    var maxWeight = Math.max.apply(null, sat.map(function (r) { return toNumber(r.weight) * 100; }).concat([9]));
+    var chartMax = Math.max(maxWeight * 1.1, 10);
+
+    var list = el("div");
+    sat.forEach(function (r) {
+      var wPct = toNumber(r.weight) * 100;
+      var row = el("div", { cls: "bar-row" });
+      row.appendChild(el("div", { cls: "bar-label", text: r.name, title: r.name + " (" + r.rachunek + ")" }));
+      var track = el("div", { cls: "bar-track" });
+
+      function bandDiv(fromPct, toPct, color) {
+        var d = el("div", { cls: "band-bg" });
+        d.style.left = (fromPct / chartMax * 100) + "%";
+        d.style.width = ((toPct - fromPct) / chartMax * 100) + "%";
+        d.style.background = color;
+        return d;
+      }
+      track.appendChild(bandDiv(1.5, 2.5, "var(--band-sonda)"));
+      track.appendChild(bandDiv(3, 5, "var(--band-standard)"));
+      track.appendChild(bandDiv(6, 9, "var(--band-rdzen)"));
+
+      var floor = el("div", { cls: "floor-line" });
+      floor.style.left = (1.5 / chartMax * 100) + "%";
+      track.appendChild(floor);
+
+      var fill = el("div", { cls: "bar-fill" });
+      fill.style.width = Math.min(wPct / chartMax * 100, 100).toFixed(2) + "%";
+      if (wPct < 1.5) fill.style.background = "var(--bad)";
+      track.appendChild(fill);
+
+      row.appendChild(track);
+      row.appendChild(el("div", { cls: "bar-value", text: formatPct(wPct, 2) }));
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+
+    var below = sat.filter(function (r) { return toNumber(r.weight) * 100 < 1.5; });
+    panel.appendChild(el("h3", { text: "Poniżej podłogi 1,5% (M53) — " + below.length + " pozycji" }));
+    if (below.length) {
+      var ul = el("ul", { cls: "plain" });
+      below.forEach(function (r) {
+        ul.appendChild(el("li", { text: r.name + " — " + formatPct(toNumber(r.weight) * 100, 2) + " (" + r.rachunek + ")" }));
+      });
+      panel.appendChild(ul);
+    } else {
+      panel.appendChild(el("div", { cls: "note", text: "Brak pozycji poniżej podłogi." }));
+    }
+    panel.appendChild(el("div", {
+      cls: "note",
+      text: "Waga = wartość PLN / BW (kontrakt §3/§20). Pasma wg polityki wag §20 dokumentu projektowego; klasa konwikcji per pozycja: nieprzypisana (brak w bazie).",
+    }));
+  }
+
+  // =======================================================================
+  // 4. Tabela pozycji
+  // =======================================================================
+  var POSITION_COLUMNS = [
+    { key: "set", label: "Zbiór", type: "str" },
+    { key: "rachunek", label: "Rachunek", type: "str" },
+    { key: "name", label: "Nazwa / ticker", type: "str" },
+    { key: "isin", label: "ISIN", type: "str" },
+    { key: "market", label: "Rynek", type: "str" },
+    { key: "quote_currency", label: "Wal. notow.", type: "str" },
+    { key: "settlement_currency", label: "Wal. rozl.", type: "str" },
+    { key: "qty", label: "Ilość", type: "num", decimals: 4 },
+    { key: "close_raw", label: "Cena ≤ D", type: "num", decimals: 4 },
+    { key: "price_age_days", label: "Wiek ceny", type: "num", decimals: 0 },
+    { key: "value_pln", label: "Wartość PLN", type: "num", decimals: 2 },
+    { key: "weight", label: "Waga (BW)", type: "pct", decimals: 2 },
+    { key: "result_a", label: "Wynik (a)", type: "resulta" },
+    { key: "result_b", label: "Wynik (b) PLN", type: "brak" },
+    { key: "broker_pl", label: "Wynik broker", type: "brak" },
+    { key: "risk_state", label: "RISK", type: "riskstate" },
+    { key: "stop", label: "Stop", type: "riskstop" },
+    { key: "open_risk", label: "Ryzyko otwarte", type: "riskpct" },
+    { key: "value_state", label: "VALUE", type: "brak" },
+    { key: "quality_state", label: "QUALITY", type: "brak" },
+    { key: "trend_state", label: "TREND", type: "brak" },
+    { key: "conviction", label: "Konwikcja", type: "conviction" },
+  ];
+
+  var positionsSortState = { key: null, dir: 1 };
+  var positionsFilterAccount = "Wszystkie";
+
+  function allPositionsFlat() {
+    var out = [];
+    ["SAT", "CORE", "FUT", "INNE"].forEach(function (setName) {
+      DATA.positions[setName].forEach(function (r) {
+        var copy = Object.assign({}, r);
+        copy.set = setName;
+        out.push(copy);
+      });
+    });
+    return out;
+  }
+
+  function sortValueFor(row, col) {
+    if (col.type === "num" || col.type === "pct") {
+      var v = row[col.key];
+      return v === null || v === undefined ? -Infinity : toNumber(v);
+    }
+    if (col.type === "resulta") {
+      return row.result_a && row.result_a.amount !== null ? toNumber(row.result_a.amount) : -Infinity;
+    }
+    if (col.type === "riskpct") {
+      return row.risk && row.risk.risk_pct_satellite_capital !== null && row.risk.risk_pct_satellite_capital !== undefined
+        ? toNumber(row.risk.risk_pct_satellite_capital) : -Infinity;
+    }
+    if (col.type === "riskstate") {
+      return (row.risk && row.risk.risk_state) || "";
+    }
+    return (row[col.key] === null || row[col.key] === undefined) ? "" : String(row[col.key]);
+  }
+
+  function renderPositionsTable() {
+    var panel = document.getElementById("positions-panel");
+    panel.textContent = "";
+
+    var controls = el("div", { cls: "controls" });
+    var label = el("label", { text: "Filtr rachunku: " });
+    var select = el("select");
+    var accounts = ["Wszystkie"].concat(
+      Array.from(new Set(allPositionsFlat().map(function (r) { return r.rachunek; }))).sort()
+    );
+    accounts.forEach(function (a) {
+      var opt = el("option", { text: a });
+      opt.value = a;
+      if (a === positionsFilterAccount) opt.selected = true;
+      select.appendChild(opt);
+    });
+    select.addEventListener("change", function () {
+      positionsFilterAccount = select.value;
+      renderPositionsBody();
+    });
+    label.appendChild(select);
+    controls.appendChild(label);
+
+    var countLabel = el("span", { cls: "note", attrs: { id: "positions-count-note" } });
+    controls.appendChild(countLabel);
+
+    panel.appendChild(controls);
+
+    var scroll = el("div", { cls: "table-scroll" });
+    var table = el("table", { attrs: { id: "positions-table" } });
+    var thead = el("thead");
+    var trh = el("tr");
+    POSITION_COLUMNS.forEach(function (col) {
+      var th = el("th", { text: col.label, title: "Sortuj wg: " + col.label });
+      th.dataset.key = col.key;
+      th.addEventListener("click", function () {
+        if (positionsSortState.key === col.key) {
+          positionsSortState.dir *= -1;
+        } else {
+          positionsSortState.key = col.key;
+          positionsSortState.dir = 1;
+        }
+        renderPositionsBody();
+      });
+      trh.appendChild(th);
+    });
+    thead.appendChild(trh);
+    table.appendChild(thead);
+    var tbody = el("tbody", { attrs: { id: "positions-tbody" } });
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    panel.appendChild(scroll);
+
+    renderPositionsBody();
+  }
+
+  function renderPositionsBody() {
+    var tbody = document.getElementById("positions-tbody");
+    tbody.textContent = "";
+
+    document.querySelectorAll("#positions-table th").forEach(function (th) {
+      th.classList.remove("sorted", "sorted-desc");
+      if (th.dataset.key === positionsSortState.key) {
+        th.classList.add(positionsSortState.dir === 1 ? "sorted" : "sorted-desc");
+      }
+    });
+
+    var rows = allPositionsFlat();
+    if (positionsFilterAccount !== "Wszystkie") {
+      rows = rows.filter(function (r) { return r.rachunek === positionsFilterAccount; });
+    }
+    if (positionsSortState.key) {
+      var col = POSITION_COLUMNS.filter(function (c) { return c.key === positionsSortState.key; })[0];
+      rows.sort(function (a, b) {
+        var va = sortValueFor(a, col), vb = sortValueFor(b, col);
+        if (va < vb) return -1 * positionsSortState.dir;
+        if (va > vb) return 1 * positionsSortState.dir;
+        return 0;
+      });
+    }
+
+    document.getElementById("positions-count-note").textContent =
+      "Pokazano " + rows.length + " pozycji" + (positionsFilterAccount !== "Wszystkie" ? " (filtr: " + positionsFilterAccount + ")" : "");
+
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      tr.appendChild(txtCell(r.set));
+      tr.appendChild(txtCell(r.rachunek));
+      var nameCell = txtCell(r.name, { title: r.broker_ticker + (r.ambiguous ? " — NIEJEDNOZNACZNE (ISIN, różne rynki)" : "") + (r.consolidated ? " — scalone" : "") });
+      if (r.ambiguous) nameCell.appendChild(el("span", { cls: "tag warn", text: "niejedn.", title: "Ten sam ISIN, różny rynek — nie scalono" }));
+      if (r.consolidated) nameCell.appendChild(document.createTextNode(" "));
+      if (r.consolidated) nameCell.appendChild(el("span", { cls: "tag neutral", text: "scalone", title: (r.mixed_currency ? "Scalono z mieszaną walutą rozliczenia" : "Scalono " + r.components.length + " wierszy") }));
+      tr.appendChild(nameCell);
+      tr.appendChild(txtCell(r.isin, { reason: "brak ISIN w instruments" }));
+      tr.appendChild(txtCell(r.market, { reason: r.market === "nieustalony" ? "brak/nierozpoznany sufiks yahoo_symbol" : null }));
+      tr.appendChild(txtCell(r.quote_currency));
+      tr.appendChild(txtCell(r.settlement_currency === null ? "mieszana" : r.settlement_currency));
+      tr.appendChild(numCell(r.qty, { decimals: 4 }));
+      tr.appendChild(numCell(r.close_raw, { decimals: 4, reason: "brak ceny ≤ D w prices_daily", title: r.price_date ? ("na " + formatDate(r.price_date)) : "" }));
+      tr.appendChild(numCell(r.price_age_days, { decimals: 0 }));
+      tr.appendChild(numCell(r.value_pln, { decimals: 2, reason: r.value_pln_brak }));
+      tr.appendChild(numCell(r.weight, { pct: true, decimals: 2, reason: r.set !== "SAT" ? "poza mianownikiem wag BW (tylko SAT)" : r.value_pln_brak }));
+
+      // Wynik (a)
+      var ra = r.result_a;
+      var tdA = el("td");
+      if (!ra || ra.amount === null) {
+        tdA.appendChild(naSpan(ra ? ra.brak_opis : null));
+      } else {
+        tdA.textContent = formatPl(ra.amount, 2) + (ra.pct !== null ? " (" + formatPct(ra.pct, 1) + ")" : "");
+        tdA.title = "cena, bez dywidend; niezrealizowany; FIFO z historii transakcji; waluta rozliczenia" + (ra.cross_rate_flag ? "; zawiera kurs notowanie/rozliczenie" : "");
+      }
+      tr.appendChild(tdA);
+
+      tr.appendChild((function () { var td = el("td"); td.appendChild(naSpan(DATA.static_notes.wynik_b)); return td; })());
+      tr.appendChild((function () { var td = el("td"); td.appendChild(naSpan(DATA.static_notes.broker_pl)); return td; })());
+
+      // Ryzyko
+      var risk = r.risk || {};
+      var tdState = el("td");
+      if (risk.brak) {
+        tdState.appendChild(naSpan(risk.brak));
+      } else {
+        var tag = el("span", {
+          cls: "tag " + (risk.risk_state === "HIGH" ? "bad" : "ok"),
+          text: risk.risk_state || "—",
+          title: "stan na D ryzyka, §19.3/M51",
+        });
+        tdState.appendChild(tag);
+        if (risk.regime) tdState.appendChild(el("span", { cls: "tag warn", text: "REGIME", title: "close<SMA200, SMA200 opada" }));
+        if (risk.warning) tdState.appendChild(el("span", { cls: "tag warn", text: "OSTRZ.", title: "σ20>2×σ60 lub blisko 252d minimum" }));
+      }
+      tr.appendChild(tdState);
+
+      var tdStop = el("td");
+      if (risk.brak || risk.stop_effective === null || risk.stop_effective === undefined) {
+        tdStop.appendChild(naSpan(risk.brak));
+      } else {
+        tdStop.textContent = formatPl(risk.stop_effective, 4);
+        tdStop.title = "stop w walucie notowania (" + risk.quote_currency + "), warstwa split_adj, źródło: " + (risk.stop_source || "?");
+      }
+      tr.appendChild(tdStop);
+
+      var tdOpenRisk = el("td");
+      if (risk.brak || risk.risk_pct_satellite_capital === null || risk.risk_pct_satellite_capital === undefined) {
+        tdOpenRisk.appendChild(naSpan(risk.brak || "NULL lub multiplier_missing"));
+      } else {
+        tdOpenRisk.textContent = formatPct(risk.risk_pct_satellite_capital, 3);
+        tdOpenRisk.title = "% kapitału satelity KS z przebiegu run_risk, D ryzyka" + (risk.level1_breach ? "; NARUSZENIE poziomu 1 (>1%)" : "");
+        if (risk.level1_breach) tdOpenRisk.appendChild(el("span", { cls: "tag bad", text: " L1" }));
+      }
+      tr.appendChild(tdOpenRisk);
+
+      tr.appendChild((function () { var td = el("td"); td.appendChild(naSpan(DATA.static_notes.value)); return td; })());
+      tr.appendChild((function () { var td = el("td"); td.appendChild(naSpan(DATA.static_notes.quality)); return td; })());
+      tr.appendChild((function () { var td = el("td"); td.appendChild(naSpan(DATA.static_notes.trend)); return td; })());
+      tr.appendChild(txtCell("nieprzypisana", { title: DATA.static_notes.conviction }));
+
+      tbody.appendChild(tr);
+    });
+  }
+
+  // =======================================================================
+  // 5. Ryzyko portfela
+  // =======================================================================
+  function renderRisk() {
+    var panel = document.getElementById("risk-panel");
+    panel.textContent = "";
+    var risk = DATA.risk;
+    var prov = risk.provenance;
+
+    var banner = el("div", { cls: "risk-banner " + (prov.passed ? "ok" : "bad") });
+    banner.appendChild(el("div", {
+      text: prov.passed ? "Pochodzenie: test zachowania, bez SHA w bazie — PASS (3/3)" : "Pochodzenie: FAIL",
+    }));
+    if (!prov.passed) {
+      var ul = el("ul", { cls: "plain" });
+      prov.failed_tests.forEach(function (t) { ul.appendChild(el("li", { text: t })); });
+      banner.appendChild(ul);
+      banner.appendChild(el("div", { cls: "note", text: "Sekcja ryzyka i kolumny ryzyka w tabeli pozycji: brak pomiaru (patrz testy powyżej)." }));
+    }
+    panel.appendChild(banner);
+
+    if (!prov.passed) return;
+
+    var grid = el("div", { cls: "grid grid-3" });
+
+    var kpi1 = el("div", { cls: "kpi" });
+    kpi1.appendChild(el("div", { cls: "label", text: "Suma otwartych ryzyk (poziom 3)" }));
+    var v1 = el("div", { cls: "value" });
+    if (risk.sum_open_risk_pct === null) {
+      v1.appendChild(naSpan());
+    } else {
+      var pctSum = toNumber(risk.sum_open_risk_pct);
+      v1.textContent = formatPct(pctSum, 2) + " / 15%";
+      v1.title = "Σ risk_pct_satellite_capital po wierszach budżetowych (equity/etf spoza core + future), bez multiplier_missing";
+      if (pctSum > 15) {
+        kpi1.appendChild(el("div", { cls: "tag bad", text: "M50: tylko cięcia", title: "Po przekroczeniu 15% system nie proponuje dobrania" }));
+      }
+    }
+    kpi1.appendChild(v1);
+    grid.appendChild(kpi1);
+
+    grid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Naruszenia poziomu 1 (>1%)" }));
+      var v = el("div", { cls: "value" });
+      if (risk.level1_breach_count === null) { v.appendChild(naSpan()); }
+      else { v.textContent = String(risk.level1_breach_count); }
+      box.appendChild(v);
+      return box;
+    })());
+
+    grid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Pokrycie cen (SAT+FUT, D ryzyka)" }));
+      var v = el("div", { cls: "value" });
+      if (!risk.price_coverage) { v.appendChild(naSpan()); }
+      else {
+        v.textContent = risk.price_coverage.n + " / " + risk.price_coverage.N;
+        if (risk.price_coverage.n < risk.price_coverage.N) {
+          box.appendChild(el("div", { cls: "tag warn", text: "zaniżone — niepełne ceny (B-19)" }));
+        }
+      }
+      box.appendChild(v);
+      return box;
+    })());
+
+    panel.appendChild(grid);
+
+    panel.appendChild(el("h3", { text: "Poziom 2 — ryzyko wg tematu (próg 3%)" }));
+    if (!risk.theme_budgets || Object.keys(risk.theme_budgets).length === 0) {
+      panel.appendChild(el("div", { cls: "note", text: "Brak wierszy budżetowych z policzalnym ryzykiem." }));
+    } else {
+      var themeList = el("div");
+      Object.keys(risk.theme_budgets).sort(function (a, b) { return toNumber(risk.theme_budgets[b]) - toNumber(risk.theme_budgets[a]); })
+        .forEach(function (theme) {
+          var pct = toNumber(risk.theme_budgets[theme]);
+          var row = el("div", { cls: "bar-row" });
+          row.appendChild(el("div", { cls: "bar-label", text: theme, title: theme === "bez tematu" ? "instruments.theme NULL" : "instruments.theme (atrybut bieżący, bez historii — B-20)" }));
+          var track = el("div", { cls: "bar-track" });
+          var fill = el("div", { cls: "bar-fill" });
+          fill.style.width = Math.min(pct / 3 * 100, 100).toFixed(1) + "%";
+          if (pct > 3) fill.style.background = "var(--bad)";
+          track.appendChild(fill);
+          row.appendChild(track);
+          row.appendChild(el("div", { cls: "bar-value", text: formatPct(pct, 2) }));
+          themeList.appendChild(row);
+        });
+      panel.appendChild(themeList);
+      panel.appendChild(el("div", { cls: "note", text: "B-20: instruments.theme jest atrybutem BIEŻĄCYM (bez historii point-in-time)." }));
+    }
+  }
+
+  // =======================================================================
+  // 6. Kontrakty
+  // =======================================================================
+  function renderContracts() {
+    var panel = document.getElementById("contracts-panel");
+    panel.textContent = "";
+    var c = DATA.contracts;
+
+    if (!c.rows.length) {
+      panel.appendChild(el("div", { cls: "note", text: "Brak otwartych pozycji KONTRAKTOWY na D." }));
+    } else {
+      var scroll = el("div", { cls: "table-scroll" });
+      var table = el("table");
+      var thead = el("tr");
+      ["Rachunek", "Seria", "Ilość", "Mnożnik", "Cena bazy ≤ D", "Nominał PLN", "Ekspozycja / BW"].forEach(function (h) {
+        thead.appendChild(el("th", { text: h }));
+      });
+      table.appendChild(el("thead")).appendChild(thead);
+      var tbody = el("tbody");
+      c.rows.forEach(function (r) {
+        var tr = el("tr");
+        tr.appendChild(txtCell(r.rachunek));
+        tr.appendChild(txtCell(r.name, { title: r.broker_ticker }));
+        tr.appendChild(numCell(r.qty, { decimals: 0 }));
+        tr.appendChild(numCell(r.multiplier, { decimals: 0, reason: "instruments.multiplier IS NULL" }));
+        tr.appendChild(numCell(r.base_close_raw, { decimals: 4, reason: "brak ceny bazy ≤ D", title: r.base_price_date ? ("na " + formatDate(r.base_price_date)) : "" }));
+        tr.appendChild(numCell(r.nominal_pln, { decimals: 2, reason: "brak mnożnika/ceny bazy/FX", title: "qty × multiplier × close_raw(baza ≤ D) w PLN, znak = znak qty" }));
+        tr.appendChild(numCell(r.exposure_pct, { pct: true, decimals: 2, reason: "nominał lub BW niedostępne", title: "nominał / BW — poza mianownikiem wag" }));
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      scroll.appendChild(table);
+      panel.appendChild(scroll);
+    }
+
+    var grid = el("div", { cls: "grid grid-3" });
+    grid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Ekspozycja netto / BW" }));
+      var v = el("div", { cls: "value" });
+      if (c.net_exposure_pct === null) v.appendChild(naSpan());
+      else v.textContent = formatPct(c.net_exposure_pct, 2);
+      box.appendChild(v);
+      return box;
+    })());
+    grid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Wartość rachunku KONTRAKTOWY" }));
+      var v = el("div", { cls: "value" });
+      if (c.account_value_pln === null) v.appendChild(naSpan(c.account_value_error));
+      else v.textContent = formatPl(c.account_value_pln, 2) + " PLN";
+      v.title = "środki ogółem z depozytem (kontraktowy_account_value)";
+      box.appendChild(v);
+      return box;
+    })());
+    panel.appendChild(grid);
+
+    panel.appendChild(el("h3", { text: "Rdzeń vs satelita" }));
+    var cvs = c.core_vs_satellite;
+    var cardGrid = el("div", { cls: "grid grid-3" });
+    cardGrid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Satelita (BW)" }));
+      var v = el("div", { cls: "value" });
+      v.textContent = formatPl(cvs.bw, 2) + " PLN";
+      box.appendChild(v);
+      return box;
+    })());
+    cardGrid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Rdzeń (CORE)" }));
+      var v = el("div", { cls: "value" });
+      v.textContent = formatPl(cvs.core_value, 2) + " PLN";
+      box.appendChild(v);
+      return box;
+    })());
+    cardGrid.appendChild((function () {
+      var box = el("div", { cls: "kpi" });
+      box.appendChild(el("div", { cls: "label", text: "Udział satelity w CAŁOŚCI" }));
+      var v = el("div", { cls: "value" });
+      v.textContent = cvs.sat_share === null ? "—" : formatPct(toNumber(cvs.sat_share) * 100, 2);
+      box.appendChild(v);
+      return box;
+    })());
+    panel.appendChild(cardGrid);
+  }
+
+  // =======================================================================
+  // 7. Stopka jakości danych
+  // =======================================================================
+  function renderFooter() {
+    var panel = document.getElementById("footer-panel");
+    panel.textContent = "";
+    var q = DATA.quality_footer;
+
+    var items = [
+      ["Brak FX ≤ D (waluta obsługiwana, brak kursu na D)", q.brak_fx],
+      ["Brak ceny ≤ D", q.brak_cena],
+      ["Wiek ceny > 3 dni", q.wiek_ceny_gt_3],
+      ["Brak ISIN", q.brak_isin],
+      ["Scalenia wykonane", q.scalenia_wykonane],
+      ["Scalenia niejednoznaczne (nie scalono)", q.scalenia_niejednoznaczne],
+      ["Scalenia z mieszaną walutą rozliczenia", q.scalenia_mieszana_waluta],
+      ["Rynek nieustalony", q.rynek_nieustalony],
+      ["Pozycje bez wiersza ryzyka na D ryzyka", q.brak_wiersza_ryzyka],
+      ["multiplier_missing (kontrakty)", q.multiplier_missing],
+      ["theme NULL (equity/etf)", q.theme_null],
+      ["VALUE/QUALITY/TREND bez pomiaru", q.value_quality_trend_brak_count],
+      ["Klasa konwikcji nieprzypisana", q.conviction_nieprzypisana_count],
+    ];
+
+    var ul = el("ul", { cls: "plain" });
+    items.forEach(function (pair) {
+      ul.appendChild(el("li", { text: pair[0] + ": " + pair[1] }));
+    });
+    ul.appendChild(el("li", { text: "Uzgodnienie z migawką brokera: " + q.broker_reconciliation_note }));
+    ul.appendChild(el("li", { text: "Atrybuty instrumentów: " + q.attrs_without_history_note }));
+    panel.appendChild(ul);
+  }
+
+  // =======================================================================
+  // Start
+  // =======================================================================
+  renderHeader();
+  renderComposition();
+  renderConcentration();
+  renderPositionsTable();
+  renderRisk();
+  renderContracts();
+  renderFooter();
+})();
+</script>
+</body>
+</html>
