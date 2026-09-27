@@ -91,7 +91,28 @@ wynik zmienny NIE jest doliczany osobno, bo broker rozlicza go już codziennie
 w środkach (wiersze `depozyt_doplata`/`depozyt_zwrot`). `capital_by_rachunek`
 i metryki ZAGRANICZNY (wagi pozycji/below_stop/below_chandelier_hold w %
 wartości) pozostają BEZ ZMIAN — kontrakty tam nie wchodzą, tylko w budżety
-i w łączny kapitał satelity (`capital_satelite_pln`)."""
+i w łączny kapitał satelity (`capital_satelite_pln`).
+
+Brief CC-U (B-19), U2-U5 (T27 dokumentu projektowego — forward-fill max 1-2
+dni, wyłącznie rynek faktycznie zamknięty, zawsze z flagą stale): pozycja bez
+policzalnej ceny na D NIGDY nie wypada po cichu z kapitału ani z ryzyka
+(decyzja nadzorcy 2026-09-27). `run_risk` najpierw sprawdza WSZYSTKIE pozycje
+z `positions_as_of(D)` (przez `_resolve_position_price_coverage`, rdzeń
+dzielony z `resolve_default_risk_date`) — jeśli którakolwiek jest
+niekompletna (brak instrumentu bazowego, nieobsługiwany typ, cena na D wg
+reguły T27 się nie rozstrzyga, brak FX, brak mnożnika kontraktu, albo
+`stop_effective` niepoliczalny z powodu za krótkiej historii), `run_risk`
+robi `conn.rollback()` i rzuca `IncompleteRiskDateError` PRZED jakimkolwiek
+zapisem do `risk_daily` — zero wierszy D zmienionych. Reguła ceny na D
+(3 przypadki: cena dokładnie na D / forward-fill max 2 sesje przy rynku
+zamkniętym z flagą `price_is_stale` / niekompletne) jest czystą funkcją
+`resolve_price_on_d` — dostęp do kalendarza sesyjnego (mapowanie giełda ->
+kod kalendarza z `calendar_check.EXCHANGE_TO_CALENDAR_CODE`) jest wydzielony
+do `CalendarFacts`/`_default_calendar_facts`, żeby testy syntetyczne mogły
+podmienić kalendarz bez `exchange_calendars`/bazy. Dotychczasowe stany
+"cichego wypadnięcia" (`_empty_row`/`_write_empty_row`, `note='no_price_on_d'`
+itp.) są USUNIĘTE — każda pozycja albo jest w pełni policzona (jeden wiersz
+`risk_daily`), albo cały przebieg D kończy się wyjątkiem."""
 
 from __future__ import annotations
 
@@ -99,12 +120,14 @@ import math
 import statistics
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
+import exchange_calendars as xcals
 import psycopg
 
+from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
 from mannaz.fifo import KONTRAKTOWY_PREFIX, positions_as_of
 
 # ---------------------------------------------------------------------------
@@ -772,20 +795,119 @@ def resolve_ratchet_start(rows: list[dict[str, Any]], events: list[dict[str, Any
 
 
 # ---------------------------------------------------------------------------
-# Domyślne D — brief P4.1 [Z]: ostatnia sesja, dla której WSZYSTKIE instrumenty
-# satelity Z CENAMI NA TĘ DATĘ mają niepusty close_split_adj. Instrument bez
-# wiersza na daną datę (np. dane przestały napływać) NIE blokuje tej daty —
-# blokuje tylko wiersz OBECNY z close_split_adj IS NULL (np. Yahoo zwrócił
-# świecę bez zamknięcia). Patrz `resolve_default_risk_date` (DB) niżej.
+# T27 (dokument projektowy, §T27 — forward-fill max 1-2 dni, wyłącznie rynek
+# faktycznie zamknięty, zawsze flaga stale) — reguła ceny na D, brief CC-U U2.
+# Czysta funkcja: kalendarz już rozstrzygnięty przez wywołującego (patrz
+# `CalendarFacts`/`_default_calendar_facts` niżej) — zero zależności od
+# `exchange_calendars`/bazy, żeby testy syntetyczne (U5) mogły podmienić
+# kalendarz przez wstrzyknięcie gotowych wartości `is_session_on_d`/
+# `sessions_before`.
 # ---------------------------------------------------------------------------
 
 
-def resolve_default_date(date_any_null_flags: list[tuple[date, bool]]) -> date | None:
-    """date_any_null_flags: [(price_date, any_satellite_row_has_null_close)],
-    nieposortowane, jeden wpis per data. Zwraca najpóźniejszą datę z flagą
-    False, albo None gdy brak takiej daty."""
-    for d, any_null in sorted(date_any_null_flags, key=lambda t: t[0], reverse=True):
-        if not any_null:
+def resolve_price_on_d(
+    price_dates: list[date],
+    as_of: date,
+    sessions_before: list[date],
+    is_session_on_d: bool | None,
+) -> tuple[str, date | None, str | None]:
+    """U2 (brief CC-U): reguła ceny na D wg T27. Zwraca `(status,
+    price_date_used, reason)`:
+
+    - `status='ok'`     — cena dokładnie z D (`as_of in price_dates`);
+      `price_date_used=as_of`, `reason=None`.
+    - `status='stale'`  — brak ceny na D, rynek ZAMKNIĘTY w D
+      (`is_session_on_d is False`), ostatnia cena `<= D` nie starsza niż
+      2 sesje giełdy (patrz niżej) -> forward-fill, `price_date_used` =
+      data tej ceny, `reason=None`. Nigdy cena z datą > D (parametr
+      `price_dates` musi być już przefiltrowany do `<= as_of` przez
+      wywołującego, tak jak `_price_series`).
+    - `status='incomplete'` — każdy inny przypadek, `price_date_used=None`,
+      `reason` in:
+        'no_calendar'       — `is_session_on_d is None` (brak mapowania
+                              giełdy, exchange NULL albo spoza
+                              `EXCHANGE_TO_CALENDAR_CODE`).
+        'market_open_no_price' — D jest sesją, ale brak ceny na D.
+        'no_price_at_all'   — rynek zamknięty w D, ale brak JAKIEJKOLWIEK
+                              ceny `<= D` (nie ma czego forward-fillować).
+        'price_too_old'     — ostatnia cena `<= D` jest starsza niż
+                              dozwolone.
+
+    Definicja "nie starsza niż 2 sesje" [S, decyzja 2026-09-27]: niech
+    `s1` = ostatnia sesja giełdy `< D` (`sessions_before[0]`), `s2` =
+    przedostatnia (`sessions_before[1]`) — dozwolone, gdy
+    `price_date_used >= s2` (brakuje najwyżej jednej sesji). `sessions_before`
+    krótsze niż 2 elementy (np. początek historii kalendarza) -> nie da się
+    potwierdzić warunku -> `incomplete`/`insufficient_calendar_history`
+    (obronnie, nie powinno wystąpić w praktyce)."""
+    if as_of in price_dates:
+        return "ok", as_of, None
+
+    if is_session_on_d is None:
+        return "incomplete", None, "no_calendar"
+
+    if is_session_on_d:
+        return "incomplete", None, "market_open_no_price"
+
+    candidates = [d for d in price_dates if d <= as_of]
+    if not candidates:
+        return "incomplete", None, "no_price_at_all"
+    last_price_date = max(candidates)
+
+    if len(sessions_before) < 2:
+        return "incomplete", None, "insufficient_calendar_history"
+
+    s2 = sorted(sessions_before, reverse=True)[1]
+    if last_price_date >= s2:
+        return "stale", last_price_date, None
+    return "incomplete", None, "price_too_old"
+
+
+@dataclass
+class CalendarFacts:
+    """Warstwa dostępu do kalendarza (brief CC-U, U2) — `resolve_price_on_d`
+    jest czysta i przyjmuje te fakty już gotowe; testy syntetyczne wstrzykują
+    własne `CalendarFacts` (przez podmianę `calendar_facts_fn` w
+    `run_risk`/`resolve_default_risk_date`) bez dotykania
+    `exchange_calendars`."""
+
+    is_session_on_d: bool | None
+    sessions_before: list[date]  # do 2 najbliższych sesji ŚCIŚLE przed D, malejąco: [s1, s2]
+
+
+def _default_calendar_facts(calendar_code: str | None, as_of: date) -> CalendarFacts:
+    """Domyślna implementacja `CalendarFacts` przez `exchange_calendars` —
+    jedyne miejsce w tym module, które dotyka tej biblioteki. `calendar_code`
+    None (exchange NULL albo spoza `EXCHANGE_TO_CALENDAR_CODE`) -> brak
+    kalendarza, `is_session_on_d=None`."""
+    if calendar_code is None:
+        return CalendarFacts(is_session_on_d=None, sessions_before=[])
+    cal = xcals.get_calendar(calendar_code)
+    is_session_on_d = bool(cal.is_session(as_of.isoformat()))
+    # okno 30 dni kalendarzowych wstecz wystarcza na najdluzsze przerwy
+    # swiateczne (Boze Narodzenie/Nowy Rok) miedzy dwiema sesjami.
+    window_start = as_of - timedelta(days=30)
+    sessions = [ts.date() for ts in cal.sessions_in_range(window_start.isoformat(), as_of.isoformat())]
+    sessions_before = sorted((s for s in sessions if s < as_of), reverse=True)[:2]
+    return CalendarFacts(is_session_on_d=is_session_on_d, sessions_before=sessions_before)
+
+
+# ---------------------------------------------------------------------------
+# Domyślne D (brief CC-U, U3) — najpóźniejsza data <= dziś, dla której reguła
+# T27 (U2) daje komplet dla WSZYSTKICH pozycji z `positions_as_of` tej daty
+# (zero przypadków 'incomplete' — stopy NIE są sprawdzane, patrz
+# `_resolve_position_price_coverage`). Zastępuje starą `resolve_default_date`
+# (brief P4.1 — "any_null" per satelitę), USUNIĘTĄ: nowa reguła sprawdza
+# WSZYSTKIE pozycje (nie tylko satelitę) przez ten sam rdzeń co `run_risk`.
+# ---------------------------------------------------------------------------
+
+
+def resolve_default_risk_date_pure(candidates_with_completeness: list[tuple[date, bool]]) -> date | None:
+    """U3: czysta część `resolve_default_risk_date` — `candidates_with_completeness`:
+    [(price_date, is_complete)], nieposortowane, jeden wpis per kandydat.
+    Zwraca najpóźniejszą datę z `is_complete=True`, albo `None` gdy żadna."""
+    for d, is_complete in sorted(candidates_with_completeness, key=lambda t: t[0], reverse=True):
+        if is_complete:
             return d
     return None
 
@@ -827,6 +949,8 @@ class PositionRiskRow:
     fx_rate_date: date | None
     risk_pln: Decimal | None
     multiplier_missing: bool
+    price_is_stale: bool
+    price_date_used: date | None
     risk_pct_satellite_capital: Decimal | None = None
     level1_breach: bool | None = None
     note: str = ""
@@ -853,28 +977,19 @@ class RiskSummary:
     level3_breach: bool | None = None
     multiplier_missing_tickers: list[str] = field(default_factory=list)
     futures_nominal_sanity: dict[str, bool] = field(default_factory=dict)
-    excluded_no_price_tickers: list[str] = field(default_factory=list)
     theme_budgets: dict[str, ThemeBudgetResult] = field(default_factory=dict)
     # CC-R (§19.4): kapitał satelity = wartość pozycji (equity/etf spoza core,
     # BEZ futures) + wartość rachunku KONTRAKTOWY (nominał futures nie wchodzi).
     capital_satelite_positions_pln: Decimal = Decimal(0)
     kontraktowy_account_value_pln: Decimal = Decimal(0)
     capital_satelite_pln: Decimal = Decimal(0)
-
-
-def resolve_default_risk_date(conn: psycopg.Connection) -> date | None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT p.price_date, bool_or(p.close_split_adj IS NULL) AS any_null
-            FROM prices_daily p
-            JOIN instruments i ON i.id = p.instrument_id
-            WHERE i.is_core = FALSE
-            GROUP BY p.price_date
-            """
-        )
-        rows = cur.fetchall()
-    return resolve_default_date([(d, bool(any_null)) for d, any_null in rows])
+    # CC-U (U4, T27): pozycje z cena forward-filled (rynek zamkniety w D,
+    # ostatnia cena <=D w granicach 2 sesji) — nigdy nie sa cicho pomijane,
+    # ale sa oznaczone i zliczone osobno.
+    stale_positions_count: int = 0
+    stale_capital_pln: Decimal = Decimal(0)
+    stale_capital_pct: Decimal | None = None
+    stale_tickers: list[str] = field(default_factory=list)
 
 
 def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
@@ -890,7 +1005,7 @@ def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, An
         cur.execute(
             """
             SELECT broker_ticker, instrument_type, is_core, base_symbol, multiplier,
-                   yahoo_symbol, currency, theme
+                   yahoo_symbol, currency, theme, exchange
             FROM instruments WHERE id = %s
             """,
             (p["instrument_id"],),
@@ -898,7 +1013,10 @@ def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, An
         row = cur.fetchone()
         if row is None:
             continue  # obronnie — FK gwarantuje istnienie, nie powinno wystapic
-        broker_ticker, instrument_type, is_core, base_symbol, multiplier, yahoo_symbol, quote_currency, theme = row
+        (
+            broker_ticker, instrument_type, is_core, base_symbol, multiplier,
+            yahoo_symbol, quote_currency, theme, exchange,
+        ) = row
         out.append(
             {
                 "rachunek": p["rachunek"],
@@ -913,6 +1031,11 @@ def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, An
                 "yahoo_symbol": yahoo_symbol,
                 "quote_currency": quote_currency,
                 "theme": theme,
+                # exchange (brief CC-U, U2): gieldy INSTRUMENTU WYCENY — dla
+                # equity/etf to ta pozycja, dla future doklejane osobno z
+                # instrumentu bazowego (_base_instrument), patrz
+                # `_resolve_position_price_coverage`.
+                "exchange": exchange,
             }
         )
     out.sort(key=lambda d: (d["rachunek"], d["broker_ticker"]))
@@ -923,13 +1046,13 @@ def _base_instrument(cur: psycopg.Cursor, base_symbol: str | None) -> dict[str, 
     if not base_symbol:
         return None
     cur.execute(
-        "SELECT id, currency, yahoo_symbol FROM instruments WHERE yahoo_symbol = %s",
+        "SELECT id, currency, yahoo_symbol, exchange FROM instruments WHERE yahoo_symbol = %s",
         (base_symbol,),
     )
     row = cur.fetchone()
     if row is None:
         return None
-    return {"id": row[0], "currency": row[1], "yahoo_symbol": row[2]}
+    return {"id": row[0], "currency": row[1], "yahoo_symbol": row[2], "exchange": row[3]}
 
 
 def _price_series(cur: psycopg.Cursor, instrument_id: int, end_date: date) -> dict[str, list]:
@@ -1047,6 +1170,171 @@ def _fx_rate_on_or_before(cur: psycopg.Cursor, currency: str, target_date: date)
     return row[1], row[0]
 
 
+# ---------------------------------------------------------------------------
+# U2 (brief CC-U) — "nigdy cicho z kapitału/ryzyka": rdzeń rozstrzygania ceny
+# na D (T27) + FX/mnożnik/instrument bazowy, dzielony przez `run_risk` i
+# `resolve_default_risk_date` (U3, bez sprawdzania stopów).
+# ---------------------------------------------------------------------------
+
+
+class IncompleteRiskItem(NamedTuple):
+    """Jeden wpis niekompletności D (brief CC-U, U2) — `.items` wyjątku
+    `IncompleteRiskDateError`. `price_instrument`: yahoo_symbol instrumentu
+    WYCENY (dla equity/etf: ten sam instrument; dla future: baza — albo
+    `base_symbol` samego kontraktu, gdy instrument bazowy nie istnieje w
+    ogóle w `instruments`). `exchange`: giełda instrumentu wyceny (może być
+    None — sam brak mapowania kalendarza to jedna z przyczyn)."""
+
+    broker_ticker: str
+    price_instrument: str | None
+    exchange: str | None
+    reason: str
+
+
+class IncompleteRiskDateError(RuntimeError):
+    """U2 (brief CC-U): D niekompletne wg reguły T27 (cena) albo innej
+    ścieżki dawnego "cichego wypadnięcia" (brak instrumentu bazowego,
+    nieobsługiwany typ, brak FX, brak mnożnika kontraktu, `stop_effective`
+    niepoliczalny) — `run_risk` zbiera WSZYSTKIE takie pozycje (nie
+    przerywa na pierwszej), robi `conn.rollback()` i rzuca ten wyjątek
+    PRZED jakimkolwiek zapisem do `risk_daily` (przed DELETE, S4). `.items`:
+    lista `IncompleteRiskItem`, jedna na pozycję niekompletną."""
+
+    def __init__(self, as_of: date, items: list[IncompleteRiskItem]):
+        self.as_of = as_of
+        self.items = items
+        reasons = "; ".join(f"{it.broker_ticker}[{it.reason}]" for it in items)
+        super().__init__(f"D={as_of}: {len(items)} pozycji niekompletnych (T27, brief CC-U) — {reasons}")
+
+
+@dataclass
+class PositionPriceCoverage:
+    """Wynik `_resolve_position_price_coverage` dla pozycji KOMPLETNEJ —
+    wystarcza do policzenia ATR/stopów/ryzyka w `run_risk` bez ponownego
+    odpytywania instrumentu/ceny/FX."""
+
+    price_instrument_id: int
+    quote_currency: str
+    yahoo_symbol: str | None
+    exchange: str | None
+    multiplier: Decimal
+    layer_factor: Decimal
+    series: dict[str, list]
+    price_is_stale: bool
+    price_date_used: date
+    fx_rate: Decimal
+    fx_rate_date: date | None
+
+
+def _resolve_position_price_coverage(
+    cur: psycopg.Cursor,
+    pos: dict[str, Any],
+    as_of: date,
+    calendar_facts_fn: Callable[[str | None, date], CalendarFacts] = _default_calendar_facts,
+) -> tuple[PositionPriceCoverage | None, IncompleteRiskItem | None]:
+    """U2/U3 (brief CC-U): rdzeń "czy ta pozycja ma komplet na D" — dzielony
+    przez `run_risk` (pełne liczenie ryzyka) i `resolve_default_risk_date`
+    (U3, tylko kompletność — stopy NIE są tu sprawdzane, bo wymagają
+    ATR/Chandelier policzonych z serii, a U3 ma być tani). Sprawdza (w tej
+    kolejności): instrument bazowy (future) / typ instrumentu, mnożnik
+    (future), cenę na D wg T27 (`resolve_price_on_d`), FX <= D. Zwraca
+    `(coverage, None)` przy komplecie albo `(None, item)` przy
+    niekompletności — DOKŁADNIE jedno z dwóch."""
+    broker_ticker = pos["broker_ticker"]
+    instrument_type = pos["instrument_type"]
+
+    if instrument_type == "future":
+        base = _base_instrument(cur, pos["base_symbol"])
+        if base is None:
+            return None, IncompleteRiskItem(broker_ticker, pos["base_symbol"], None, "base_instrument_not_found")
+        price_instrument_id = base["id"]
+        quote_currency = base["currency"]
+        yahoo_symbol = base["yahoo_symbol"]
+        exchange = base["exchange"]
+        multiplier = pos["multiplier"]
+        if multiplier is None:
+            return None, IncompleteRiskItem(broker_ticker, yahoo_symbol, exchange, "multiplier_missing")
+        # Kontrakt terminowy nie ma wlasnych splitow — jego ilosc jest w
+        # jednostkach kontraktu, nie serii cenowej bazy (S3).
+        layer_factor = Decimal(1)
+    elif instrument_type in ("equity", "etf"):
+        price_instrument_id = pos["instrument_id"]
+        quote_currency = pos["quote_currency"]
+        yahoo_symbol = pos["yahoo_symbol"]
+        exchange = pos["exchange"]
+        multiplier = Decimal(1)
+        layer_events = _instrument_layer_events(cur, price_instrument_id)
+        layer_factor = layer_factor_after(layer_events, as_of)
+    else:
+        return None, IncompleteRiskItem(broker_ticker, None, None, "unsupported_instrument_type")
+
+    series = _price_series(cur, price_instrument_id, as_of)
+    dates = series["dates"]
+    calendar_code = EXCHANGE_TO_CALENDAR_CODE.get(exchange) if exchange else None
+    facts = calendar_facts_fn(calendar_code, as_of)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=dates, as_of=as_of, sessions_before=facts.sessions_before, is_session_on_d=facts.is_session_on_d
+    )
+    if status == "incomplete":
+        return None, IncompleteRiskItem(broker_ticker, yahoo_symbol, exchange, reason)
+
+    fx_rate, fx_rate_date = _fx_rate_on_or_before(cur, quote_currency, as_of)
+    if fx_rate is None:
+        return None, IncompleteRiskItem(broker_ticker, yahoo_symbol, exchange, "fx_rate_missing")
+
+    coverage = PositionPriceCoverage(
+        price_instrument_id=price_instrument_id,
+        quote_currency=quote_currency,
+        yahoo_symbol=yahoo_symbol,
+        exchange=exchange,
+        multiplier=multiplier,
+        layer_factor=layer_factor,
+        series=series,
+        price_is_stale=(status == "stale"),
+        price_date_used=price_date_used,  # type: ignore[arg-type]  # status != 'incomplete' -> zawsze data
+        fx_rate=fx_rate,
+        fx_rate_date=fx_rate_date,
+    )
+    return coverage, None
+
+
+def resolve_default_risk_date(
+    conn: psycopg.Connection,
+    max_candidates: int = 30,
+    calendar_facts_fn: Callable[[str | None, date], CalendarFacts] = _default_calendar_facts,
+) -> date | None:
+    """U3 (brief CC-U): najpóźniejsza data `<= dziś`, dla której reguła T27
+    (U2) daje komplet dla WSZYSTKICH pozycji z `positions_as_of` tej daty
+    (stopy NIE są sprawdzane — `_resolve_position_price_coverage` pomija
+    ATR/Chandelier, U3 ma być tani). Kandydaci: `max_candidates`
+    najpóźniejszych dat z `prices_daily` (malejąco, ograniczone rozsądnie);
+    zatrzymuje się na pierwszej kompletnej (kandydaci już malejący, więc to
+    od razu najpóźniejsza). Brak kompletu w oknie -> `None` (`run_risk`
+    wtedy rzuca `RuntimeError` jak dotychczas)."""
+    today = date.today()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT price_date FROM prices_daily WHERE price_date <= %s ORDER BY price_date DESC LIMIT %s",
+            (today, max_candidates),
+        )
+        candidates = [row[0] for row in cur.fetchall()]
+
+        completeness: list[tuple[date, bool]] = []
+        for d in candidates:
+            positions = _open_positions_as_of(cur, d)
+            complete = True
+            for pos in positions:
+                _, incomplete = _resolve_position_price_coverage(cur, pos, d, calendar_facts_fn)
+                if incomplete is not None:
+                    complete = False
+                    break
+            completeness.append((d, complete))
+            if complete:
+                break
+
+    return resolve_default_risk_date_pure(completeness)
+
+
 def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool = True) -> RiskSummary:
     """`commit=False` (brief CC-S, S4): nie wywołuje `conn.commit()` — do
     testów bazodanowych z rollbackiem (zero trwałych zmian)."""
@@ -1067,7 +1355,8 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         capital_satelite_positions_pln = Decimal(0)
         positions_count_by_rachunek: dict[str, int] = {}
 
-        computed: list[dict[str, Any]] = []
+        computed: list[PositionRiskRow] = []
+        incomplete_items: list[IncompleteRiskItem] = []
 
         for pos in positions:
             broker_ticker = pos["broker_ticker"]
@@ -1081,65 +1370,29 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
             is_short = qty_d < 0  # znak niezmienny pod skalowaniem dodatnim czynnikiem f
             position_kind = "short" if is_short else "long"
             note = ""
-            multiplier_missing = False
-            multiplier: Decimal | None = Decimal(1)
 
-            # --- Instrument dla ceny (equity/etf: samo siebie; future: baza) ---
-            if instrument_type == "future":
-                base = _base_instrument(cur, pos["base_symbol"])
-                if base is None:
-                    computed.append(
-                        _empty_row(
-                            rachunek, pos["instrument_id"], broker_ticker, pos["settlement_currency"],
-                            None, instrument_type, is_core, qty_d, position_kind,
-                            note="base_instrument_not_found", multiplier_missing=True,
-                        )
-                    )
-                    summary.excluded_no_price_tickers.append(broker_ticker)
-                    continue
-                price_instrument_id = base["id"]
-                quote_currency = base["currency"]
-                yahoo_symbol = base["yahoo_symbol"]
-                multiplier = pos["multiplier"]
-                if multiplier is None:
-                    multiplier_missing = True
-                # Kontrakt terminowy nie ma własnych splitów — jego ilość jest
-                # w jednostkach kontraktu, nie serii cenowej bazy (S3).
-                layer_factor = Decimal(1)
-            elif instrument_type in ("equity", "etf"):
-                price_instrument_id = pos["instrument_id"]
-                quote_currency = pos["quote_currency"]
-                yahoo_symbol = pos["yahoo_symbol"]
-                layer_events = _instrument_layer_events(cur, price_instrument_id)
-                layer_factor = layer_factor_after(layer_events, as_of)
-            else:
-                computed.append(
-                    _empty_row(
-                        rachunek, pos["instrument_id"], broker_ticker, pos["settlement_currency"],
-                        pos["quote_currency"], instrument_type, is_core, qty_d, position_kind,
-                        note="unsupported_instrument_type", multiplier_missing=False,
-                    )
-                )
-                summary.excluded_no_price_tickers.append(broker_ticker)
+            # --- U2 (brief CC-U): instrument bazowy/typ/cena na D (T27)/FX —
+            # WSZYSTKIE dotychczasowe ścieżki cichego wypadnięcia teraz trafiają
+            # do incomplete_items (zbieramy WSZYSTKIE pozycje, nie przerywamy
+            # na pierwszej niekompletnej — patrz sprawdzenie po tej pętli). ---
+            coverage, incomplete = _resolve_position_price_coverage(cur, pos, as_of)
+            if incomplete is not None:
+                incomplete_items.append(incomplete)
                 continue
+
+            quote_currency = coverage.quote_currency
+            yahoo_symbol = coverage.yahoo_symbol
+            multiplier = coverage.multiplier
+            layer_factor = coverage.layer_factor
+            price_instrument_id = coverage.price_instrument_id
 
             # qty: warstwa split_adj (S3) — spójna z ATR/stopami/close niżej.
             # Wartość PLN na D jest z definicji niezależna od layer_factor
             # (qty_d * close_raw(D) == qty * close_split_adj(D)).
             qty = qty_d * layer_factor
 
-            series = _price_series(cur, price_instrument_id, as_of)
+            series = coverage.series
             dates = series["dates"]
-            if not dates or dates[-1] != as_of:
-                computed.append(
-                    _empty_row(
-                        rachunek, pos["instrument_id"], broker_ticker, pos["settlement_currency"],
-                        quote_currency, instrument_type, is_core, qty, position_kind,
-                        note="no_price_on_d", multiplier_missing=multiplier_missing,
-                    )
-                )
-                summary.excluded_no_price_tickers.append(broker_ticker)
-                continue
 
             pence = gbp_pence_factor(quote_currency, yahoo_symbol)
             highs = [h * pence for h in series["highs"]]
@@ -1228,15 +1481,19 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 hold = chandelier_hold(highs, lows, first_idx, d_idx, atr22_d, is_short)
                 below_hold = is_breached(close_d, hold, is_short)
 
-            risk_native, below_stop = compute_risk_native(
-                close_d, stop_eff, abs(qty), multiplier if not multiplier_missing else None, is_short
-            )
-            if multiplier_missing:
-                risk_native = None
-                note = (note + ";" if note else "") + "multiplier_missing"
+            risk_native, below_stop = compute_risk_native(close_d, stop_eff, abs(qty), multiplier, is_short)
+            if risk_native is None:
+                # U2 (brief CC-U): risk_pln niepoliczalne — stop_effective None
+                # (brak stopu z powodu za krotkiej historii ATR/Chandelier/2N),
+                # bo close_d juz na pewno nie-None (mamy komplet ceny z T27).
+                incomplete_items.append(
+                    IncompleteRiskItem(broker_ticker, yahoo_symbol, coverage.exchange, "stop_unavailable")
+                )
+                continue
 
-            fx_rate, fx_rate_date = _fx_rate_on_or_before(cur, quote_currency, as_of)
-            risk_pln = risk_native * fx_rate if (risk_native is not None and fx_rate is not None) else None
+            fx_rate = coverage.fx_rate
+            fx_rate_date = coverage.fx_rate_date
+            risk_pln = risk_native * fx_rate
 
             row = PositionRiskRow(
                 rachunek=rachunek,
@@ -1268,20 +1525,38 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 fx_rate=fx_rate,
                 fx_rate_date=fx_rate_date,
                 risk_pln=risk_pln,
-                multiplier_missing=multiplier_missing,
+                multiplier_missing=False,
+                price_is_stale=coverage.price_is_stale,
+                price_date_used=coverage.price_date_used,
                 note=note,
             )
             computed.append(row)
 
+            # --- U4 (brief CC-U): pozycje z ceną forward-filled (T27) — nigdy
+            # cicho pominięte, ale oznaczone i zliczone osobno. ---
+            if row.price_is_stale:
+                summary.stale_tickers.append(broker_ticker)
+                summary.stale_positions_count += 1
+
             # --- kapitał satelity: equity/etf, is_core=false, BEZ futures
             # (§19.4 CC-R: nominał futures NIE wchodzi do kapitału satelity —
             # zamiast niego wchodzi wartość rachunku KONTRAKTOWY, patrz niżej). ---
-            if instrument_type in ("equity", "etf") and not is_core and close_d is not None and fx_rate is not None:
+            if instrument_type in ("equity", "etf") and not is_core:
                 value_pln = close_d * qty * fx_rate
                 capital_satelite_positions_pln += value_pln
                 capital_by_rachunek[rachunek] = capital_by_rachunek.get(rachunek, Decimal(0)) + value_pln
                 positions_count_by_rachunek[rachunek] = positions_count_by_rachunek.get(rachunek, 0) + 1
                 summary.capital_satelite_positions_total += 1
+                if row.price_is_stale:
+                    summary.stale_capital_pln += value_pln
+
+        # --- U2 (brief CC-U): D niekompletne — ZERO wierszy risk_daily
+        # zmienionych, rollback PRZED jakimkolwiek zapisem (przed DELETE, S4).
+        # Zbieramy WSZYSTKIE pozycje niekompletne (nie przerywamy na
+        # pierwszej) — patrz `incomplete_items.append(...)` w pętli wyżej. ---
+        if incomplete_items:
+            conn.rollback()
+            raise IncompleteRiskDateError(as_of, incomplete_items)
 
         # --- kapitał satelity CC-R (§19.4 + decyzja nadzorcy K3): pozycje
         # equity/etf (wyżej) + wartość rachunku KONTRAKTOWY (środki ogółem
@@ -1299,6 +1574,10 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         capital_satelite_pln = capital_satelite_positions_pln + kontraktowy_value_pln
         summary.capital_satelite_pln = capital_satelite_pln
 
+        # --- U4 (brief CC-U): udział pozycji stale w kapitale satelity. ---
+        if capital_satelite_pln:
+            summary.stale_capital_pct = summary.stale_capital_pln / capital_satelite_pln * Decimal(100)
+
         # --- druga faza: budżety poziom 1/3 (satelita + futures, §19.4) i
         # agregaty raportu ZAGRANICZNY (bez zmian, kontrakty tam nie wchodzą). ---
         satellite_risk_zagraniczny = Decimal(0)
@@ -1309,8 +1588,6 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         budget_items: list[tuple[str, str, bool, Decimal | None, str | None]] = []
 
         for row in computed:
-            if isinstance(row, dict):
-                continue  # empty rows created via _empty_row helper (dicts), skip aggregation
             if row.stop_source:
                 stop_source_counts[row.stop_source] = stop_source_counts.get(row.stop_source, 0) + 1
             if row.below_stop:
@@ -1384,16 +1661,15 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
             )
 
         # level1_results wyrównane indeksem do budget_items (patrz docstring
-        # aggregate_risk_budgets) -> ten sam porządek co non_dict_rows.
-        non_dict_rows = [r for r in computed if not isinstance(r, dict)]
-        for row, (pct1, breach1) in zip(non_dict_rows, budget_result.level1_results):
+        # aggregate_risk_budgets) -> ten sam porządek co computed (brief CC-U:
+        # `computed` zawiera już WYŁĄCZNIE PositionRiskRow — pozycje
+        # niekompletne nigdy tu nie trafiają, run_risk rzucił wyżej).
+        for row, (pct1, breach1) in zip(computed, budget_result.level1_results):
             row.risk_pct_satellite_capital = pct1
             row.level1_breach = breach1
 
         # --- kontrolka nominału P4.2: FPGEZ26/FCDRZ26 (multiplier znany) ---
         for row in computed:
-            if isinstance(row, dict):
-                continue
             if row.instrument_type == "future" and not row.multiplier_missing and row.close_d is not None:
                 nominal = abs(row.qty) * _multiplier_for(cur, row.instrument_id) * row.close_d
                 summary.futures_nominal_sanity[row.broker_ticker] = bool(
@@ -1404,18 +1680,16 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         # DELETE wszystkich wierszy D, potem zwykły INSERT każdego wiersza
         # przebiegu (bez ON CONFLICT — po DELETE kluczy nie ma czym
         # kolidować), jeden `computed_at` dla całego przebiegu, na końcu
-        # asercja liczby wierszy == liczba pozycji z positions_as_of(D)
-        # (wiersze "puste" z _empty_row TEŻ są wierszami pozycji — w
-        # risk_daily nie ma osobnych wierszy agregatów, patrz RiskSummary/
-        # `_write_row`/`_write_empty_row` — jeden wiersz per pozycja). Przy
-        # niezgodności: wyjątek PRZED commitem (rollback, brak trwałego
-        # zapisu). ---
+        # asercja liczby wierszy == liczba pozycji z positions_as_of(D). Brief
+        # CC-U (U2): w tym miejscu KAŻDA pozycja z `positions_as_of` ma już
+        # policzalny wiersz w `computed` — gdyby którakolwiek była
+        # niekompletna, `run_risk` rzuciłby `IncompleteRiskDateError` wyżej,
+        # PRZED tym DELETE (zero wierszy D zmienionych w takim przypadku).
+        # Przy niezgodności tej asercji: wyjątek PRZED commitem (rollback,
+        # brak trwałego zapisu). ---
         cur.execute("DELETE FROM risk_daily WHERE risk_date = %s", (summary.risk_date,))
         computed_at = datetime.now(timezone.utc)
         for row in computed:
-            if isinstance(row, dict):
-                _write_empty_row(cur, summary.risk_date, row, computed_at)
-                continue
             _write_row(cur, summary.risk_date, row, computed_at)
 
         cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (summary.risk_date,))
@@ -1430,7 +1704,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         if commit:
             conn.commit()
 
-    summary.rows = [r for r in computed if not isinstance(r, dict)]
+    summary.rows = computed
     return summary
 
 
@@ -1463,43 +1737,13 @@ def _index_on_or_before(dates: list[date], target: date) -> int | None:
     return idx_found
 
 
-def _empty_row(
-    rachunek: str,
-    instrument_id: int,
-    broker_ticker: str,
-    settlement_currency: str,
-    quote_currency: str | None,
-    instrument_type: str,
-    is_core: bool,
-    qty: Decimal,
-    position_kind: str,
-    note: str,
-    multiplier_missing: bool,
-) -> dict[str, Any]:
-    """Wiersz dla pozycji bez policzalnych stopów (brak ceny na D / brak bazy /
-    nieobsługiwany typ instrumentu) — zwracany jako dict (nie PositionRiskRow),
-    żeby druga faza (agregaty) mogła je jednoznacznie pominąć przez `isinstance`."""
-    return {
-        "rachunek": rachunek,
-        "instrument_id": instrument_id,
-        "broker_ticker": broker_ticker,
-        "settlement_currency": settlement_currency,
-        "quote_currency": quote_currency,
-        "instrument_type": instrument_type,
-        "is_core": is_core,
-        "qty": qty,
-        "position_kind": position_kind,
-        "note": note,
-        "multiplier_missing": multiplier_missing,
-    }
-
-
 def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, computed_at: datetime) -> None:
     """S4 (brief CC-S): zwykły INSERT (bez ON CONFLICT — `run_risk` robi
     DELETE FROM risk_daily WHERE risk_date=D PRZED zapisem całego przebiegu,
     więc w obrębie D nie ma z czym kolidować). `computed_at` jeden dla
     całego przebiegu, przekazany jawnie (kolumna ma DEFAULT now(), ale wtedy
-    każdy wiersz dostałby inną wartość)."""
+    każdy wiersz dostałby inną wartość). U4 (brief CC-U): dokłada
+    `price_is_stale`/`price_date_used` (T27, migracja sql/008)."""
     cur.execute(
         """
         INSERT INTO risk_daily (
@@ -1510,7 +1754,8 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             chandelier_from_entry, below_chandelier_from_entry,
             position_kind, risk_native, fx_rate, fx_rate_date, risk_pln,
             risk_pct_satellite_capital, level1_breach,
-            regime, warning, multiplier_missing, note, computed_at
+            regime, warning, multiplier_missing, price_is_stale, price_date_used,
+            note, computed_at
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s,
@@ -1519,7 +1764,8 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s,
-            %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s,
+            %s, %s
         )
         """,
         (
@@ -1530,24 +1776,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             row.chandelier_from_entry, row.below_chandelier_from_entry,
             row.position_kind, row.risk_native, row.fx_rate, row.fx_rate_date, row.risk_pln,
             row.risk_pct_satellite_capital, row.level1_breach,
-            row.regime, row.warning, row.multiplier_missing, row.note, computed_at,
-        ),
-    )
-
-
-def _write_empty_row(cur: psycopg.Cursor, risk_date: date, row: dict[str, Any], computed_at: datetime) -> None:
-    """S4: jak `_write_row` — zwykły INSERT, jeden `computed_at` per przebieg."""
-    cur.execute(
-        """
-        INSERT INTO risk_daily (
-            rachunek, instrument_id, risk_date,
-            settlement_currency, quote_currency, qty, position_kind,
-            multiplier_missing, note, computed_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            row["rachunek"], row["instrument_id"], risk_date,
-            row["settlement_currency"], row["quote_currency"], row["qty"], row["position_kind"],
-            row["multiplier_missing"], row["note"], computed_at,
+            row.regime, row.warning, row.multiplier_missing, row.price_is_stale, row.price_date_used,
+            row.note, computed_at,
         ),
     )

@@ -133,8 +133,11 @@ def cmd_risk(args: argparse.Namespace) -> None:
         conn.close()
 
     # Wyłącznie agregaty — bez ilości/kosztów/kwot per pozycja (zasada projektu).
+    # Brief CC-U (U2): pozycja bez ceny na D nigdy nie wypada po cichu — D albo
+    # jest w pełni policzone (n_positions == wszystkie pozycje), albo run_risk
+    # rzuca IncompleteRiskDateError przed dojściem tutaj.
     print(f"D: {summary.risk_date}")
-    print(f"n_positions: {len(summary.rows)} (+{len(summary.excluded_no_price_tickers)} bez ceny/bazy na D)")
+    print(f"n_positions: {len(summary.rows)}")
     print(f"kapital_satelity_pozycje: {summary.capital_satelite_positions_total} "
           f"(per rachunek: {summary.capital_satelite_positions_by_rachunek})")
     print(f"kapital_satelity_pozycje_PLN (equity/etf spoza core, BEZ futures): "
@@ -160,8 +163,11 @@ def cmd_risk(args: argparse.Namespace) -> None:
         print(f"  {theme}: {result.risk_pct} breach={result.breach}")
     print(f"multiplier_missing: {summary.multiplier_missing_tickers}")
     print(f"futures_nominal_sanity (dodatni i rzedu 1e4-1e6): {summary.futures_nominal_sanity}")
-    if summary.excluded_no_price_tickers:
-        print(f"wykluczone_brak_ceny_na_D: {summary.excluded_no_price_tickers}")
+    # U4 (brief CC-U, T27): pozycje z cena forward-filled (rynek zamkniety w D,
+    # ostatnia cena <=D w granicach 2 sesji) — tylko suma i udzial, bez kwot per pozycja.
+    print(f"stale_positions_count (forward-fill T27): {summary.stale_positions_count} {summary.stale_tickers}")
+    print(f"stale_capital_PLN (w kapitale satelity): {summary.stale_capital_pln}")
+    print(f"stale_capital_pct_kapital_satelity: {summary.stale_capital_pct}")
 
 
 def build_parser() -> argparse.ArgumentParser:

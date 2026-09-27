@@ -10,21 +10,48 @@ from decimal import Decimal
 import pytest
 
 from mannaz.db import get_connection
-from mannaz.fifo import positions_as_of
-from mannaz.risk import RATCHET_INIT_DATE, resolve_default_risk_date, run_risk
+from mannaz.fifo import KONTRAKTOWY_PREFIX, positions_as_of
+from mannaz.risk import (
+    RATCHET_INIT_DATE,
+    IncompleteRiskDateError,
+    is_risk_budget_eligible,
+    kontraktowy_account_value,
+    resolve_default_risk_date,
+    run_risk,
+)
 
 
 @pytest.fixture
 def db_conn():
+    """U4 (brief CC-U): baza testowa NIE ma jeszcze migracji sql/008
+    (price_is_stale/price_date_used) — aplikujemy jej treść w TEJ SAMEJ
+    transakcji przed testem (DDL w Postgresie jest transakcyjny), żeby
+    `run_risk`/`_write_row` mogły zapisywać te kolumny. Po teście: rollback
+    (obronnie, testy i tak robią własny rollback) + weryfikacja przez
+    information_schema, że kolumny NIE zostały trwale dodane."""
     try:
         conn = get_connection()
     except Exception as exc:  # brak .env/hasla/serwera -> caly test pomijamy
         pytest.skip(f"mannaz.db.get_connection() niedostepne: {exc}")
         return
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE risk_daily ADD COLUMN IF NOT EXISTS price_is_stale BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE risk_daily ADD COLUMN IF NOT EXISTS price_date_used DATE")
     try:
         yield conn
     finally:
+        conn.rollback()  # obronnie — testy robia wlasny rollback, ale gdyby nie zrobily
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'risk_daily' AND column_name IN ('price_is_stale', 'price_date_used')"
+            )
+            leftover_columns = cur.fetchall()
         conn.close()
+        assert leftover_columns == [], (
+            "U4 (brief CC-U): migracja 008 nie zostala w pelni cofnieta po tescie — "
+            f"kolumny nadal istnieja trwale: {leftover_columns}"
+        )
 
 
 @pytest.mark.db
@@ -77,11 +104,18 @@ def test_s4_ghost_row_removed_and_row_count_matches_positions_as_of(db_conn):
 
 @pytest.mark.db
 def test_s5_ratchet_deterministic_regardless_of_prior_risk_daily_rows(db_conn):
-    """S5: stop_effective na D=2026-09-25 identyczny niezaleznie od tego, czy
-    risk_daily bylo puste, czy zawieralo juz wiersz dla D-1 (2026-09-24) —
-    zapadka nie zalezy od tego, co juz przeliczono (naprawa F4)."""
+    """S5: stop_effective na D identyczny niezaleznie od tego, czy risk_daily
+    bylo puste, czy zawieralo juz wiersz dla D-1 (RATCHET_INIT_DATE) — zapadka
+    nie zalezy od tego, co juz przeliczono (naprawa F4). D = najpozniejsza
+    data kompletna wg T27 (brief CC-U, U2/U3) — NIE sztywne 2026-09-25: ta
+    data ma od 2026-09-27 pozycje bez ceny na D (rynek otwarty bez ceny),
+    wiec run_risk(2026-09-25) rzuca IncompleteRiskDateError (patrz
+    `test_u5_...`), a ten test dotyczy determinizmu zapadki, nie pokrycia
+    cen."""
     conn = db_conn
-    d = date(2026, 9, 25)
+    d = resolve_default_risk_date(conn)
+    if d is None:
+        pytest.skip("brak sesji kompletnej wg T27 — nie da sie wyznaczyc D")
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM risk_daily")
@@ -168,5 +202,115 @@ def test_s5_run_risk_unaffected_by_transactions_and_prices_after_d(db_conn):
         assert db_count_after == db_count_before
         assert rows_after == rows_before
         assert summary_after.capital_satelite_pln == capital_before
+    finally:
+        conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# U5 (7)/(8) (brief CC-U) — testy bazodanowe reguly ceny na D (T27) na
+# biezacej bazie. Zero ilosci/kwot/numerow rachunkow wpisanych na sztywno:
+# (7) porownuje TYLKO liczbe pozycji niekompletnych i wspolna przyczyne;
+# (8) porownuje sumy C/R policzone W TESCIE z biezacej tabeli risk_daily
+# (sprzed przebiegu) z wynikiem run_risk — nie z zadnej stalej.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+def test_u5_2026_09_25_incomplete_market_open_no_price_zero_writes(db_conn):
+    """U5 (7): run_risk(2026-09-25, commit=False) na obecnej bazie ->
+    IncompleteRiskDateError; wszystkie pozycje niekompletne z ta sama
+    przyczyna 'rynek otwarty bez ceny' (market_open_no_price — GPW/gieldy w
+    tym dniu byly otwarte, ale 22 instrumenty maja swiece bez zamkniecia);
+    count(risk_daily WHERE risk_date=D) identyczny przed i po (run_risk robi
+    conn.rollback() PRZED rzuceniem, zero zapisu, S4/U2)."""
+    conn = db_conn
+    d = date(2026, 9, 25)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
+            count_before = cur.fetchone()[0]
+
+        with pytest.raises(IncompleteRiskDateError) as exc_info:
+            run_risk(conn, as_of=d, commit=False)
+
+        items = exc_info.value.items
+        assert len(items) == 23
+        assert all(it.reason == "market_open_no_price" for it in items)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
+            count_after = cur.fetchone()[0]
+        assert count_after == count_before
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
+    """U5 (8): run_risk(2026-09-24, commit=False) — dzien inicjalizacji
+    systemu, wg [Z] kazda pozycja ma komplet na D (cena dokladnie na D) —
+    57 wierszy, stale_positions_count=0, a `capital_satelite_positions_pln`/
+    `total_risk_pct_satellite_capital` rowne wartosci referencyjnej policzonej
+    W TYM TESCIE z BIEZACEJ (sprzed przebiegu) tabeli risk_daily + instruments
+    (sumy C = kapital pozycji, R = suma risk_pln pozycji uprawnionych do
+    budzetow) — regresja 24.09 nie moze sie zmienic (brief CC-U, fakt [Z])."""
+    conn = db_conn
+    d = date(2026, 9, 24)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.qty, r.close_d, r.fx_rate, r.risk_pln, i.instrument_type, i.is_core
+                FROM risk_daily r JOIN instruments i ON i.id = r.instrument_id
+                WHERE r.risk_date = %s
+                """,
+                (d,),
+            )
+            existing_rows = cur.fetchall()
+        assert existing_rows, "brak istniejacych wierszy risk_daily na 24.09 w bazie testowej — nie da sie zbudowac referencji"
+
+        ref_capital_positions = sum(
+            (
+                qty * close_d * fx_rate
+                for (qty, close_d, fx_rate, risk_pln, itype, is_core) in existing_rows
+                if itype in ("equity", "etf") and not is_core and close_d is not None and fx_rate is not None
+            ),
+            Decimal(0),
+        )
+        ref_satellite_risk_total = sum(
+            (
+                risk_pln
+                for (qty, close_d, fx_rate, risk_pln, itype, is_core) in existing_rows
+                if is_risk_budget_eligible(itype, bool(is_core)) and risk_pln is not None
+            ),
+            Decimal(0),
+        )
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.transaction_date, t.currency, t.row_type, t.amount, t.qty, t.price,
+                       i.multiplier, i.broker_ticker
+                FROM transactions t
+                LEFT JOIN instruments i ON i.id = t.instrument_id
+                WHERE t.rachunek LIKE %s AND t.transaction_date <= %s
+                ORDER BY t.transaction_date, t.id
+                """,
+                (f"{KONTRAKTOWY_PREFIX}%", d),
+            )
+            cols = ("transaction_date", "currency", "row_type", "amount", "qty", "price", "multiplier", "broker_ticker")
+            kontraktowy_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        ref_kontraktowy = kontraktowy_account_value(kontraktowy_rows, as_of=d)
+        ref_capital_total = ref_capital_positions + ref_kontraktowy
+        ref_total_risk_pct = (
+            (ref_satellite_risk_total / ref_capital_total * Decimal(100)) if ref_capital_total else None
+        )
+
+        summary = run_risk(conn, as_of=d, commit=False)
+
+        assert len(summary.rows) == 57
+        assert summary.stale_positions_count == 0
+        assert summary.capital_satelite_positions_pln == ref_capital_positions
+        assert summary.total_risk_pct_satellite_capital == ref_total_risk_pct
     finally:
         conn.rollback()

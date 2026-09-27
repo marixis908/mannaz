@@ -31,8 +31,9 @@ from mannaz.risk import (
     log_returns,
     population_stdev,
     ratchet_extreme,
-    resolve_default_date,
+    resolve_default_risk_date_pure,
     resolve_fx_rate,
+    resolve_price_on_d,
     resolve_ratchet_start,
     rolling_max,
     rolling_min,
@@ -383,21 +384,179 @@ def test_weighted_entry_price_no_rows_returns_none_entry():
 
 
 # ---------------------------------------------------------------------------
-# Domyślne D (brief P4.1 [Z])
+# resolve_price_on_d (brief CC-U, U2, T27) — reguła ceny na D, czysta funkcja
+# (kalendarz już rozstrzygnięty przez wywołującego — is_session_on_d/
+# sessions_before wstrzykiwane wprost, zero exchange_calendars/bazy).
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_default_date_picks_latest_date_without_null_close():
-    flags = [
-        (date(2026, 9, 23), False),
-        (date(2026, 9, 24), False),
-        (date(2026, 9, 25), True),
+def test_resolve_price_on_d_exact_price_on_d_is_ok():
+    d = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 9, 22), date(2026, 9, 23), d],
+        as_of=d,
+        sessions_before=[date(2026, 9, 23), date(2026, 9, 22)],
+        is_session_on_d=True,
+    )
+    assert (status, price_date_used, reason) == ("ok", d, None)
+
+
+def test_resolve_price_on_d_us_holiday_market_closed_forward_fills_within_two_sessions():
+    """U5 (1): swieto w USA (rynek US zamkniety w D) — brak ceny na D, ostatnia
+    cena to poprzednia sesja (s1) -> stale, uzyta ta cena."""
+    d = date(2026, 11, 26)  # Thanksgiving (przykladowe swieto US)
+    last_session = date(2026, 11, 25)  # s1
+    prev_session = date(2026, 11, 24)  # s2
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 11, 23), last_session],
+        as_of=d,
+        sessions_before=[last_session, prev_session],
+        is_session_on_d=False,
+    )
+    assert (status, price_date_used, reason) == ("stale", last_session, None)
+
+
+def test_resolve_price_on_d_gpw_open_with_price_is_ok_same_day_as_us_holiday():
+    """U5 (1), druga polowa: rownolegle GPW jest otwarte i MA cene na D ->
+    'ok', niezaleznie od tego, ze US w tym samym dniu jest 'stale' (patrz test
+    powyzej) — kalendarze sa niezalezne per pozycja."""
+    d = date(2026, 11, 26)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 11, 25), d],
+        as_of=d,
+        sessions_before=[date(2026, 11, 25), date(2026, 11, 24)],
+        is_session_on_d=True,
+    )
+    assert (status, price_date_used, reason) == ("ok", d, None)
+
+
+def test_resolve_price_on_d_market_open_no_price_is_incomplete():
+    """U5 (2): rynek otwarty w D, brak ceny -> niekompletne z przyczyna."""
+    d = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 9, 22), date(2026, 9, 23)],
+        as_of=d,
+        sessions_before=[date(2026, 9, 23), date(2026, 9, 22)],
+        is_session_on_d=True,
+    )
+    assert status == "incomplete"
+    assert price_date_used is None
+    assert reason == "market_open_no_price"
+
+
+def test_resolve_price_on_d_price_older_than_two_sessions_is_incomplete():
+    """U5 (3): rynek zamkniety w D, ale ostatnia cena jest starsza niz 2 sesje
+    (brakuja co najmniej 2 sesje, nie 1) -> niekompletne."""
+    d = date(2026, 9, 28)
+    s1 = date(2026, 9, 25)
+    s2 = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 9, 22), date(2026, 9, 23)],  # najnowsza cena starsza niz s2
+        as_of=d,
+        sessions_before=[s1, s2],
+        is_session_on_d=False,
+    )
+    assert status == "incomplete"
+    assert price_date_used is None
+    assert reason == "price_too_old"
+
+
+def test_resolve_price_on_d_exactly_two_sessions_old_is_still_stale():
+    """Granica: price_date_used == s2 jest DOZWOLONA (brakuje najwyzej jednej
+    sesji), nie 'incomplete'."""
+    d = date(2026, 9, 28)
+    s1 = date(2026, 9, 25)
+    s2 = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[s2],
+        as_of=d,
+        sessions_before=[s1, s2],
+        is_session_on_d=False,
+    )
+    assert (status, price_date_used, reason) == ("stale", s2, None)
+
+
+def test_resolve_price_on_d_no_calendar_mapping_is_incomplete():
+    d = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 9, 23)],
+        as_of=d,
+        sessions_before=[],
+        is_session_on_d=None,
+    )
+    assert (status, price_date_used, reason) == ("incomplete", None, "no_calendar")
+
+
+def test_resolve_price_on_d_market_closed_no_price_at_all_is_incomplete():
+    d = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[],
+        as_of=d,
+        sessions_before=[date(2026, 9, 23), date(2026, 9, 22)],
+        is_session_on_d=False,
+    )
+    assert (status, price_date_used, reason) == ("incomplete", None, "no_price_at_all")
+
+
+def test_resolve_price_on_d_never_uses_price_dated_after_d():
+    """Cena z data > D jest ignorowana nawet jesli jest w price_dates (rynek
+    zamkniety w D) — nigdy look-ahead (T27: 'Nigdy w przod poza ostatnia
+    realna sesje')."""
+    d = date(2026, 9, 24)
+    s1 = date(2026, 9, 23)
+    s2 = date(2026, 9, 22)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[s1, date(2026, 9, 25)],  # 25.09 > D -> pominiete
+        as_of=d,
+        sessions_before=[s1, s2],
+        is_session_on_d=False,
+    )
+    assert (status, price_date_used, reason) == ("stale", s1, None)
+
+
+def test_resolve_price_on_d_complete_price_result_unchanged_regression():
+    """U5 (5): komplet cen (D w price_dates) -> wynik identyczny jak przed
+    zmiana (status='ok', price_is_stale odpowiada False u wywolujacego)."""
+    d = date(2026, 9, 24)
+    status, price_date_used, reason = resolve_price_on_d(
+        price_dates=[date(2026, 9, 22), date(2026, 9, 23), d],
+        as_of=d,
+        sessions_before=[date(2026, 9, 23), date(2026, 9, 22)],
+        is_session_on_d=True,
+    )
+    assert status == "ok"
+    assert price_date_used == d
+    assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# kontrakt bez ceny bazy przy otwartym GPW — U5 (4): niekompletne (kontrakty
+# NIE wypadaja po cichu). resolve_price_on_d nie wie nic o kontraktach —
+# scenariusz sprawdza `_resolve_position_price_coverage`, patrz
+# tests/test_price_coverage.py.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Domyślne D (brief CC-U, U3) — resolve_default_risk_date_pure zastępuje
+# usunięte resolve_default_date (brief P4.1 [Z], liczyło tylko satelitę przez
+# any_null; nowa reguła sprawdza WSZYSTKIE pozycje przez T27/U2).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_default_risk_date_pure_skips_incomplete_day_picks_earlier_complete():
+    """U5 (6): wybor domyslnej daty pomija dzien z lukami (incomplete) i
+    wybiera wczesniejszy kompletny."""
+    candidates = [
+        (date(2026, 9, 23), True),
+        (date(2026, 9, 24), True),
+        (date(2026, 9, 25), False),  # najnowsza, ale niekompletna -> pomijana
     ]
-    assert resolve_default_date(flags) == date(2026, 9, 24)
+    assert resolve_default_risk_date_pure(candidates) == date(2026, 9, 24)
 
 
-def test_resolve_default_date_all_null_returns_none():
-    assert resolve_default_date([(date(2026, 9, 25), True)]) is None
+def test_resolve_default_risk_date_pure_all_incomplete_returns_none():
+    assert resolve_default_risk_date_pure([(date(2026, 9, 25), False)]) is None
 
 
 # ---------------------------------------------------------------------------
