@@ -146,3 +146,130 @@ def test_exchange_fallback_bare_us_ticker_is_ambiguous_returns_none():
 
 def test_exchange_fallback_none_symbol():
     assert exchange_fallback_from_suffix(None) is None
+
+
+# ---------------------------------------------------------------------------
+# B-28: run_instrument_mapping na bazie (transakcja + rollback, zero sieci)
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from mannaz import instruments_map
+from mannaz.db import get_connection
+
+
+@pytest.fixture
+def map_conn(monkeypatch):
+    try:
+        conn = get_connection()
+    except Exception as exc:
+        pytest.skip(f"mannaz.db.get_connection() niedostepne: {exc}")
+        return
+    conn.rollback()
+    monkeypatch.setattr(conn, "commit", lambda: None)  # nic nie utrwalamy
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def _insert_instrument(cur, ticker, itype, *, yahoo_symbol=None, multiplier=None, source=None,
+                       name="SYNTH", currency="PLN", exchange=None, isin=None):
+    cur.execute(
+        """
+        INSERT INTO instruments (broker_ticker, name, isin, yahoo_symbol, currency, exchange,
+                                 instrument_type, multiplier, multiplier_source)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+        """,
+        (ticker, name, isin, yahoo_symbol, currency, exchange, itype, multiplier, source),
+    )
+    iid = cur.fetchone()[0]
+    cur.execute(
+        """
+        INSERT INTO positions_fifo (rachunek, instrument_id, currency, qty, residual_cost,
+                                    first_entry_date, last_entry_date)
+        VALUES ('__B28_TEST__', %s, %s, 1, 1, DATE '2026-01-02', DATE '2026-01-02')
+        """,
+        (iid, currency),
+    )
+    return iid
+
+
+def _row(cur, iid):
+    cur.execute(
+        "SELECT yahoo_symbol, currency, exchange, instrument_type, name, base_symbol, "
+        "multiplier, multiplier_source FROM instruments WHERE id = %s",
+        (iid,),
+    )
+    return cur.fetchone()
+
+
+@pytest.fixture
+def yf_calls(monkeypatch):
+    calls = []
+
+    def fake(symbol):
+        calls.append(symbol)
+        return instruments_map.YfinanceVerification(
+            currency="USD", name="Mock Name", exchange_raw="NYSE", quote_type="EQUITY"
+        )
+
+    monkeypatch.setattr(instruments_map, "verify_via_yfinance", fake)
+    return calls
+
+
+@pytest.mark.db
+def test_b28_future_multiplier_with_source_unchanged(map_conn, yf_calls):
+    with map_conn.cursor() as cur:
+        iid = _insert_instrument(cur, "FPGEZ26", "future", multiplier=Decimal(100),
+                                 source="sql/007 test")
+        summary = instruments_map.run_instrument_mapping(map_conn)
+        row = _row(cur, iid)
+    assert row[6] == Decimal(100) and row[7] == "sql/007 test"
+    assert row[5] == "PGE.WA"  # base_symbol uzupelniony, bo byl NULL
+    out = [o for o in summary.mapped if o.instrument_id == iid][0]
+    assert out.multiplier == Decimal(100)
+    assert iid not in [o.instrument_id for o in summary.flagged_for_owner]
+
+
+@pytest.mark.db
+def test_b28_future_base_outside_override_list_multiplier_not_zeroed(map_conn, yf_calls):
+    with map_conn.cursor() as cur:
+        iid = _insert_instrument(cur, "FKGHZ26", "future", multiplier=Decimal(100),
+                                 source="sql/007 test")
+        instruments_map.run_instrument_mapping(map_conn)
+        row = _row(cur, iid)
+    assert row[6] == Decimal(100) and row[7] == "sql/007 test"
+
+
+@pytest.mark.db
+def test_b28_future_without_multiplier_flagged_not_filled(map_conn, yf_calls):
+    with map_conn.cursor() as cur:
+        iid = _insert_instrument(cur, "FPGEZ26", "future")
+        summary = instruments_map.run_instrument_mapping(map_conn)
+        row = _row(cur, iid)
+    assert row[6] is None
+    assert iid in [o.instrument_id for o in summary.flagged_for_owner]
+
+
+@pytest.mark.db
+def test_b28_equity_without_yahoo_symbol_is_processed(map_conn, yf_calls):
+    with map_conn.cursor() as cur:
+        iid = _insert_instrument(cur, "B28NEWEQ", "equity", currency="USD")
+        instruments_map.run_instrument_mapping(map_conn)
+        row = _row(cur, iid)
+    assert row[0] == "B28NEWEQ" and row[4] == "Mock Name"
+    assert "B28NEWEQ" in yf_calls
+
+
+@pytest.mark.db
+def test_b28_equity_with_yahoo_symbol_untouched(map_conn, yf_calls):
+    with map_conn.cursor() as cur:
+        iid = _insert_instrument(cur, "B28SETEQ", "equity", yahoo_symbol="B28SETEQ.XX",
+                                 currency="EUR", exchange="XETRA", name="Orig Name")
+        before = _row(cur, iid)
+        instruments_map.run_instrument_mapping(map_conn)
+        after = _row(cur, iid)
+    assert after == before
+    assert "B28SETEQ" not in yf_calls and "B28SETEQ.XX" not in yf_calls
