@@ -122,7 +122,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Hashable, NamedTuple
 
 import exchange_calendars as xcals
 import psycopg
@@ -498,11 +498,13 @@ class RiskBudgetAggregateResult:
     theme_budgets: dict[str, ThemeBudgetResult]
     level1_results: list[tuple[Decimal | None, bool | None]]
     level1_breach_tickers: list[str]
+    name_risk_pcts: list[Decimal | None] = field(default_factory=list)
 
 
 def aggregate_risk_budgets(
     items: list[tuple[str, str, bool, Decimal | None, str | None]],
     capital: Decimal | None,
+    name_keys: list[Hashable | None] | None = None,
 ) -> RiskBudgetAggregateResult:
     """Czysta funkcja (brief CC-R (e)) — agreguje budżety poziomów 1-3 z listy
     `items` = (broker_ticker, instrument_type, is_core, risk_pln, theme), JEDEN
@@ -512,14 +514,46 @@ def aggregate_risk_budgets(
     pozycji (equity/etf/future/inne) bez wstępnego filtrowania przez wołającego.
     `level1_results` wyrównane indeksem do `items` (żeby dało się przypisać
     z powrotem `risk_pct_satellite_capital`/`level1_breach` do wierszy bez
-    grupowania po tickerze — ten sam ticker może wystąpić w kilku wierszach)."""
+    grupowania po tickerze — ten sam ticker może wystąpić w kilku wierszach).
+
+    Poziom 1 per NAZWĘ (B-30, decyzja ownera 6.3: nazwa = emitent):
+    `name_keys` (wyrównane indeksem do `items`) = klucz nazwy wiersza (w
+    `run_risk`: id instrumentu wyceny — equity/etf własny, future = bazowy).
+    Suma `risk_pln` po kluczu wśród wierszy uprawnionych trafia do
+    `level1_check`; `None` → każdy wiersz jest własną nazwą. B-19: jeśli
+    którykolwiek uprawniony wiersz nazwy ma `risk_pln=None` albo `capital`
+    jest pusty, pct nazwy i breach = None dla całej nazwy (jawnie niepełne,
+    nigdy "brak przekroczenia"). `level1_results[i]` = (pct WIERSZA, breach
+    NAZWY); `name_risk_pcts[i]` = pct nazwy (None dla nieuprawnionych)."""
     satellite_risk_total = Decimal(0)
     ticker_risk_pln_for_themes: list[tuple[str, Decimal | None]] = []
     ticker_to_theme: dict[str, str] = {}
     level1_results: list[tuple[Decimal | None, bool | None]] = []
     level1_breach_tickers: list[str] = []
+    name_risk_pcts: list[Decimal | None] = []
 
-    for ticker, instrument_type, is_core, risk_pln, theme in items:
+    def _key(idx: int) -> Hashable:
+        k = name_keys[idx] if name_keys is not None else None
+        return ("row", idx) if k is None else ("name", k)
+
+    name_sum: dict[Hashable, Decimal] = {}
+    name_incomplete: set[Hashable] = set()
+    for idx, (_t, instrument_type, is_core, risk_pln, _th) in enumerate(items):
+        if not is_risk_budget_eligible(instrument_type, is_core):
+            continue
+        k = _key(idx)
+        if risk_pln is None:
+            name_incomplete.add(k)
+        else:
+            name_sum[k] = name_sum.get(k, Decimal(0)) + risk_pln
+    name_result: dict[Hashable, tuple[Decimal | None, bool | None]] = {}
+    for k in set(name_sum) | name_incomplete:
+        if k in name_incomplete:
+            name_result[k] = (None, None)
+        else:
+            name_result[k] = level1_check(name_sum[k], capital)
+
+    for idx, (ticker, instrument_type, is_core, risk_pln, theme) in enumerate(items):
         eligible = is_risk_budget_eligible(instrument_type, is_core)
 
         if eligible and risk_pln is not None:
@@ -530,13 +564,16 @@ def aggregate_risk_budgets(
             if theme is not None:
                 ticker_to_theme[ticker] = theme
 
-        if eligible and risk_pln is not None and capital:
-            pct, breach = level1_check(risk_pln, capital)
-            level1_results.append((pct, breach))
-            if breach:
+        if eligible:
+            name_pct, name_breach = name_result[_key(idx)]
+            row_pct, _ = level1_check(risk_pln, capital)
+            level1_results.append((row_pct, name_breach))
+            name_risk_pcts.append(name_pct)
+            if name_breach:
                 level1_breach_tickers.append(ticker)
         else:
             level1_results.append((None, None))
+            name_risk_pcts.append(None)
 
     total_risk_pct, level3_breach = level3_check(satellite_risk_total, capital)
     theme_budgets = compute_theme_budgets(ticker_risk_pln_for_themes, ticker_to_theme, capital)
@@ -548,6 +585,7 @@ def aggregate_risk_budgets(
         theme_budgets=theme_budgets,
         level1_results=level1_results,
         level1_breach_tickers=level1_breach_tickers,
+        name_risk_pcts=name_risk_pcts,
     )
 
 
@@ -953,6 +991,8 @@ class PositionRiskRow:
     price_date_used: date | None
     risk_pct_satellite_capital: Decimal | None = None
     level1_breach: bool | None = None
+    name_key: int | None = None
+    name_risk_pct: Decimal | None = None
     note: str = ""
 
 
@@ -1534,6 +1574,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 multiplier_missing=False,
                 price_is_stale=coverage.price_is_stale,
                 price_date_used=coverage.price_date_used,
+                name_key=coverage.price_instrument_id,
                 note=note,
             )
             computed.append(row)
@@ -1649,7 +1690,9 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
 
         # --- Poziomy 1/3 (§19.2/§19.4, kapitał = capital_satelite_pln) + poziom
         # 2 (tematy) — czysta agregacja (brief CC-R (e)), testowalna bez bazy. ---
-        budget_result = aggregate_risk_budgets(budget_items, capital_satelite_pln)
+        budget_result = aggregate_risk_budgets(
+            budget_items, capital_satelite_pln, name_keys=[row.name_key for row in computed]
+        )
         summary.total_risk_pct_satellite_capital = budget_result.total_risk_pct
         summary.level3_breach = budget_result.level3_breach
         summary.theme_budgets = budget_result.theme_budgets
@@ -1670,9 +1713,12 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         # aggregate_risk_budgets) -> ten sam porządek co computed (brief CC-U:
         # `computed` zawiera już WYŁĄCZNIE PositionRiskRow — pozycje
         # niekompletne nigdy tu nie trafiają, run_risk rzucił wyżej).
-        for row, (pct1, breach1) in zip(computed, budget_result.level1_results):
+        for row, (pct1, breach1), name_pct in zip(
+            computed, budget_result.level1_results, budget_result.name_risk_pcts
+        ):
             row.risk_pct_satellite_capital = pct1
             row.level1_breach = breach1
+            row.name_risk_pct = name_pct
 
         # --- kontrolka nominału P4.2: FPGEZ26/FCDRZ26 (multiplier znany) ---
         for row in computed:
@@ -1761,6 +1807,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             position_kind, risk_native, fx_rate, fx_rate_date, risk_pln,
             risk_pct_satellite_capital, level1_breach,
             regime, warning, multiplier_missing, price_is_stale, price_date_used,
+            name_key, name_risk_pct,
             note, computed_at
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
@@ -1771,6 +1818,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             %s, %s, %s, %s, %s,
             %s, %s,
             %s, %s, %s, %s, %s,
+            %s, %s,
             %s, %s
         )
         """,
@@ -1783,6 +1831,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             row.position_kind, row.risk_native, row.fx_rate, row.fx_rate_date, row.risk_pln,
             row.risk_pct_satellite_capital, row.level1_breach,
             row.regime, row.warning, row.multiplier_missing, row.price_is_stale, row.price_date_used,
+            row.name_key, row.name_risk_pct,
             row.note, computed_at,
         ),
     )
