@@ -903,3 +903,46 @@ def test_resolve_ratchet_start_reopened_after_init_date_uses_reopen_date():
     ]
     d = date(2026, 9, 26)
     assert resolve_ratchet_start(rows, events=[], as_of=d) == date(2026, 9, 26)
+
+
+# ---------------------------------------------------------------------------
+# B-32: level1_by_name (prezentacja poziomu 1 per nazwa)
+# ---------------------------------------------------------------------------
+
+
+def test_level1_by_name_groups_rows_and_breaches():
+    from mannaz.risk import level1_by_name
+
+    items = [
+        (1, True, "AAA", "USD", Decimal("0.6"), Decimal("1.2"), True),
+        (1, True, "AAA", "PLN", Decimal("0.6"), Decimal("1.2"), True),
+        (2, True, "BBB", "USD", Decimal("0.3"), Decimal("0.3"), False),
+    ]
+    names = level1_by_name(items, {1: "AAA"})
+    assert [n.label for n in names] == ["AAA", "BBB"]
+    assert names[0].pct == Decimal("1.2") and names[0].breach is True and len(names[0].members) == 2
+    assert names[1].breach is False and not names[1].incomplete
+
+
+def test_level1_by_name_incomplete_is_never_clean_and_sorted_last():
+    from mannaz.risk import level1_by_name
+
+    items = [
+        (1, True, "AAA", "USD", Decimal("0.6"), None, None),
+        (2, True, "BBB", "USD", Decimal("0.1"), Decimal("0.1"), False),
+    ]
+    names = level1_by_name(items)
+    assert [n.label for n in names] == ["BBB", "AAA"]
+    assert names[1].incomplete and names[1].pct is None and names[1].breach is None
+
+
+def test_level1_by_name_skips_ineligible_and_none_key_is_own_name():
+    from mannaz.risk import level1_by_name
+
+    items = [
+        (None, False, "CORE", "USD", Decimal("5"), Decimal("5"), True),
+        (None, True, "X", "USD", Decimal("0.4"), Decimal("0.4"), False),
+        (None, True, "Y", "USD", Decimal("0.4"), Decimal("0.4"), False),
+    ]
+    names = level1_by_name(items)
+    assert sorted(n.label for n in names) == ["X", "Y"]

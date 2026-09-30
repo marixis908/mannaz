@@ -1248,3 +1248,72 @@ def test_render_report_positive_control_old_path_would_leak_number(monkeypatch):
     monkeypatch.setattr("mannaz.cycle.account_label", lambda rachunek: rachunek)
     text = render_report(state)
     assert any(number in text for number in ("900001", "900002", "900003"))
+
+
+# ---------------------------------------------------------------------------
+# B-32: poziom 1 per nazwę w raporcie
+# ---------------------------------------------------------------------------
+
+
+def _l1_row(ticker, cur, name_key, pct, name_pct, breach, itype="equity"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        broker_ticker=ticker, settlement_currency=cur, name_key=name_key,
+        risk_pct_satellite_capital=pct, name_risk_pct=name_pct, level1_breach=breach,
+        instrument_type=itype, is_core=False, below_stop=False, price_is_stale=False,
+        price_date_used=None, close_d=None, fx_rate=None, qty=Decimal(1),
+    )
+
+
+def _l1_summary(rows):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        rows=rows, theme_budgets={}, total_risk_pct_satellite_capital=None,
+        total_risk_pct_zagraniczny_satellite_capital=None, level3_breach=False,
+        capital_satelite_positions_pln=Decimal(0), kontraktowy_account_value_pln=Decimal(0),
+        capital_satelite_pln=Decimal(0), level1_breach_tickers=["STALE-ROW-LIST"],
+    )
+
+
+def _l1_line(rows, labels=None):
+    from mannaz.cycle import _render_risk_section
+
+    state = _complete_state()
+    state.risk_aggregates = RiskReportAggregates.from_risk_summary(_l1_summary(rows), labels)
+    return [ln for ln in _render_risk_section(state) if ln.startswith("- poziom 1")][0]
+
+
+def test_level1_report_positive_two_rows_one_name_breach():
+    line = _l1_line(
+        [_l1_row("AAA", "USD", 1, Decimal("0.6"), Decimal("1.2"), True),
+         _l1_row("AAA", "PLN", 1, Decimal("0.6"), Decimal("1.2"), True)],
+        {1: "AAA"},
+    )
+    assert "(per nazwa)" in line
+    assert line.count("AAA 1") == 2 or "AAA/USD" in line  # max + przekroczenie
+    assert "przekroczenia > 1%: AAA" in line
+    assert "AAA/USD" in line and "AAA/PLN" in line and " + " in line
+    assert "STALE-ROW-LIST" not in line
+
+
+def test_level1_report_negative_two_names_no_breach():
+    line = _l1_line(
+        [_l1_row("AAA", "USD", 1, Decimal("0.6"), Decimal("0.6"), False),
+         _l1_row("BBB", "USD", 2, Decimal("0.6"), Decimal("0.6"), False)],
+        {1: "AAA", 2: "BBB"},
+    )
+    assert "przekroczenia > 1%: brak" in line
+    assert "max AAA 0,6" in line.replace(".", ",") or "max AAA 0.6" in line
+    assert "niepełne" not in line
+
+
+def test_level1_report_incomplete_name_listed():
+    line = _l1_line(
+        [_l1_row("AAA", "USD", 1, Decimal("0.6"), None, None),
+         _l1_row("BBB", "USD", 2, Decimal("0.2"), Decimal("0.2"), False)],
+        {1: "AAA", 2: "BBB"},
+    )
+    assert "niepełne: AAA (AAA)" in line
+    assert "przekroczenia > 1%: brak" in line

@@ -704,3 +704,34 @@ def test_sygnatury_funkcji_mannaz_zgodne_z_wywolaniami_generate():
             if p.kind in (p.KEYWORD_ONLY,) and p.default is inspect.Parameter.empty
         ]
         assert not extra_required, f"{module_name}.{func_name}: nowe wymagane parametry keyword-only {extra_required}"
+
+
+# B-32: poziom 1 per NAZWĘ (nie per wiersz)
+
+
+def _name_row(key, pct, name_pct, breach, label="AAA", cur="USD"):
+    return _risk_row(
+        name_key=key, name_label=label, settlement_currency=cur,
+        risk_pct_satellite_capital=pct, name_risk_pct=name_pct, level1_breach=breach,
+    )
+
+
+def test_name_breach_positive_two_rows_one_name_counts_once():
+    rows = [_name_row(1, Decimal("0.6"), Decimal("1.2"), True, cur="USD"),
+            _name_row(1, Decimal("0.6"), Decimal("1.2"), True, cur="PLN")]
+    assert model.count_level1_name_breaches(rows, is_risk_budget_eligible) == 1
+    assert model.count_level1_incomplete_names(rows, is_risk_budget_eligible) == 0
+
+
+def test_name_breach_negative_two_names_zero():
+    rows = [_name_row(1, Decimal("0.6"), Decimal("0.6"), False, "AAA"),
+            _name_row(2, Decimal("0.6"), Decimal("0.6"), False, "BBB")]
+    assert model.count_level1_name_breaches(rows, is_risk_budget_eligible) == 0
+    assert model.count_level1_incomplete_names(rows, is_risk_budget_eligible) == 0
+
+
+def test_name_incomplete_counted_separately_not_clean():
+    rows = [_name_row(1, Decimal("0.6"), None, None),
+            _name_row(2, Decimal("0.2"), Decimal("0.2"), False, "BBB")]
+    assert model.count_level1_incomplete_names(rows, is_risk_budget_eligible) == 1
+    assert model.count_level1_name_breaches(rows, is_risk_budget_eligible) == 0
