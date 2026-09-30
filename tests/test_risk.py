@@ -627,6 +627,71 @@ def test_aggregate_risk_budgets_multiplier_missing_risk_none_is_skipped():
 
 
 # ---------------------------------------------------------------------------
+# Poziom 1 per NAZWA (brief CC-N, B-30) — N4
+# ---------------------------------------------------------------------------
+
+
+def test_n4_same_name_two_rows_breach_on_both():
+    items = [
+        ("AAA", "equity", False, Decimal(600), None),
+        ("AAA", "equity", False, Decimal(600), None),
+    ]
+    result = aggregate_risk_budgets(items, Decimal(100000), name_keys=[7, 7])
+    assert result.level1_results == [(Decimal("0.6"), True), (Decimal("0.6"), True)]
+    assert result.name_risk_pcts == [Decimal("1.2"), Decimal("1.2")]
+    assert result.level1_breach_tickers == ["AAA", "AAA"]
+
+
+def test_n4_different_names_no_breach():
+    items = [
+        ("AAA", "equity", False, Decimal(600), None),
+        ("BBB", "equity", False, Decimal(600), None),
+    ]
+    result = aggregate_risk_budgets(items, Decimal(100000), name_keys=[7, 8])
+    assert [b for _, b in result.level1_results] == [False, False]
+    assert result.name_risk_pcts == [Decimal("0.6"), Decimal("0.6")]
+    assert result.level1_breach_tickers == []
+
+
+def test_n4_equity_plus_future_same_base_breach():
+    items = [
+        ("AAA", "equity", False, Decimal(500), None),
+        ("FUTAAA", "future", False, Decimal(600), None),
+    ]
+    result = aggregate_risk_budgets(items, Decimal(100000), name_keys=[7, 7])
+    assert [b for _, b in result.level1_results] == [True, True]
+    assert result.name_risk_pcts == [Decimal("1.1"), Decimal("1.1")]
+    assert result.level1_breach_tickers == ["AAA", "FUTAAA"]
+
+
+def test_n4_incomplete_name_breach_none_not_false():
+    items = [
+        ("AAA", "equity", False, None, None),
+        ("AAA", "equity", False, Decimal(600), None),
+    ]
+    result = aggregate_risk_budgets(items, Decimal(100000), name_keys=[7, 7])
+    assert [b for _, b in result.level1_results] == [None, None]
+    assert result.name_risk_pcts == [None, None]
+    assert result.level1_breach_tickers == []
+
+
+def test_n4_name_keys_none_equals_legacy_and_core_excluded():
+    items = [
+        ("AAA", "equity", False, Decimal(600), None),
+        ("AAA", "equity", False, Decimal(600), None),
+        ("CORE", "equity", True, Decimal(9999), None),
+    ]
+    result = aggregate_risk_budgets(items, Decimal(100000))
+    assert result.level1_results == [
+        (Decimal("0.6"), False),
+        (Decimal("0.6"), False),
+        (None, None),
+    ]
+    assert result.name_risk_pcts == [Decimal("0.6"), Decimal("0.6"), None]
+    assert result.level1_breach_tickers == []
+
+
+# ---------------------------------------------------------------------------
 # kontraktowy_account_value (brief CC-R (a)/(g), §19.4 + decyzja nadzorcy K3)
 # — srodki ogolem lacznie z depozytem zablokowanym; nominal kupna/sprzedazy
 # NIE jest przeplywem srodkow, liczy sie wylacznie prowizja jako koszt.
