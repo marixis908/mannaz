@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.5 · 2026-09-27**
+**Rewizja 4.6 · 2026-09-30**
 
 ---
 
@@ -30,7 +30,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.2 | 2026-09-27 | §19 M77: zasada „dane ≤ D” dla wielkości liczonych na dzień D; §19.3: zapadka Chandeliera per okres posiadania (brief CC-S) |
 | 4.3 | 2026-09-27 | T27: forward-fill przy odczycie (`run_risk`), tabela cen tylko z realnymi sesjami, flaga nieświeżości i data użytej ceny w `risk_daily` (brief CC-U) |
 | 4.4 | 2026-09-27 | T12: zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie (T27); §8.2/§8.3: `prices_eod` → `prices_daily`, kolumny zgodne z bazą, bez `is_stale` (brief CC-I) |
-| **4.5** | **2026-09-27** | **§23.2: etap lokalny — przebieg główny uruchamiany ręcznie przez ownera po wgraniu historii transakcji, raport lokalny zamiast Slacka i dead-mana; §22.3 T38: próg istotności zmiany zlecenia stop (brief CC-C)** |
+| 4.5 | 2026-09-27 | §23.2: etap lokalny — przebieg główny uruchamiany ręcznie przez ownera po wgraniu historii transakcji, raport lokalny zamiast Slacka i dead-mana; §22.3 T38: próg istotności zmiany zlecenia stop (brief CC-C) |
+| **4.6** | **2026-09-30** | **§25.3: kolumna „stan” faz F0–F6 z dowodami; kolejność przekrojami pionowymi od 2026-09-26; F0 warunkiem wejścia w F3 (decyzja ownera 2026-09-30)** |
 
 ### 0.3 Oznaczenia
 
@@ -1230,15 +1231,19 @@ Etap 4  dopiero teraz zmiana progów
 
 Kryteria sformułowane jako **liczby przewidziane przed pomiarem, bez hedge'y**.
 
-| Faza | Zakres | Kryterium akceptacji | Nakład realny |
-|---|---|---|---|
-| **F0** | Ręczny replay 5×3; kontrakt danych z `available_at`; definicja czterech stanów; deklaracja konwencji korekt; wersjonowanie peerów w schemacie; modele Pydantic; ok. 20 testów jednostkowych na EV, P/TBV, mNAV, ATR | Replay wykonany, każda kratka ma wskazane źródło albo jawne „brak". Testy przechodzą, w tym **kontrolka dodatnia na znanej wartości** | 3–4 dni |
-| **F1** | Repo, baza, schemat, trigger append-only, klienci yfinance + NBP + kalendarze, asercja walut, ingest wszystkich rynków | ≥ 252 sesje dla każdego instrumentu; **asercja waluty przechodzi 100%**; rozbieżność do drugiego źródła <0,5% **tam, gdzie drugie źródło istnieje** (T32); kontrolka dodatnia na instrumencie o znanej liczbie sesji | 2–3 weekendy |
-| **F2** | 7 wskaźników, reguły ryzyka, sizing, portfolio heat, raport inicjalizacyjny, Slack, dead-man | Zgodność ATR i RSI z niezależną implementacją **do 4 miejsc**; ≥300 barów rozgrzewki; liczba alertów w raporcie inicjalizacyjnym **przewidziana przed przebiegiem** | 1–2 weekendy |
-| **F3** | Arkusz mianowników, RVS na percentylu, cztery stany, silnik decyzyjny, kwarantanna, artefakt tygodniowy | Każdy instrument ma cztery stany albo jawny UNKNOWN z przyczyną; pierwszy pełny cykl tygodniowy bez interwencji | 2 weekendy |
-| **F4** | Pipeline SEC XBRL, backfill filings.xbrl.org PL, normalizacja taksonomii i walut | 24 spółki US z pełnymi kwartałami; NVO przeliczone z DKK zgodne z raportem do 1%; ~150 emitentów PL FY2020–FY2023 | **3–4 tygodnie**, nie 2 |
-| **F5** | Reverse DCF, MEROI, ROTE implikowane, base rates, PCA/ENB/MCTR, rejestr tez jako tabela | Solver z diagnostyką pierwiastków; przedział WACC zamiast punktu; PCA na ≥120 obserwacjach | 2–3 tygodnie |
-| **F6** | Shadow mode | 8–12 tygodni; <15 alertów/mies.; artefakt czytany | — |
+| Faza | Zakres | Kryterium akceptacji | Nakład realny | Stan (2026-09-30) |
+|---|---|---|---|---|
+| **F0** | Ręczny replay 5×3; kontrakt danych z `available_at`; definicja czterech stanów; deklaracja konwencji korekt; wersjonowanie peerów w schemacie; modele Pydantic; ok. 20 testów jednostkowych na EV, P/TBV, mNAV, ATR | Replay wykonany, każda kratka ma wskazane źródło albo jawne „brak". Testy przechodzą, w tym **kontrolka dodatnia na znanej wartości** | 3–4 dni | częściowo — **replay 5×3: nie wykonany**; testy ATR (`b3f280c`); EV, P/TBV, mNAV, Pydantic, `available_at`, wersjonowanie peerów — brak; kryterium niezmierzone |
+| **F1** | Repo, baza, schemat, trigger append-only, klienci yfinance + NBP + kalendarze, asercja walut, ingest wszystkich rynków | ≥ 252 sesje dla każdego instrumentu; **asercja waluty przechodzi 100%**; rozbieżność do drugiego źródła <0,5% **tam, gdzie drugie źródło istnieje** (T32); kontrolka dodatnia na instrumencie o znanej liczbie sesji | 2–3 weekendy | częściowo — klienci yfinance + NBP, kalendarze, asercja waluty (`2308b93`), bezpiecznik importera T12 (`a183213`); trigger append-only — brak; kryterium zmierzone tylko sondą CC-P P1 (14 instrumentów, FX 6/7 walut), na pełnym zbiorze niezmierzone |
+| **F2** | 7 wskaźników, reguły ryzyka, sizing, portfolio heat, raport inicjalizacyjny, Slack, dead-man | Zgodność ATR i RSI z niezależną implementacją **do 4 miejsc**; ≥300 barów rozgrzewki; liczba alertów w raporcie inicjalizacyjnym **przewidziana przed przebiegiem** | 1–2 weekendy | częściowo — reguły ryzyka, sizing, heat, ATR, SMA, σ, kanał 252, Chandelier (`b3f280c`, CC-R `724fafb`, CC-S `358ef34`); warstwa raportowa: cykl `run_p3 cycle` (`1ef3914`), dashboard (`4ec3923`); RSI — brak (7 wskaźników niekompletne); raport inicjalizacyjny, Slack, dead-man — brak (§23.2); kryterium niezmierzone |
+| **F3** | Arkusz mianowników, RVS na percentylu, cztery stany, silnik decyzyjny, kwarantanna, artefakt tygodniowy | Każdy instrument ma cztery stany albo jawny UNKNOWN z przyczyną; pierwszy pełny cykl tygodniowy bez interwencji | 2 weekendy | nie |
+| **F4** | Pipeline SEC XBRL, backfill filings.xbrl.org PL, normalizacja taksonomii i walut | 24 spółki US z pełnymi kwartałami; NVO przeliczone z DKK zgodne z raportem do 1%; ~150 emitentów PL FY2020–FY2023 | **3–4 tygodnie**, nie 2 | nie |
+| **F5** | Reverse DCF, MEROI, ROTE implikowane, base rates, PCA/ENB/MCTR, rejestr tez jako tabela | Solver z diagnostyką pierwiastków; przedział WACC zamiast punktu; PCA na ≥120 obserwacjach | 2–3 tygodnie | nie |
+| **F6** | Shadow mode | 8–12 tygodni; <15 alertów/mies.; artefakt czytany | — | nie |
+
+Od 2026-09-26 praca idzie przekrojami pionowymi (brief CC-P i kolejne), nie fazami F0→F6 po kolei. Tabela faz pozostaje miarą kompletności: stan fazy zmienia się na „zrobione” dopiero po zmierzeniu jej kryterium akceptacji.
+
+**F0 jest warunkiem wejścia w F3.** Ręczny replay 5×3 (M72) wykonuje się przed pierwszą linią kodu RVS, czterech stanów i silnika decyzyjnego.
 
 **Realny horyzont po godzinach: 5–7 miesięcy do wersji pełnej, 5–8 weekendów do F3.** Nominalne „dwa weekendy" z rewizji 1 było zaniżone — test dwóch źródeł z założenia pali się czerwono do czasu napisania normalizatora konwencji, dochodzi walidacja wskaźników i pierwsze wypełnienie arkusza.
 
