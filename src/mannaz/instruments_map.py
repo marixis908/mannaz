@@ -24,9 +24,11 @@ pominięty):
 
 Kontrakty terminowe (`instrument_type = 'future'`) NIE dostają `yahoo_symbol`
 (GPW derywaty nie mają odpowiednika na Yahoo) — zamiast tego `base_symbol`
-(spółka bazowa + `.WA`) i `multiplier`, jeśli znany z `FUTURES_MULTIPLIER_OVERRIDES`
-(brief podaje tylko PGE i CDR; inne bazy zostają z `multiplier IS NULL` i trafiają
-do `flagged_for_owner`).
+(spółka bazowa + `.WA`, wypełniany tylko gdy NULL). Mapowanie NIGDY nie zapisuje
+`multiplier` (B-28): źródłem mnożnika jest migracja (sql/007, kolumna
+`multiplier_source`); kontrakt bez mnożnika trafia do `flagged_for_owner`.
+Mapowanie dotyka wyłącznie instrumentów z `yahoo_symbol IS NULL`; wiersze z
+ustawionym symbolem nie są ruszane w żadnej kolumnie (B-28).
 
 Certyfikaty strukturyzowane (`instrument_type = 'certificate'`, np. ING Turbo
 `INTL*`/`INTS*`) nie mają reguły w briefie -> zawsze niezmapowane.
@@ -66,8 +68,9 @@ EXPLICIT_SYMBOL_OVERRIDES: dict[str, str] = {
 # tego, że weryfikacja waluty/nazwy wypadła pozytywnie.
 IDENTITY_CONFIRMATION_REQUIRED = frozenset({"MDV", "GMT"})
 
-# Multiplier kontraktów terminowych GPW, znany z briefu tylko dla dwóch baz;
-# reszta zostaje NULL i jest zgłaszana do ownera (brak zgadywania).
+# Multiplier kontraktów GPW z briefu P3.1 — używany WYŁĄCZNIE przez
+# `futures_base_mapping` (czysta funkcja/testy). Od B-28 `run_instrument_mapping`
+# NIE zapisuje mnożnika do bazy; źródłem jest migracja (sql/007, multiplier_source).
 FUTURES_MULTIPLIER_OVERRIDES: dict[str, Decimal | None] = {
     "PGE": Decimal(1000),
     "CDR": Decimal(100),
@@ -221,14 +224,16 @@ def _target_instruments(cur: psycopg.Cursor) -> list[dict[str, Any]]:
     cur.execute(
         """
         SELECT DISTINCT i.id, i.broker_ticker, i.isin, i.currency, i.instrument_type,
-               i.name, i.is_core
+               i.name, i.is_core, i.base_symbol, i.multiplier, i.multiplier_source
         FROM instruments i
-        WHERE i.is_core
-           OR EXISTS (SELECT 1 FROM positions_fifo p WHERE p.instrument_id = i.id)
+        WHERE i.yahoo_symbol IS NULL
+          AND (i.is_core
+               OR EXISTS (SELECT 1 FROM positions_fifo p WHERE p.instrument_id = i.id))
         ORDER BY i.id
         """
     )
-    cols = ("id", "broker_ticker", "isin", "currency", "instrument_type", "name", "is_core")
+    cols = ("id", "broker_ticker", "isin", "currency", "instrument_type", "name", "is_core",
+            "base_symbol", "multiplier", "multiplier_source")
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
@@ -250,11 +255,23 @@ def run_instrument_mapping(conn: psycopg.Connection) -> MappingSummary:
             instrument_type = inst["instrument_type"]
 
             if instrument_type == "future":
-                base_symbol, multiplier, note = futures_base_mapping(ticker)
-                cur.execute(
-                    "UPDATE instruments SET base_symbol = %s, multiplier = %s WHERE id = %s",
-                    (base_symbol, multiplier, instrument_id),
-                )
+                base_symbol, _override_multiplier, parse_note = futures_base_mapping(ticker)
+                # B-28: multiplier nigdy nie zapisywany przez mapowanie (źródło: sql/007);
+                # base_symbol tylko gdy NULL.
+                if base_symbol is not None:
+                    cur.execute(
+                        "UPDATE instruments SET base_symbol = %s WHERE id = %s AND base_symbol IS NULL",
+                        (base_symbol, instrument_id),
+                    )
+                multiplier = inst["multiplier"]
+                notes = []
+                if base_symbol is None:
+                    # nierozpoznany kod serii — nota z futures_base_mapping zostaje
+                    notes.append(parse_note)
+                    base_symbol = inst["base_symbol"]
+                if multiplier is None:
+                    notes.append("brak mnożnika ze źródłem — uzupełnij migracją (wzór sql/007)")
+                note = "; ".join(notes)
                 outcome = MappingOutcome(
                     instrument_id=instrument_id,
                     broker_ticker=ticker,
