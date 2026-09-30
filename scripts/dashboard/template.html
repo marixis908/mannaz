@@ -914,7 +914,12 @@
       box.appendChild(el("div", { cls: "label", text: "Naruszenia poziomu 1 (>1%)" }));
       var v = el("div", { cls: "value" });
       if (risk.level1_breach_count === null) { v.appendChild(naSpan()); }
-      else { v.textContent = String(risk.level1_breach_count); }
+      else {
+        v.textContent = String(risk.level1_breach_count);
+        if (risk.level1_incomplete_count > 0) {
+          v.appendChild(el("span", { cls: "tag bad", text: " + " + risk.level1_incomplete_count + " niepełne" }));
+        }
+      }
       box.appendChild(v);
       return box;
     })());

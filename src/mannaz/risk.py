@@ -491,6 +491,59 @@ def is_risk_budget_eligible(instrument_type: str, is_core: bool) -> bool:
 
 
 @dataclass
+class Level1Name:
+    """Poziom 1 per NAZWA (B-32) — wspólna prezentacja dla raportu i dashboardu."""
+
+    name_key: Hashable
+    label: str
+    pct: Decimal | None
+    breach: bool | None
+    incomplete: bool
+    # (broker_ticker, settlement_currency, risk_pct_satellite_capital wiersza)
+    members: list[tuple[str, str | None, Decimal | None]]
+
+
+def level1_by_name(items, labels: dict | None = None) -> list[Level1Name]:
+    """`items` = krotki `(name_key, eligible, broker_ticker, settlement_currency,
+    row_pct, name_pct, level1_breach)`. Tylko wiersze eligible. `name_key` None →
+    każdy wiersz własną nazwą. Nazwa niepełna (którykolwiek wiersz z
+    `name_pct` None) → pct/breach None, incomplete=True (B-19: nigdy „brak
+    przekroczenia”). Sortowanie: pełne malejąco po pct, potem niepełne."""
+    groups: dict[Any, list[tuple]] = {}
+    for idx, it in enumerate(items):
+        name_key, eligible, ticker, cur, row_pct, name_pct, breach = it
+        if not eligible:
+            continue
+        gk = name_key if name_key is not None else ("__row__", idx)
+        groups.setdefault(gk, []).append((name_key, ticker, cur, row_pct, name_pct, breach))
+    out: list[Level1Name] = []
+    for gk, rows in groups.items():
+        name_key = rows[0][0]
+        label = (labels or {}).get(name_key) if name_key is not None else None
+        if label is None:
+            label = rows[0][1]
+        members = [(t, c, rp) for _, t, c, rp, _, _ in rows]
+        incomplete = any(r[4] is None for r in rows)
+        if incomplete:
+            pct, breach = None, None
+        else:
+            pct = rows[0][4]
+            breach = any(r[5] is True for r in rows)
+        out.append(
+            Level1Name(
+                name_key=name_key if name_key is not None else gk,
+                label=label,
+                pct=pct,
+                breach=breach,
+                incomplete=incomplete,
+                members=members,
+            )
+        )
+    out.sort(key=lambda n: (n.pct is None, -(n.pct or Decimal(0))))
+    return out
+
+
+@dataclass
 class RiskBudgetAggregateResult:
     satellite_risk_total: Decimal
     total_risk_pct: Decimal | None

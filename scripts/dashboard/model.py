@@ -515,6 +515,35 @@ def count_level1_breaches(rows: list[dict[str, Any]]) -> int:
     return sum(1 for r in rows if r.get("level1_breach"))
 
 
+def _level1_names(rows: list[dict[str, Any]], is_eligible):
+    from mannaz.risk import level1_by_name  # jedna definicja, jak is_risk_budget_eligible
+
+    items = [
+        (
+            r.get("name_key"),
+            is_eligible(r["instrument_type"], r["is_core"]),
+            r.get("broker_ticker") or str(r.get("instrument_id")),
+            r.get("settlement_currency"),
+            r.get("risk_pct_satellite_capital"),
+            r.get("name_risk_pct"),
+            r.get("level1_breach"),
+        )
+        for r in rows
+    ]
+    labels = {r["name_key"]: r["name_label"] for r in rows if r.get("name_key") is not None and r.get("name_label")}
+    return level1_by_name(items, labels)
+
+
+def count_level1_name_breaches(rows: list[dict[str, Any]], is_eligible) -> int:
+    """B-32: liczba NAZW (nie wierszy) z przekroczeniem poziomu 1; nazwy
+    niepełne nie są liczone jako czyste — patrz `count_level1_incomplete_names`."""
+    return sum(1 for n in _level1_names(rows, is_eligible) if n.breach)
+
+
+def count_level1_incomplete_names(rows: list[dict[str, Any]], is_eligible) -> int:
+    return sum(1 for n in _level1_names(rows, is_eligible) if n.incomplete)
+
+
 def price_coverage(rows: list[dict[str, Any]], is_eligible) -> tuple[int, int]:
     """n = wiersze SAT+FUT z close_d IS NOT NULL, N = wszystkie SAT+FUT na D
     ryzyka (kontrakt §5)."""

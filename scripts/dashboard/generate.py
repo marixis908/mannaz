@@ -404,9 +404,11 @@ def _fetch_risk_rows(cur, d_risk: date) -> list[dict[str, Any]]:
                r.risk_state, r.stop_effective, r.stop_source, r.risk_pct_satellite_capital,
                r.level1_breach, r.multiplier_missing, r.close_d, r.regime, r.warning,
                r.risk_pln, r.note, r.computed_at, r.price_is_stale, r.price_date_used,
-               i.instrument_type, i.is_core, i.theme
+               i.instrument_type, i.is_core, i.theme,
+               r.name_key, r.name_risk_pct, n.broker_ticker AS name_label, i.broker_ticker
         FROM risk_daily r
         JOIN instruments i ON i.id = r.instrument_id
+        LEFT JOIN instruments n ON n.id = r.name_key
         WHERE r.risk_date = %s
         """,
         (d_risk,),
@@ -417,6 +419,7 @@ def _fetch_risk_rows(cur, d_risk: date) -> list[dict[str, Any]]:
         "level1_breach", "multiplier_missing", "close_d", "regime", "warning",
         "risk_pln", "note", "computed_at", "price_is_stale", "price_date_used",
         "instrument_type", "is_core", "theme",
+        "name_key", "name_risk_pct", "name_label", "broker_ticker",
     )
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
@@ -459,6 +462,7 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
         risk_by_key: dict[tuple, dict[str, Any]] = {}
         sum_open_risk_pct = None
         level1_breach_count = None
+        level1_incomplete_count = None
         price_cov_n = price_cov_N = None
         risk_stale_n = risk_stale_N = None
         theme_budgets: dict[str, Decimal] | None = None
@@ -467,7 +471,8 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
             for rr in risk_rows:
                 risk_by_key[(rr["rachunek"], rr["instrument_id"], rr["settlement_currency"])] = rr
             sum_open_risk_pct = model.sum_open_risk_pct(risk_rows, is_risk_budget_eligible)
-            level1_breach_count = model.count_level1_breaches(risk_rows)
+            level1_breach_count = model.count_level1_name_breaches(risk_rows, is_risk_budget_eligible)
+            level1_incomplete_count = model.count_level1_incomplete_names(risk_rows, is_risk_budget_eligible)
             price_cov_n, price_cov_N = model.price_coverage(risk_rows, is_risk_budget_eligible)
             risk_stale_n, risk_stale_N = model.count_stale_risk_rows(risk_rows, is_risk_budget_eligible)
             theme_budgets = model.group_risk_pct_by_theme(risk_rows, is_risk_budget_eligible)
@@ -645,6 +650,7 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
                 "provenance": asdict(provenance),
                 "sum_open_risk_pct": sum_open_risk_pct,
                 "level1_breach_count": level1_breach_count,
+                "level1_incomplete_count": level1_incomplete_count,
                 "price_coverage": {"n": price_cov_n, "N": price_cov_N} if provenance.passed else None,
                 "stale_coverage": {"n": risk_stale_n, "N": risk_stale_N} if provenance.passed else None,
                 "theme_budgets": theme_budgets,

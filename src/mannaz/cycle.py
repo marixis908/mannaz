@@ -39,7 +39,9 @@ from mannaz.prices import PricesSummary, run_prices_fetch
 from mannaz.risk import (
     IncompleteRiskDateError,
     IncompleteRiskItem,
+    Level1Name,
     RiskSummary,
+    level1_by_name,
     _default_calendar_facts,
     is_risk_budget_eligible,
     resolve_default_risk_date,
@@ -708,15 +710,34 @@ class RiskReportAggregates:
     # Kontrakty HIGH — poza `high_risk_capital_pct` (ich nominał nie wchodzi
     # do C, patrz `_satellite_capital_eligible`), wymienione osobno w raporcie.
     high_risk_contract_tickers: list[str] = field(default_factory=list)
+    # B-32: poziom 1 per NAZWĘ (puste → stara linia per wiersz w raporcie).
+    level1_names: list[Level1Name] = field(default_factory=list)
 
     @classmethod
-    def from_risk_summary(cls, summary: RiskSummary) -> "RiskReportAggregates":
-        eligible_rows = [r for r in summary.rows if r.risk_pct_satellite_capital is not None]
-        if eligible_rows:
-            top = max(eligible_rows, key=lambda r: r.risk_pct_satellite_capital)
-            level1_max_ticker, level1_max_pct = top.broker_ticker, top.risk_pct_satellite_capital
+    def from_risk_summary(
+        cls, summary: RiskSummary, name_labels: dict[int, str] | None = None
+    ) -> "RiskReportAggregates":
+        level1_names = level1_by_name(
+            [
+                (
+                    r.name_key,
+                    is_risk_budget_eligible(r.instrument_type, r.is_core),
+                    r.broker_ticker,
+                    r.settlement_currency,
+                    r.risk_pct_satellite_capital,
+                    r.name_risk_pct,
+                    r.level1_breach,
+                )
+                for r in summary.rows
+            ],
+            name_labels,
+        )
+        full_names = [n for n in level1_names if not n.incomplete]
+        if full_names:
+            level1_max_ticker, level1_max_pct = full_names[0].label, full_names[0].pct
         else:
             level1_max_ticker, level1_max_pct = None, None
+        level1_breach_labels = [n.label for n in full_names if n.breach]
         theme_ranking = sorted(
             ((t, r.risk_pct, r.breach) for t, r in summary.theme_budgets.items()),
             key=lambda t: (t[1] is None, -(t[1] or Decimal(0))),
@@ -753,7 +774,8 @@ class RiskReportAggregates:
             heat_pct_zagraniczny=summary.total_risk_pct_zagraniczny_satellite_capital,
             level1_max_ticker=level1_max_ticker,
             level1_max_pct=level1_max_pct,
-            level1_breach_tickers=list(summary.level1_breach_tickers),
+            level1_breach_tickers=level1_breach_labels,
+            level1_names=level1_names,
             theme_ranking=theme_ranking,
             level3_breach=summary.level3_breach,
             capital_satelite_positions_pln=summary.capital_satelite_positions_pln,
@@ -975,6 +997,36 @@ def _render_stop_orders_section(state: ReportState) -> list[str]:
     return lines
 
 
+def _level1_composition(n: Level1Name) -> str:
+    return " + ".join(
+        f"{t}/{c} {format_pct(p)}" if c else f"{t} {format_pct(p)}" for t, c, p in n.members
+    )
+
+
+def _render_level1_by_name(names: list[Level1Name]) -> str:
+    full = [n for n in names if not n.incomplete]
+    incomplete = [n for n in names if n.incomplete]
+    if full:
+        top = full[0]
+        show = len(top.members) > 1 or top.members[0][0] != top.label
+        comp = f" ({_level1_composition(top)})" if show else ""
+        head = f"max {top.label} {format_pct(top.pct)}{comp}"
+    else:
+        head = "max brak"
+    breaches = [n for n in full if n.breach]
+    breach_txt = (
+        ", ".join(f"{n.label} {format_pct(n.pct)} ({_level1_composition(n)})" for n in breaches)
+        if breaches
+        else "brak"
+    )
+    line = f"- poziom 1 (per nazwa): {head}; przekroczenia > 1%: {breach_txt}"
+    if incomplete:
+        line += "; niepełne: " + ", ".join(
+            f"{n.label} ({', '.join(m[0] for m in n.members)})" for n in incomplete
+        )
+    return line
+
+
 def _render_risk_section(state: ReportState) -> list[str]:
     lines = ["## Ryzyko"]
     if STAGE_RISK in state.stage_not_executed or state.risk_aggregates is None:
@@ -983,10 +1035,13 @@ def _render_risk_section(state: ReportState) -> list[str]:
     a = state.risk_aggregates
     lines.append(f"- heat ogółem (% kapitału satelity): {format_pct(a.heat_pct_total)}")
     lines.append(f"- heat ZAGRANICZNY (% kapitału satelity): {format_pct(a.heat_pct_zagraniczny)}")
-    lines.append(
-        f"- poziom 1: max {a.level1_max_ticker or 'brak'} ({format_pct(a.level1_max_pct)}); "
-        f"przekroczenia > 1%: {', '.join(a.level1_breach_tickers) if a.level1_breach_tickers else 'brak'}"
-    )
+    if a.level1_names:
+        lines.append(_render_level1_by_name(a.level1_names))
+    else:
+        lines.append(
+            f"- poziom 1: max {a.level1_max_ticker or 'brak'} ({format_pct(a.level1_max_pct)}); "
+            f"przekroczenia > 1%: {', '.join(a.level1_breach_tickers) if a.level1_breach_tickers else 'brak'}"
+        )
     lines.append("- poziom 2 (tematy, próg > 3%):")
     if a.theme_ranking:
         for theme, pct, breach in a.theme_ranking:
@@ -1533,7 +1588,13 @@ def run_cycle(
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop() from exc
 
-        state.risk_aggregates = RiskReportAggregates.from_risk_summary(risk_summary)
+        name_ids = sorted({r.name_key for r in risk_summary.rows if r.name_key is not None})
+        name_labels: dict[int, str] = {}
+        if name_ids:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, broker_ticker FROM instruments WHERE id = ANY(%s)", (name_ids,))
+                name_labels = {i: t for i, t in cur.fetchall()}
+        state.risk_aggregates = RiskReportAggregates.from_risk_summary(risk_summary, name_labels)
 
         # Poprzednia ocena (D-1): stop_effective (M62) I risk_state (STOP §2,
         # M69 EVENT) na `prev_date` — jedno zapytanie, dwa słowniki. Z1a:
