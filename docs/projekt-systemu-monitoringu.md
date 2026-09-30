@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.6 · 2026-09-30**
+**Rewizja 4.7 · 2026-09-30**
 
 ---
 
@@ -31,7 +31,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.3 | 2026-09-27 | T27: forward-fill przy odczycie (`run_risk`), tabela cen tylko z realnymi sesjami, flaga nieświeżości i data użytej ceny w `risk_daily` (brief CC-U) |
 | 4.4 | 2026-09-27 | T12: zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie (T27); §8.2/§8.3: `prices_eod` → `prices_daily`, kolumny zgodne z bazą, bez `is_stale` (brief CC-I) |
 | 4.5 | 2026-09-27 | §23.2: etap lokalny — przebieg główny uruchamiany ręcznie przez ownera po wgraniu historii transakcji, raport lokalny zamiast Slacka i dead-mana; §22.3 T38: próg istotności zmiany zlecenia stop (brief CC-C) |
-| **4.6** | **2026-09-30** | **§25.3: kolumna „stan” faz F0–F6 z dowodami; kolejność przekrojami pionowymi od 2026-09-26; F0 warunkiem wejścia w F3 (decyzja ownera 2026-09-30)** |
+| 4.6 | 2026-09-30 | §25.3: kolumna „stan” faz F0–F6 z dowodami; kolejność przekrojami pionowymi od 2026-09-26; F0 warunkiem wejścia w F3 (decyzja ownera 2026-09-30) |
+| **4.7** | **2026-09-30** | **§19.2: poziom 1 liczony per nazwę = emitent — waluty rozliczenia i kontrakty na bazę pod jedną nazwą (decyzja ownera 6.3; B-30, brief CC-N)** |
 
 ### 0.3 Oznaczenia
 
@@ -970,6 +971,8 @@ Poziom 1: ryzyko pojedynczej nazwy   ≤ 1%  kapitału satelity
 Poziom 2: ryzyko tematu / czynnika   ≤ 3%
 Poziom 3: suma otwartych ryzyk       ≤ 15%
 ```
+
+**Nazwa = emitent:** poziom 1 sumuje ryzyko tej samej spółki we wszystkich walutach rozliczenia oraz kontraktów terminowych, dla których jest instrumentem bazowym (decyzja ownera 6.3; B-30).
 
 **M50.** Po przekroczeniu poziomu 3 system **nie proponuje dobrania — wyłącznie cięcia**. Przy 31 pozycjach po 1% suma to 31% kapitału, a stopy pękną razem, bo portfel ma dominujący czynnik wzrostowy o długim duration.
 
