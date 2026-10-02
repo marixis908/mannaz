@@ -6,6 +6,7 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 fx [--currencies USD EUR ...] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     python -m mannaz.run_p3 calendar
     python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
+    python -m mannaz.run_p3 satellite --from YYYY-MM-DD --to YYYY-MM-DD --out DIR [--account-values CSV] [--symbol-map CSV]
 
 Bez argumentów `--instrument-ids`/`--currencies`/`--start`/`--end`, `prices` i
 `fx` robią PEŁNE pobranie (wszystkie zmapowane instrumenty / wszystkie 9 walut,
@@ -42,6 +43,7 @@ from mannaz.instruments_map import run_instrument_mapping
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
 from mannaz.prices import run_prices_fetch
 from mannaz.risk import run_risk
+from mannaz.satellite import run_satellite
 
 
 def _parse_date(value: str) -> date:
@@ -187,6 +189,33 @@ def cmd_risk(args: argparse.Namespace) -> None:
     print(f"stale_capital_pct_kapital_satelity: {summary.stale_capital_pct}")
 
 
+def cmd_satellite(args: argparse.Namespace) -> None:
+    """E3 (brief CC-OS2, §21.6): ocena satelity jako calosci. Tylko SELECT
+    (`conn.read_only = True`); wyniki do `--out` (satellite.json, satellite.md,
+    benchmarks_cache.csv, ewentualnie prices_cache.csv). Wyłącznie agregaty."""
+    conn = get_connection()
+    try:
+        report = run_satellite(
+            conn,
+            args.date_from,
+            args.date_to,
+            args.out,
+            account_values=args.account_values,
+            symbol_map=args.symbol_map,
+        )
+    finally:
+        conn.close()
+    print(f"zakres: {report['d_from']} .. {report['d_to']} (S={report['S']}, T={report['T']})")
+    print(f"dni osi: {report['n_axis_days']}, niepelne: {report['n_incomplete_days']}")
+    print(f"dane zweryfikowane: {report['data_verified']} {report['data_unverified_reasons']}")
+    for name, win in report["windows"].items():
+        print(
+            f"okno {name}: {win['from']}..{win['to']} kompletne={win['complete']} "
+            f"mandat={win['mandate']['status']} werdykt={win['verdict']['label']}"
+        )
+    print(f"wyniki: {args.out}")
+
+
 def cmd_cycle(args: argparse.Namespace) -> None:
     conn = get_connection()
     try:
@@ -253,6 +282,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="D; domyslnie ostatnia sesja z kompletnymi close_split_adj dla satelity"
     )
     p_risk.set_defaults(func=cmd_risk)
+
+    p_sat = sub.add_parser("satellite", help="E3 — ocena satelity jako calosci (§21.6, tylko SELECT)")
+    p_sat.add_argument("--from", dest="date_from", type=_parse_date, required=True, help="poczatek osi dni (YYYY-MM-DD)")
+    p_sat.add_argument("--to", dest="date_to", type=_parse_date, required=True, help="koniec osi dni (YYYY-MM-DD)")
+    p_sat.add_argument("--out", type=Path, required=True, help="katalog wynikow")
+    p_sat.add_argument(
+        "--account-values", type=Path, default=None,
+        help="CSV migawek brokera (date,rachunek,currency,value) dla bramki M78"
+    )
+    p_sat.add_argument(
+        "--symbol-map", type=Path, default=None,
+        help="CSV broker_ticker,isin,yahoo_symbol,exchange_mic,currency dla instrumentow bez cen"
+    )
+    p_sat.set_defaults(func=cmd_satellite)
 
     p_cycle = sub.add_parser(
         "cycle", help="C2-C7 — cykl tygodniowy: import -> FIFO -> bramka rejestracji -> ceny/FX -> ryzyko -> raport"
