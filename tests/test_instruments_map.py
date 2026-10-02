@@ -273,3 +273,176 @@ def test_b28_equity_with_yahoo_symbol_untouched(map_conn, yf_calls):
         after = _row(cur, iid)
     assert after == before
     assert "B28SETEQ" not in yf_calls and "B28SETEQ.XX" not in yf_calls
+
+
+# ---------------------------------------------------------------------------
+# CC-OS2 M1: plan_mapping_from_file (czyste) + run_instrument_mapping_from_file
+# ---------------------------------------------------------------------------
+
+from mannaz.instruments_map import plan_mapping_from_file, run_instrument_mapping_from_file
+
+
+def _frow(iid, ticker, yahoo="", exchange="", before="", after=""):
+    return {"instrument_id": str(iid), "broker_ticker": ticker, "yahoo_symbol": yahoo,
+            "exchange": exchange, "currency_before": before, "currency_after": after}
+
+
+def _cur(ticker="AAA", yahoo=None, exchange=None, currency="PLN"):
+    return {"broker_ticker": ticker, "yahoo_symbol": yahoo, "exchange": exchange, "currency": currency}
+
+
+def test_plan_null_fields_get_set_positive_control():
+    plan = plan_mapping_from_file([_frow(1, "AAA", "AAA.WA", "GPW")], {1: _cur()})
+    assert not plan.errors and not plan.conflicts
+    got = {(c.instrument_id, c.column, c.before, c.after) for c in plan.changes}
+    assert got == {(1, "yahoo_symbol", None, "AAA.WA"), (1, "exchange", None, "GPW")}
+
+
+def test_plan_instrument_outside_file_untouched():
+    plan = plan_mapping_from_file([_frow(1, "AAA", "AAA.WA", "GPW")],
+                                  {1: _cur(), 2: _cur("BBB")})
+    assert {c.instrument_id for c in plan.changes} == {1}
+
+
+def test_plan_nonnull_equal_is_unchanged_and_different_is_conflict():
+    cur = {1: _cur(yahoo="AAA.WA", exchange="GPW"), 2: _cur("BBB", yahoo="B.DE", exchange="XETRA")}
+    plan = plan_mapping_from_file(
+        [_frow(1, "AAA", "AAA.WA", "GPW"), _frow(2, "BBB", "BBB.WA", "GPW")], cur)
+    assert plan.changes == []
+    assert len(plan.unchanged) == 2
+    assert len(plan.conflicts) == 2 and not plan.errors
+
+
+def test_plan_currency_changes_only_when_before_matches():
+    plan = plan_mapping_from_file([_frow(1, "AAA", before="PLN", after="USD")], {1: _cur(currency="PLN")})
+    assert [(c.column, c.before, c.after) for c in plan.changes] == [("currency", "PLN", "USD")]
+
+
+def test_plan_currency_conflict_when_before_mismatch():
+    plan = plan_mapping_from_file([_frow(1, "AAA", before="EUR", after="USD")], {1: _cur(currency="PLN")})
+    assert plan.changes == [] and len(plan.conflicts) == 1
+
+
+def test_plan_empty_currency_columns_no_change():
+    plan = plan_mapping_from_file([_frow(1, "AAA")], {1: _cur(currency="PLN")})
+    assert plan.changes == [] and not plan.conflicts and not plan.errors
+
+
+def test_plan_wrong_ticker_is_error_and_no_changes():
+    plan = plan_mapping_from_file([_frow(1, "ZZZ", "AAA.WA", "GPW")], {1: _cur()})
+    assert len(plan.errors) == 1 and plan.changes == []
+
+
+def test_plan_unknown_id_is_error():
+    plan = plan_mapping_from_file([_frow(9, "AAA", "AAA.WA", "GPW")], {1: _cur()})
+    assert len(plan.errors) == 1 and plan.changes == []
+
+
+def test_plan_exchange_outside_calendar_map_is_error():
+    plan = plan_mapping_from_file([_frow(1, "AAA", "AAA.WA", "MARS")], {1: _cur()})
+    assert len(plan.errors) == 1 and plan.changes == []
+
+
+def test_plan_duplicate_id_is_error_and_no_changes_for_id():
+    plan = plan_mapping_from_file(
+        [_frow(1, "AAA", "AAA.WA", "GPW"), _frow(1, "AAA", "AAA.WA", "GPW")], {1: _cur()})
+    assert len(plan.errors) == 1 and plan.changes == []
+
+
+def test_plan_only_three_columns_ever_changed():
+    plan = plan_mapping_from_file(
+        [_frow(1, "AAA", "AAA.WA", "GPW", "PLN", "EUR")], {1: _cur()})
+    assert {c.column for c in plan.changes} <= {"yahoo_symbol", "exchange", "currency"}
+    assert len(plan.changes) == 3
+
+
+def test_run_p3_parser_map_from_file_and_dry_run():
+    from pathlib import Path
+    from mannaz.run_p3 import build_parser
+
+    p = build_parser()
+    a = p.parse_args(["map", "--from-file", "x.csv", "--dry-run"])
+    assert a.from_file == Path("x.csv") and a.dry_run is True
+    b = p.parse_args(["map"])
+    assert b.from_file is None and b.dry_run is False
+
+
+def _write_csv(tmp_path, lines):
+    f = tmp_path / "map.csv"
+    f.write_text("instrument_id,broker_ticker,yahoo_symbol,exchange,currency_before,currency_after\n"
+                 + "\n".join(lines) + "\n", encoding="utf-8")
+    return f
+
+
+@pytest.mark.db
+def test_from_file_writes_only_listed_null_fields(map_conn, tmp_path):
+    with map_conn.cursor() as cur:
+        a = _insert_instrument(cur, "OS2NULL", "equity", name="Orig A", currency="PLN")
+        b = _insert_instrument(cur, "OS2SET", "equity", yahoo_symbol="OS2SET.XX", currency="EUR",
+                               exchange="XETRA", name="Orig B")
+        before_a, before_b = _row(cur, a), _row(cur, b)
+        f = _write_csv(tmp_path, [f"{a},OS2NULL,OS2NULL.WA,GPW,,"])
+        plan = run_instrument_mapping_from_file(map_conn, f, dry_run=False, commit=False)
+        after_a, after_b = _row(cur, a), _row(cur, b)
+    assert len(plan.changes) == 2 and not plan.errors and not plan.conflicts
+    assert after_a[0] == "OS2NULL.WA" and after_a[2] == "GPW"
+    assert (after_a[1], after_a[3:]) == (before_a[1], before_a[3:])
+    assert after_b == before_b
+
+
+@pytest.mark.db
+def test_from_file_dry_run_changes_nothing(map_conn, tmp_path):
+    with map_conn.cursor() as cur:
+        a = _insert_instrument(cur, "OS2DRY", "equity", name="Orig A", currency="PLN")
+        before = _row(cur, a)
+        f = _write_csv(tmp_path, [f"{a},OS2DRY,OS2DRY.WA,GPW,,"])
+        plan = run_instrument_mapping_from_file(map_conn, f, dry_run=True, commit=False)
+        after = _row(cur, a)
+    assert len(plan.changes) == 2
+    assert after == before
+
+
+@pytest.mark.db
+def test_cli_map_from_file_commit_visible_from_new_connection(tmp_path, capsys):
+    """Sciezka CLI (run_p3 map --from-file) utrwala zapis: osobne, nowe polaczenie
+    widzi zmiane. Jedyny test, ktory commituje — syntetyczny instrument jest
+    usuwany (commit) w finally."""
+    import uuid
+
+    from mannaz.run_p3 import main as run_p3_main
+
+    try:
+        setup = get_connection()
+    except Exception as exc:
+        pytest.skip(f"mannaz.db.get_connection() niedostepne: {exc}")
+        return
+    ticker = f"OS2CLI{uuid.uuid4().hex[:8].upper()}"
+    iid = None
+    try:
+        with setup.cursor() as cur:
+            cur.execute(
+                "INSERT INTO instruments (broker_ticker, name, currency, instrument_type) "
+                "VALUES (%s, 'SYNTH CLI', 'EUR', 'equity') RETURNING id",
+                (ticker,),
+            )
+            iid = cur.fetchone()[0]
+        setup.commit()
+
+        f = _write_csv(tmp_path, [f"{iid},{ticker},{ticker}.WA,GPW,EUR,USD"])
+        run_p3_main(["map", "--from-file", str(f)])
+        assert "mode: WRITE" in capsys.readouterr().out
+
+        fresh = get_connection()
+        try:
+            with fresh.cursor() as cur:
+                cur.execute("SELECT yahoo_symbol, exchange, currency FROM instruments WHERE id = %s", (iid,))
+                assert cur.fetchone() == (f"{ticker}.WA", "GPW", "USD")
+        finally:
+            fresh.close()
+    finally:
+        setup.rollback()
+        if iid is not None:
+            with setup.cursor() as cur:
+                cur.execute("DELETE FROM instruments WHERE id = %s AND broker_ticker = %s", (iid, ticker))
+            setup.commit()
+        setup.close()

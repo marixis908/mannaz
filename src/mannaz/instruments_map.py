@@ -360,3 +360,199 @@ def run_instrument_mapping(conn: psycopg.Connection) -> MappingSummary:
         conn.commit()
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Kontrolowany zapis mapowania z zatwierdzonego pliku CSV (brief CC-OS2, M1)
+#
+# Tylko kolumny yahoo_symbol / exchange / currency; zmiana wyłącznie gdy
+# warunek planu jest spełniony (NULL albo currency == currency_before).
+# Nigdy instrument_type / name / base_symbol / multiplier. Zero sieci.
+# ---------------------------------------------------------------------------
+
+MAPPING_FILE_COLUMNS = (
+    "instrument_id",
+    "broker_ticker",
+    "yahoo_symbol",
+    "exchange",
+    "currency_before",
+    "currency_after",
+)
+
+
+@dataclass
+class PlannedChange:
+    instrument_id: int
+    broker_ticker: str
+    column: str  # 'yahoo_symbol' | 'exchange' | 'currency'
+    before: str | None
+    after: str
+
+
+@dataclass
+class MappingPlan:
+    changes: list[PlannedChange] = field(default_factory=list)
+    unchanged: list[tuple[int, str, str]] = field(default_factory=list)  # (id, ticker, kolumna)
+    conflicts: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def counts_per_column(self) -> dict[str, int]:
+        out = {"yahoo_symbol": 0, "exchange": 0, "currency": 0}
+        for c in self.changes:
+            out[c.column] += 1
+        return out
+
+
+def read_mapping_file(path) -> list[dict[str, str]]:
+    """Czyta CSV (UTF-8, nagłówek). ValueError gdy brakuje wymaganej kolumny."""
+    import csv
+
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        missing = [c for c in MAPPING_FILE_COLUMNS if c not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"brak kolumn w pliku mapowania: {missing}")
+        return [dict(r) for r in reader]
+
+
+def _s(value: Any) -> str:
+    return (value or "").strip()
+
+
+def plan_mapping_from_file(
+    file_rows: list[dict[str, Any]], current: dict[int, dict[str, Any]]
+) -> MappingPlan:
+    from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
+
+    plan = MappingPlan()
+    parsed: list[tuple[int, int, dict[str, Any]]] = []  # (nr wiersza, id, wiersz)
+    seen: dict[int, int] = {}
+    dup_ids: set[int] = set()
+
+    for n, row in enumerate(file_rows, start=2):  # wiersz 1 = nagłówek
+        raw_id = _s(row.get("instrument_id"))
+        try:
+            iid = int(raw_id)
+        except ValueError:
+            plan.errors.append(f"wiersz {n}: niepoprawne instrument_id={raw_id!r}")
+            continue
+        if iid in seen:
+            dup_ids.add(iid)
+            plan.errors.append(f"wiersz {n}: zdublowane instrument_id={iid} (pierwszy w wierszu {seen[iid]})")
+            continue
+        seen[iid] = n
+        parsed.append((n, iid, row))
+
+    for n, iid, row in parsed:
+        if iid in dup_ids:
+            continue  # zero zmian dla zdublowanego id
+        cur = current.get(iid)
+        if cur is None:
+            plan.errors.append(f"wiersz {n}: instrument_id={iid} nie istnieje w bazie")
+            continue
+        ticker = _s(row.get("broker_ticker"))
+        if ticker != cur["broker_ticker"]:
+            plan.errors.append(
+                f"wiersz {n}: id={iid} broker_ticker w pliku {ticker!r} != baza {cur['broker_ticker']!r}"
+            )
+            continue
+
+        file_yahoo = _s(row.get("yahoo_symbol"))
+        file_exchange = _s(row.get("exchange"))
+        cur_before = _s(row.get("currency_before"))
+        cur_after = _s(row.get("currency_after"))
+
+        if file_exchange and file_exchange not in EXCHANGE_TO_CALENDAR_CODE:
+            plan.errors.append(
+                f"wiersz {n}: id={iid} exchange {file_exchange!r} spoza EXCHANGE_TO_CALENDAR_CODE"
+            )
+            continue
+        if bool(cur_before) != bool(cur_after):
+            plan.errors.append(
+                f"wiersz {n}: id={iid} currency_before i currency_after muszą być podane razem"
+            )
+            continue
+
+        row_changes: list[PlannedChange] = []
+        for column, wanted in (("yahoo_symbol", file_yahoo), ("exchange", file_exchange)):
+            if not wanted:
+                continue
+            have = cur.get(column)
+            if have is None:
+                row_changes.append(PlannedChange(iid, ticker, column, None, wanted))
+            elif have == wanted:
+                plan.unchanged.append((iid, ticker, column))
+            else:
+                plan.conflicts.append(
+                    f"wiersz {n}: id={iid} {ticker} {column}: baza {have!r} != plik {wanted!r}"
+                )
+
+        if cur_before and cur_after:
+            have = cur.get("currency")
+            if have == cur_before:
+                if cur_after != have:
+                    row_changes.append(PlannedChange(iid, ticker, "currency", have, cur_after))
+                else:
+                    plan.unchanged.append((iid, ticker, "currency"))
+            else:
+                plan.conflicts.append(
+                    f"wiersz {n}: id={iid} {ticker} currency: baza {have!r} != currency_before {cur_before!r}"
+                )
+
+        plan.changes.extend(row_changes)
+
+    return plan
+
+
+_MAPPING_UPDATE_SQL = {
+    "yahoo_symbol": ("UPDATE instruments SET yahoo_symbol = %s WHERE id = %s AND yahoo_symbol IS NULL", False),
+    "exchange": ("UPDATE instruments SET exchange = %s WHERE id = %s AND exchange IS NULL", False),
+    "currency": ("UPDATE instruments SET currency = %s WHERE id = %s AND currency = %s", True),
+}
+
+
+def run_instrument_mapping_from_file(
+    conn: psycopg.Connection, path, dry_run: bool = True, commit: bool = True
+) -> MappingPlan:
+    """Plan z pliku + (gdy dry_run=False) zapis. SELECT tylko dla id z pliku.
+    Przy błędach/konfliktach w planie nic nie jest zapisywane (rollback).
+    rowcount != 1 dla zmiany -> rollback całości i RuntimeError."""
+    rows = read_mapping_file(path)
+    ids: list[int] = []
+    for r in rows:
+        try:
+            ids.append(int(_s(r.get("instrument_id"))))
+        except ValueError:
+            pass
+    current: dict[int, dict[str, Any]] = {}
+    with conn.cursor() as cur:
+        if ids:
+            cur.execute(
+                "SELECT id, broker_ticker, yahoo_symbol, exchange, currency "
+                "FROM instruments WHERE id = ANY(%s)",
+                (sorted(set(ids)),),
+            )
+            for iid, bt, ys, ex, cc in cur.fetchall():
+                current[iid] = {"broker_ticker": bt, "yahoo_symbol": ys, "exchange": ex, "currency": cc}
+
+        plan = plan_mapping_from_file(rows, current)
+
+        # dry_run / bledy / konflikty: tylko SELECT, bez rollbacku — rollback na
+        # wspoldzielonym polaczeniu wycofalby tez otwarta prace wywolujacego.
+        if dry_run or plan.errors or plan.conflicts:
+            return plan
+
+        # conn.transaction(): w otwartej transakcji wywolujacego to SAVEPOINT —
+        # wyjatek (np. rowcount != 1) wycofuje wylacznie zmiany tej funkcji.
+        with conn.transaction():
+            for ch in plan.changes:
+                sql, with_before = _MAPPING_UPDATE_SQL[ch.column]
+                params = (ch.after, ch.instrument_id, ch.before) if with_before else (ch.after, ch.instrument_id)
+                cur.execute(sql, params)
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        f"UPDATE {ch.column} dla id={ch.instrument_id}: rowcount={cur.rowcount}, oczekiwano 1"
+                    )
+    if commit:
+        conn.commit()
+    return plan

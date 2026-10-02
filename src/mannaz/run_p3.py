@@ -39,7 +39,7 @@ from mannaz.cycle import (
 from mannaz.db import get_connection
 from mannaz.fx import DEFAULT_START as FX_DEFAULT_START
 from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
-from mannaz.instruments_map import run_instrument_mapping
+from mannaz.instruments_map import run_instrument_mapping, run_instrument_mapping_from_file
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
 from mannaz.prices import run_prices_fetch
 from mannaz.risk import run_risk
@@ -50,7 +50,39 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def cmd_map_from_file(args: argparse.Namespace) -> None:
+    conn = get_connection()
+    try:
+        plan = run_instrument_mapping_from_file(
+            conn, args.from_file, dry_run=args.dry_run, commit=True
+        )
+    finally:
+        conn.close()
+    counts = plan.counts_per_column()
+    mode = "DRY-RUN" if args.dry_run else "WRITE"
+    print(f"mode: {mode}")
+    print(
+        f"changes: {len(plan.changes)} (yahoo_symbol={counts['yahoo_symbol']} "
+        f"exchange={counts['exchange']} currency={counts['currency']})"
+    )
+    print(f"unchanged: {len(plan.unchanged)}")
+    print(f"conflicts: {len(plan.conflicts)}")
+    for c in plan.conflicts:
+        print(f"  CONFLICT {c}")
+    print(f"errors: {len(plan.errors)}")
+    for e in plan.errors:
+        print(f"  ERROR {e}")
+    for ch in plan.changes:
+        print(f"  CHANGE id={ch.instrument_id} ticker={ch.broker_ticker} {ch.column}: {ch.before} -> {ch.after}")
+    if (plan.errors or plan.conflicts) and not args.dry_run:
+        print("plan ma bledy/konflikty -> nic nie zapisano")
+        sys.exit(1)
+
+
 def cmd_map(args: argparse.Namespace) -> None:
+    if getattr(args, "from_file", None) is not None:
+        cmd_map_from_file(args)
+        return
     conn = get_connection()
     try:
         summary = run_instrument_mapping(conn)
@@ -255,6 +287,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_map = sub.add_parser(
         "map", help="P3.1 — mapowanie instruments.yahoo_symbol/currency/exchange/instrument_type/name"
     )
+    p_map.add_argument("--from-file", type=Path, default=None,
+                       help="CSV z zatwierdzonym mapowaniem (zapis kontrolowany, tylko yahoo_symbol/exchange/currency)")
+    p_map.add_argument("--dry-run", action="store_true",
+                       help="z --from-file: tylko plan, zero zapisu")
     p_map.set_defaults(func=cmd_map)
 
     p_prices = sub.add_parser("prices", help="P3.2 — pobranie prices_daily")
