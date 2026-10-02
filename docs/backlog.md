@@ -47,3 +47,4 @@ i uzupełnia datę — wiersz zostaje.
 | B-40 | Rewizja 4.9 dokumentu: T41 = 35%, T43 = 20%, T44, M88, M89, M83, §28 pytanie 4 | zamknięte | 2026-10-02 | 2026-10-02 | brief CC-OS2, część D; decyzje ownera 2026-10-02 |
 | B-41 | risk.py:1532-1555 stop_2n moze laczyc cene wejscia w walucie rozliczenia z ATR w walucie notowania; dotyczy otwartych CSU, GRAB, META; heat i M50 potencjalnie bledne | otwarte | 2026-10-02 | | raport-OS2 §6 |
 | B-42 | Import eksportu CSV z TradingView do prices_daily (zrodlo dozwolone w instrukcji projektu); po nim zastapic wycene modelowa SHO 2025-01-07..2026-07-16 cenami rzeczywistymi | otwarte | 2026-10-02 | | raport-OS2 §7 |
+| B-43 | Rew. 4.10: T45 - wycena modelowa instrumentow bez notowan w zrodlach systemu (zakres rozszerzony 2026-10-02 o SHO), odcinkami liniowa miedzy cenami transakcyjnymi, wykup = kwota / ilosc, flaga, prog 10% | otwarte | 2026-10-02 | | raport-OS2 §7 |
