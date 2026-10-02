@@ -48,6 +48,9 @@ CALENDAR_CODES_AXIS = ("XWAR", "XNYS", "XETR")
 BENCHMARK_SYMBOLS = {"sp500": "SXR8.DE", "spyi": "SPYI.DE"}
 BENCHMARK_LABELS = {"sp500": "S&P 500 TR (SXR8.DE)", "spyi": "SPYI (SPYI.DE)"}
 PRICE_TAIL = 45  # ile ostatnich cen <= D przekazywac do resolve_price_on_d
+MODEL_SHARE_LIMIT = 0.10  # T45: dzienny udzial wyceny modelowej w NAV powyzej -> dane niezweryfikowane
+MODEL_POINT_ROW_TYPES = ("kupno", "sprzedaz", "zamiana_wydanie", "zamiana_przyjecie")
+NEAR_LIMIT_PP = 0.01  # skladnik mandatu blizej limitu niz 1 pp -> wynik wrazliwy na wycene modelowa
 
 # ---------------------------------------------------------------------------
 # (A) Klasyfikator przeplywow (M80)
@@ -171,7 +174,7 @@ class PositionInput:
     qty: float  # warstwa "na D"
     layer_factor: float  # risk.layer_factor_after (ilosc -> warstwa split_adj)
     price: float | None  # close_split_adj (x pence), None gdy brak
-    price_status: str  # 'ok' | 'stale' | 'incomplete'
+    price_status: str  # 'ok' | 'stale' | 'incomplete' | 'model' (T45)
     price_reason: str | None
     quote_fx: float | None  # kurs waluty notowania -> PLN
     settle_fx: float | None  # kurs waluty rozliczenia -> PLN
@@ -194,6 +197,53 @@ class NavResult:
     cash_native: dict[tuple[str, str], float] = field(default_factory=dict)
     cash_missing: list[tuple[str, str]] = field(default_factory=list)  # (grupa, waluta) bez wyceny srodkow
     rates: dict[str, float] = field(default_factory=dict)  # waluta -> kurs PLN uzyty w dniu
+    model_value_pln: float = 0.0  # T45: czesc NAV z wyceny modelowej (pozycje satelity)
+    model_tickers: list[str] = field(default_factory=list)
+
+    @property
+    def model_share(self) -> float | None:
+        """Udzial wyceny modelowej w NAV (None gdy NAV niepelny albo <= 0)."""
+        if self.value is None or self.value <= 0:
+            return None
+        return self.model_value_pln / self.value
+
+
+def model_curve(
+    points: Sequence[tuple[date, float, float]], first_quote: tuple[date, float] | None = None
+) -> tuple[list[date], list[float]]:
+    """T45: punkty wyceny modelowej (data, ilosc, cena w warstwie split_adj i
+    walucie notowania). Kilka punktow jednego dnia -> srednia wazona |ilosc|.
+    `first_quote` (data, cena) pierwszego notowania zamyka krzywa; punkty od
+    tej daty sa pomijane (dalej obowiazuja notowania)."""
+    by_day: dict[date, list[tuple[float, float]]] = {}
+    for d, qty, price in points:
+        if first_quote is not None and d >= first_quote[0]:
+            continue
+        if not qty or not price or price <= 0:
+            continue
+        by_day.setdefault(d, []).append((abs(qty), price))
+    dates = sorted(by_day)
+    prices = [sum(q * p for q, p in by_day[d]) / sum(q for q, _ in by_day[d]) for d in dates]
+    if first_quote is not None:
+        dates.append(first_quote[0])
+        prices.append(first_quote[1])
+    return dates, prices
+
+
+def model_price_on(curve: tuple[list[date], list[float]], d: date) -> float | None:
+    """T45: cena modelowa na D — odcinkami liniowo miedzy kolejnymi punktami
+    (po dniach kalendarzowych). Przed pierwszym i za ostatnim punktem -> None
+    (bez ekstrapolacji)."""
+    dates, prices = curve
+    k = bisect.bisect_right(dates, d)
+    if k == 0:
+        return None
+    if dates[k - 1] == d:
+        return prices[k - 1]
+    if k == len(dates):
+        return None
+    d0, d1 = dates[k - 1], dates[k]
+    return prices[k - 1] + (prices[k] - prices[k - 1]) * (d - d0).days / (d1 - d0).days
 
 
 def nav_for_day(
@@ -221,6 +271,8 @@ def nav_for_day(
     rates: dict[str, float] = {"PLN": 1.0, **{c: r for c, r in fx.items() if r is not None}}
     core_complete = True
     partial = 0.0
+    model_pln = 0.0
+    model_tickers: list[str] = []
 
     for p in positions:
         key = (account_group(p.rachunek), p.currency)
@@ -241,6 +293,9 @@ def nav_for_day(
             continue
         if p.price_status == "stale":
             stale.append(p.ticker)
+        elif p.price_status == "model":
+            model_pln += value_pln
+            model_tickers.append(p.ticker)
         by_pln[key] = by_pln.get(key, 0.0) + value_pln
         if native is not None:
             by_native[key] = by_native.get(key, 0.0) + native
@@ -284,6 +339,8 @@ def nav_for_day(
         cash_native=cash_native,
         cash_missing=cash_missing,
         rates=rates,
+        model_value_pln=model_pln,
+        model_tickers=sorted(model_tickers),
     )
 
 
@@ -741,6 +798,8 @@ class Inputs:
     positions_by_day: dict[date, list[dict[str, Any]]]  # positions_as_of per dzien compute_days
     warnings: list[str] = field(default_factory=list)
     no_price_tickers: list[str] = field(default_factory=list)
+    # T45: krzywe wyceny modelowej (split_adj, waluta notowania) dla dni przed pierwszym notowaniem
+    model_curves: dict[int, tuple[list[date], list[float]]] = field(default_factory=dict)
 
 
 def build_axis(d_from: date, d_to: date, codes: Sequence[str] = CALENDAR_CODES_AXIS) -> list[date]:
@@ -959,6 +1018,10 @@ def load_inputs(
                 info.calendar_code = m["exchange_mic"]
         no_price_tickers = sorted(instruments[i].ticker for i in no_price_ids if not prices.get(i))
 
+    model_curves = build_model_curves(
+        tx_rows, instruments, prices, layer_events, fx, positions_by_day, held_ids
+    )
+
     return Inputs(
         axis=axis,
         compute_days=compute_days,
@@ -971,7 +1034,65 @@ def load_inputs(
         positions_by_day=positions_by_day,
         warnings=warnings,
         no_price_tickers=no_price_tickers,
+        model_curves=model_curves,
     )
+
+
+def build_model_curves(
+    tx_rows: Sequence[TxRow],
+    instruments: dict[int, InstrumentInfo],
+    prices: dict[int, tuple[list[date], list[float]]],
+    layer_events: dict[int, list[dict[str, Any]]],
+    fx: dict[str, tuple[list[date], list[float]]],
+    positions_by_day: dict[date, list[dict[str, Any]]],
+    held_ids: set[int],
+) -> dict[int, tuple[list[date], list[float]]]:
+    """T45: krzywe wyceny modelowej dla instrumentow trzymanych w oknie (bez
+    kontraktow). Punkty: ceny transakcyjne (MODEL_POINT_ROW_TYPES), wykup
+    certyfikatow = kwota / ilosc trzymana w poprzednim dniu liczenia, oraz
+    pierwsze notowanie jako punkt koncowy. Ceny przeliczane do waluty
+    notowania (NBP A z dnia punktu) i do warstwy split_adj (/ layer_factor)."""
+    pos_days = sorted(positions_by_day)
+    points: dict[int, list[tuple[date, float, float]]] = {}
+    for r in tx_rows:
+        iid = r.instrument_id
+        if iid is None or iid not in held_ids or iid not in instruments:
+            continue
+        info = instruments[iid]
+        if info.instrument_type == "future":
+            continue
+        if r.row_type in MODEL_POINT_ROW_TYPES and r.qty and r.price:
+            qty, price = r.qty, r.price
+        elif r.row_type == "wykup_certyfikatow":
+            k = bisect.bisect_left(pos_days, r.date)
+            if k == 0:
+                continue
+            qty = sum(float(p["qty"]) for p in positions_by_day[pos_days[k - 1]] if p["instrument_id"] == iid)
+            if not qty:
+                continue
+            price = r.amount / qty
+        else:
+            continue
+        quote = info.quote_currency or r.currency
+        if quote != r.currency:
+            f_tx, f_q = fx_on(fx, r.currency, r.date), fx_on(fx, quote, r.date)
+            if f_tx is None or not f_q:
+                continue
+            price = price * f_tx / f_q
+        layer = float(_risk.layer_factor_after(layer_events.get(iid, []), r.date))
+        points.setdefault(iid, []).append((r.date, qty, price / layer))
+    curves: dict[int, tuple[list[date], list[float]]] = {}
+    for iid, pts in points.items():
+        info = instruments[iid]
+        series = prices.get(iid)
+        first = None
+        if series and series[0]:
+            pence = float(_risk.gbp_pence_factor(info.quote_currency, info.yahoo_symbol))
+            first = (series[0][0], series[1][0] * pence)
+        curve = model_curve(pts, first)
+        if curve[0] and (first is None or curve[0][0] < first[0]):
+            curves[iid] = curve
+    return curves
 
 
 # ---------------------------------------------------------------------------
@@ -1000,9 +1121,16 @@ class Valuer:
         return self._facts[key]
 
     def price(self, iid: int, d: date) -> tuple[float | None, str, str | None]:
-        """(cena z pence, status ok/stale/incomplete, przyczyna)."""
+        """(cena z pence, status ok/stale/incomplete/model, przyczyna). Wycena
+        modelowa (T45) wylacznie przed pierwszym notowaniem instrumentu albo gdy
+        notowan nie ma wcale; instrument z notowaniem <= D nigdy jej nie dostaje."""
         info = self.inp.instruments[iid]
         series = self.inp.prices.get(iid)
+        if not series or not series[0] or d < series[0][0]:
+            curve = self.inp.model_curves.get(iid)
+            mp = model_price_on(curve, d) if curve else None
+            if mp is not None:
+                return mp, "model", None
         if not series or not series[0]:
             reason = "brak cen"
             if (info.instrument_type or "").lower().startswith("cert") or info.ticker.startswith("INTL"):
@@ -1314,7 +1442,9 @@ def window_summary(
             "regression": regression_dict(reg),
         }
     ms = mandate_status(comps, limits)
-    out["mandate"] = {"status": ms.status, "violations": ms.violations, "missing": ms.missing, "components": comps}
+    near = sorted(k for k, v in comps.items() if v is not None and abs(limits[k] - v) < NEAR_LIMIT_PP)
+    out["mandate"] = {"status": ms.status, "violations": ms.violations, "missing": ms.missing, "components": comps,
+                      "near_limit": near}
     v = verdict(dws, nav[a] if nav[a] is not None else 0.0, TIE_PCT, data_verified and complete)
     out["verdict"] = {
         "result": v.result,
@@ -1464,6 +1594,13 @@ def render_markdown(report: dict[str, Any]) -> str:
     for r in (gate or {}).get("rows", []):
         L.append(f"  - {r['date']} {r['account']}/{r['currency']} {r['component']}: {r['status']}; broker {_num(r['broker'])}, "
                  f"NAV {_num(r['ours'])}, roznica {_num(r['diff'])} ({_num(r['diff_pln'])} PLN, {_pct(r['rel_diff'])})")
+    mv = report.get("model_valuation") or {}
+    if mv.get("n_days"):
+        L.append(
+            f"- wycena modelowa (T45): {mv['n_days']} dni; maks. dzienny udzial {_pct(mv['max_share'])} "
+            f"({mv['max_share_date']}), sredni {_pct(mv['mean_share'])}; dni > {mv['limit'] * 100:.0f}%: "
+            f"{mv['days_over_limit']}; instrumenty: {', '.join(mv['tickers'])}"
+        )
     L.append(f"- status danych: {'zweryfikowane' if report['data_verified'] else 'niezweryfikowane'}")
     for reason in report["data_unverified_reasons"]:
         L.append(f"  - {reason}")
@@ -1493,6 +1630,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                      f"IR={_num(reg['ir'], 3)} (SE {_num(reg['se_ir'], 3)})")
         m = win["mandate"]
         L.append(f"- mandat: {m['status']}; naruszenia: {', '.join(m['violations']) or '-'}; braki: {', '.join(m['missing']) or '-'}")
+        if m.get("near_limit"):
+            L.append(f"  - skladniki < 1 pp od limitu: {', '.join(m['near_limit'])}"
+                     + (" — WYNIK WRAZLIWY NA WYCENE MODELOWA" if m.get("sensitive_to_model") else ""))
         v = win["verdict"]
         L.append(f"- werdykt wyniku: {v['label']} (znaki: {v['signs']}; dane zweryfikowane: {v['data_verified']})")
     L.append("")
@@ -1560,8 +1700,30 @@ def run_satellite(
         for tick, why in daily.navs[d].missing:
             k = f"{tick if tick == KONTRAKTOWY_GROUP else 'pozycja'}:{why}"
             missing_summary[k] = missing_summary.get(k, 0) + 1
-    if inp.no_price_tickers:
-        reasons.append(f"instrumenty bez cen w prices_daily i bez mapy: {len(inp.no_price_tickers)}")
+    modelled = {inp.instruments[i].ticker for i in inp.model_curves}
+    unpriced = [t for t in inp.no_price_tickers if t not in modelled]
+    if unpriced:
+        reasons.append(f"instrumenty bez cen w prices_daily, bez mapy i bez wyceny modelowej: {len(unpriced)}")
+
+    # T45: dzienny udzial wyceny modelowej w NAV; > MODEL_SHARE_LIMIT -> dane niezweryfikowane
+    model_days = [(d, daily.navs[d].model_share, daily.navs[d].model_tickers) for d in axis
+                  if daily.navs[d].model_tickers]
+    shares = [(s, d) for d, s, _ in model_days if s is not None]
+    model_max = max(shares) if shares else None
+    model_over = [d for s, d in shares if s > MODEL_SHARE_LIMIT]
+    if model_over:
+        reasons.append(f"udzial wyceny modelowej > {MODEL_SHARE_LIMIT * 100:.0f}% NAV w {len(model_over)} dniach (T45)")
+    model_summary = {
+        "n_days": len(model_days),
+        "max_share": model_max[0] if model_max else None,
+        "max_share_date": model_max[1] if model_max else None,
+        "mean_share": statistics.mean(s for s, _ in shares) if shares else None,
+        "days_over_limit": len(model_over),
+        "limit": MODEL_SHARE_LIMIT,
+        "tickers": sorted({t for _, _, ts in model_days for t in ts}),
+    }
+    for w in analysis["windows"].values():
+        w["mandate"]["sensitive_to_model"] = bool(w["mandate"]["near_limit"]) and bool(model_days)
 
     p3_control = None
     if p3_series_path:
@@ -1585,7 +1747,9 @@ def run_satellite(
         "S": analysis["S"],
         "T": analysis["T"],
         "gate": gate,
-        "data_verified": verified_base and not any(not w["complete"] for w in analysis["windows"].values()),
+        "data_verified": verified_base and not model_over
+        and not any(not w["complete"] for w in analysis["windows"].values()),
+        "model_valuation": model_summary,
         "data_unverified_reasons": sorted(set(reasons)),
         "unknown_row_types": daily.unknown_row_types,
         "missing_summary": missing_summary,
@@ -1605,6 +1769,8 @@ def run_satellite(
                 "nav_pln": n.value,
                 "nav_by_account_pln": {f"{g}/{c}": v for (g, c), v in sorted(n.by_account_pln.items())},
                 "complete": n.complete and flows[i] is not None,
+                "model_share": n.model_share,
+                "model_tickers": n.model_tickers,
                 "missing": [f"{t}:{w}" for t, w in n.missing] + [f"{t}:{w}" for t, w in daily.flow_issues.get(d, [])],
                 "F_D": flows[i],
                 "r": analysis["r"][i],
