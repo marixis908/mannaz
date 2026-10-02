@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.7 · 2026-09-30**
+**Rewizja 4.8 · 2026-10-02**
 
 ---
 
@@ -32,7 +32,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.4 | 2026-09-27 | T12: zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie (T27); §8.2/§8.3: `prices_eod` → `prices_daily`, kolumny zgodne z bazą, bez `is_stale` (brief CC-I) |
 | 4.5 | 2026-09-27 | §23.2: etap lokalny — przebieg główny uruchamiany ręcznie przez ownera po wgraniu historii transakcji, raport lokalny zamiast Slacka i dead-mana; §22.3 T38: próg istotności zmiany zlecenia stop (brief CC-C) |
 | 4.6 | 2026-09-30 | §25.3: kolumna „stan” faz F0–F6 z dowodami; kolejność przekrojami pionowymi od 2026-09-26; F0 warunkiem wejścia w F3 (decyzja ownera 2026-09-30) |
-| **4.7** | **2026-09-30** | **§19.2: poziom 1 liczony per nazwę = emitent — waluty rozliczenia i kontrakty na bazę pod jedną nazwą (decyzja ownera 6.3; B-30, brief CC-N)** |
+| 4.7 | 2026-09-30 | §19.2: poziom 1 liczony per nazwę = emitent — waluty rozliczenia i kontrakty na bazę pod jedną nazwą (decyzja ownera 6.3; B-30, brief CC-N) |
+| **4.8** | **2026-10-02** | **§21.6 ocena satelity jako całości (M78–M87, T39–T42): granica subportfela, nadwyżka majątku ΔW w PLN, dwa progi — S&P 500 TR (UCITS) i SPYI, werdykt w trzech statusach, trzy rejestry pomiaru, atrybucja w kwotach PLN; M59 i przykład M57 przepisane; §2.1 oznaczony jako stan historyczny; §28 pytania 2–4; O-46–O-50 (decyzje ownera 2026-10-02 po dwóch rundach recenzji zewnętrznej)** |
 
 ### 0.3 Oznaczenia
 
@@ -106,6 +107,8 @@ System uznaje się za działający, gdy przez kwartał spełnia jednocześnie: m
 **Defekt danych wejściowych [Z]:** dla NU, GRAB i DLO iloczyn `(kurs − średnia) × liczba` nie zgadza się z raportowanym Z/S (GRAB: −1275,00 vs −1260,60). Kolumna „średnia cena" jest zaokrąglona do dwóch miejsc — realna średnia GRAB to ok. 4,0452. **Koszt nabycia musi pochodzić z historii transakcji, nigdy ze zrzutu portfela.**
 
 **Splity [Z]:** kursy w zrzucie są split-adjusted (ServiceNow po podziale 5:1 zatwierdzonym w 2025, Netflix po 10:1 z listopada 2025). Dane XBRL z SEC są „as reported" i splitów nie korygują — historyczne EPS i liczba akcji wymagają własnej korekty (T14).
+
+**Stan historyczny [Z].** Tabela opisuje wyłącznie część USD rachunku ZAGRANICZNY na 2026-08-27. Od rew. 4.8 zakres satelity definiuje §21.6 (M78): trzy rachunki DM BOŚ bez rdzenia. Skład i wagi pochodzą zawsze z aktualnej migawki, nie z tej tabeli.
 
 ### 2.2 Kierunek rozwoju — to jest zmiana wobec rewizji 1
 
@@ -1058,15 +1061,107 @@ MARA
                                   złożoność i ryzyko względem IBIT?"
 ```
 
-Przykłady: NVDA → SMH; COIN → BTC/IBIT; ACMR → SOXX; spółka GPW → mWIG40/sWIG80; cały satelita → QQQ (lub koszyk odzwierciedlający jego skład rynkowy).
+Przykłady: NVDA → SMH; COIN → BTC/IBIT; ACMR → SOXX; spółka GPW → mWIG40/sWIG80; cały satelita → dwa progi z §21.6 (M81).
 
 **M58.** Miara: excess return 12M i 24M **skorygowany o ryzyko**. Pozycja przegrywająca z własnym benchmarkiem przez 24 miesiące jest kandydatem do **zamiany na ten benchmark**, bez dyskusji o tezie.
 
-**M59.** Ten sam test na poziomie całego satelity. 31 pozycji, godziny pracy i ryzyko idiosynkratyczne muszą wygrać z jednym instrumentem. Jeśli nie wygrywają przez 24 miesiące, **to jest informacja o systemie, nie o rynku** — i przesłanka do jego wyłączenia zgodnie z §1.3.
+**M59.** Ten sam test na poziomie całego satelity, według §21.6: dwa progi (M81), miara ΔW w PLN (M80), werdykt w trzech niezależnych statusach (M83), okno 24 miesięcy, rejestr 2 (M84). Strata wobec obu progów jest przesłanką obowiązkowego przeglądu reguł i doboru pozycji (M87), nie przeniesienia kapitału do rdzenia.
 
 ### 21.5 Czego zmiana alokacji NIE obejmuje
 
 Twarde stopy i wyjścia reżimowe (§19.1, priorytet 1–2) **nie są zmianami alokacji** — są wyjściami z pozycji i mają pierwszeństwo przed każdym mechanizmem z §21.
+
+### 21.6 Ocena satelity jako całości
+
+Decyzje ownera z 2026-10-02 po dwóch rundach recenzji zewnętrznej (`tmp/ocena-satelity/`). Sekcja zastępuje dotychczasową, niepełną treść M59 i rozstrzyga pytania 2–3 z §28.
+
+**M78. Granica satelity.** Satelita to subportfel trzech rachunków DM BOŚ: ZAGRANICZNY bez instrumentów rdzenia (SPYI, V80A, V60A; atrybut `instruments.is_core`), AKCYJNY oraz KONTRAKTOWY według §19.4. Gotówka na rachunku ZAGRANICZNY należy do satelity (decyzja ownera 2026-10-02). Każde przesunięcie wartości między satelitą a rdzeniem jest przepływem przez granicę subportfela. Inwestycje niepubliczne fundacji są poza satelitą.
+
+Bramka: na każdą datę migawki brokera wartość trzech rachunków = NAV satelity + NAV rdzenia. Różnica niewyjaśniona zdarzeniem ani udokumentowanym zaokrągleniem (T39) daje pomiarowi status „niezweryfikowany”.
+
+**M79. Mandat.** Celem satelity jest zwrot z kapitału wyższy niż oba progi z M81. Mandat jest wzrostowy, nie ochronny: niższe ryzyko nie kompensuje niższego wyniku. Kapitał z zamkniętych pozycji pozostaje w satelicie; satelita nie zasila rdzenia (decyzja ownera 2026-10-02).
+
+**M80. Miara decyzyjna: nadwyżka majątku ΔW w PLN.** Dla okna od `a` do `T`, NAV satelity `V`, wpłat przez granicę `C_t`, wypłat `D_t` i indeksu total return progu `B` (w PLN):
+
+```
+ΔW_T = V_T + Σ D_t·B_T/B_t − ( V_a·B_T/B_a + Σ C_t·B_T/B_t )
+```
+
+- Okno zaczyna się od rzeczywistego NAV satelity `V_a`; ocena „od początku historii” wymaga uzgodnionego stanu otwarcia, łącznie z pozycjami wniesionymi w naturze.
+- Wypłaty przeliczane są na ekwiwalent końcowy według progu. To konwencja porównawcza, nie założenie reinwestycji.
+- Wypłata, której benchmark z identycznymi przepływami nie mógłby sfinansować, dostaje flagę „benchmark niewykonalny bez finansowania”; nie dopisuje się kredytu ani krótkich jednostek.
+- IRR nie jest miarą decyzyjną (O-47).
+
+Klasyfikacja operacji względem granicy satelity:
+
+| Operacja | Klasa |
+|---|---|
+| wpłata spoza satelity / wypłata poza satelitę | przepływ zewnętrzny |
+| zakup instrumentu rdzenia ze środków satelity / wpływ ze sprzedaży rdzenia do satelity | przepływ zewnętrzny |
+| wniesienie lub wycofanie papierów w naturze | przepływ zewnętrzny, po wartości rynkowej z dnia transferu |
+| przelew między rachunkami satelity, także dopłata depozytu KONTRAKTOWY z AKCYJNEGO | wewnętrzna (obie strony sparowane, środki w drodze uwzględnione) |
+| przewalutowanie na tym samym rachunku | wewnętrzna; spread i prowizja obciążają wynik |
+| kupno/sprzedaż instrumentu satelity | wewnętrzna |
+| dywidenda, odsetki od gotówki | dochód, nie kapitał wniesiony |
+| podatek u źródła, prowizje, opłaty | koszt, nie wypłata kapitału |
+| blokada/zwolnienie depozytu | wewnętrzna (dostępność gotówki, nie NAV) |
+| dzienny wynik kontraktów | wynik inwestycji, raz w środkach rachunku (§19.4) |
+
+**M81. Progi.** Dwa progi decyzyjne, zadeklarowane przez ownera przed pomiarem:
+
+1. **S&P 500 total return** — akumulujący UCITS ETF iShares Core S&P 500, ISIN `IE00B5BMR087`; kontrolka drugiego źródła: indeks S&P 500 Total Return (brutto). Oczekiwana różnica to mały, systematyczny ujemny dryf ETF (TER, podatek u źródła na poziomie funduszu); skok jest błędem danych.
+2. **SPYI** — SPDR MSCI ACWI IMI UCITS ETF (Acc), ISIN `IE00B3YLTY66`; wyłącznie SPYI, nie miks rdzenia (O-49).
+
+Oba progi przeliczane na PLN po kursie NBP A z dnia D (M1) i pobierane z tego samego miejsca notowania, wybranego pomiarem kompletności historii. Identyfikacja łańcuchem ISIN → MIC → waluta → symbol dostawcy → kontrolka ceny i zdarzeń korporacyjnych. Ticker bez sufiksu nie jest identyfikatorem: `SPYI` w USA to inny ETF (NEOS).
+
+Benchmark diagnostyczny: model ekspozycji zbudowany z benchmarków zastępczych M57, z kontraktami ze znakiem i nominałem. Wynik względem niego to „reszta względem modelu ekspozycji”, nie „selekcja”.
+
+**M82. Miary raportowe.**
+
+- TWR liczony na dziennym NAV EOD; przepływ zewnętrzny przypisany do końca dnia, w którym wpłynął. Dokładności intraday się nie deklaruje.
+- Maksymalne obsunięcie indeksu TWR satelity i obu progów, liczone na dziennych wycenach.
+- IR wobec każdego progu, z błędem standardowym.
+- Istotność raportowana obok wyniku. Moc testu i istotność wyniku to różne pytania: przy dwóch latach i wysokim tracking error test ma małą moc dla umiarkowanych nadwyżek. Brak istotności nie dowodzi braku umiejętności, a wynik istotny jest dowodem. M59 pozostaje regułą ekonomiczną, nie testem statystycznym.
+
+**M83. Werdykt — trzy niezależne statusy.**
+
+| Wymiar | Statusy | Podstawa |
+|---|---|---|
+| Wynik | przewaga (ΔW > 0 wobec obu progów) / częściowo (wobec jednego, z nazwą progu) / strata (wobec obu) / remis (T40) | M80, M81 |
+| Mandat ryzyka | spełniony / naruszony / nieoceniony | maksymalne obsunięcie TWR wobec L_max (T41) |
+| Dane | zweryfikowane / niezweryfikowane | bramka M78, kompletna klasyfikacja M80, splity, kompletność historii |
+
+Przewaga przy naruszonym mandacie ma etykietę „przewaga z naruszeniem mandatu”. Status danych „niezweryfikowane” wyklucza werdykt wynikowy — wynik nie jest wtedy ani wygraną, ani przegraną.
+
+**M84. Trzy rejestry pomiaru.**
+
+1. **Historia ownera** — od uzgodnionego stanu otwarcia. Ocenia dotychczasową praktykę dyskrecjonalną; nie jest testem systemu.
+2. **Polityka z Mannazem** — od pierwszego pełnego cyklu tygodniowego po rewizji 4.8 (data w T42). Werdykt M59 dla tego rejestru najwcześniej po 24 miesiącach od tej daty; do tego czasu raport pokazuje stan bieżący bez werdyktu.
+3. **Proces** — kompletność danych, decyzje i override'y z dziennika, reakcje na alerty (§1.3, M75).
+
+**M85. Atrybucja w kwotach PLN.** Dzienny wynik pozycji = zmiana wartości w PLN − przepływy transakcyjne tej pozycji. Kwoty sumują się przez dni bez łączenia okresów. Rozkład na część lokalną, walutową i interakcję jest dzienny, z symetrycznym podziałem interakcji:
+
+```
+c_lokalny = r_L + ½·r_L·r_FX        c_FX = r_FX + ½·r_L·r_FX
+```
+
+Atrybucja obejmuje wszystkie pozycje utrzymywane w okresie, łącznie z zamkniętymi, agregowane per emitent (nazwa = emitent, §19.2). Koszty wchodzą raz. Przekroje rachunek, emitent i waluta osobno uzgadniają się do zmiany NAV po przepływach; między sobą się ich nie sumuje. M85 doprecyzowuje T24.
+
+**M86. Ryzyko portfela w raporcie.**
+
+- Heat (§19.2, poziom 3) to ryzyko do poziomów stop przy założeniu wykonania, nie maksymalna strata. Osobno: ekspozycja kontraktów brutto i netto (nominał ze znakiem / NAV) oraz wolne środki KONTRAKTOWY wobec depozytu.
+- HHI i udział TOP5 liczone per emitent na wagach w sumie długiej ekspozycji akcyjnej; gotówka i kontrakty w osobnych liniach.
+- Poziom 2 liczony na atrybucie `instruments.theme`: tylko tematy z regułą przypisania. Ryzyko pozycji liczy się w pełni w każdym jej temacie, w heat portfela — raz. Brak tematu blokuje dokładanie. Szerokie czynniki (np. „growth”) wolno raportować diagnostycznie, bez limitu. Poziom 2 na korelacjach (B-10, P-10) pozostaje późniejszą kontrolą kompletności tematów.
+
+**M87. Kadencja i skutek.** Owner aktualizuje portfel co tydzień; cykl tygodniowy liczy wszystkie wielkości z §21.6, a reguły §19 i M50 działają w każdym przebiegu. Werdykt M59 zapada wyłącznie przy przeglądzie kwartalnym. Strata wobec obu progów w rejestrze 2 po 24 miesiącach uruchamia obowiązkowy przegląd reguł i doboru pozycji z zapisanymi wnioskami (przyczyna: reguły, ich niestosowanie czy dobór), bez automatycznego ruchu kapitału. Koszt czasu ownera nie jest rejestrowany (decyzja ownera 2026-10-02).
+
+**T39.** Tolerancja uzgodnienia M78: ≤ 0,01% wartości rachunku na datę migawki. [S]
+
+**T40.** Remis w M83: |ΔW| ≤ 0,5% × `V_a`. [S] Do kalibracji po pierwszym pomiarze rejestru 1.
+
+**T41.** L_max — maksymalne dopuszczalne obsunięcie indeksu TWR satelity, w procentach i w PLN wobec NAV z dnia zapisu. **Do decyzji ownera.** Procedura: najpierw pomiar obsunięć obu progów w PLN, potem decyzja ownera, dopiero potem pomiar obsunięć satelity. Do czasu decyzji mandat ryzyka ma status „nieoceniony”.
+
+**T42.** Data startu rejestru 2 — wpisywana po pierwszym pełnym cyklu tygodniowym po rewizji 4.8.
 
 ## 22. Egzekucja
 
@@ -1316,6 +1411,11 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 | **O-36** | „Nie dokładaj poniżej 30% od maksimum" jako **ostrzeżenie** | Reguła ma funkcję behawioralną, nie informacyjną. Asymetria: koszt fałszywej blokady to nieodebrany zysk, koszt fałszywego pozwolenia to kapitał w spółce, która dalej spada | Zostaje blokadą z **nazwanym override'em w dzienniku** |
 | **O-37** | Słabość relatywna jako automatyczne wyjście | Sygnał kupna brzmi „tania względem peerów", więc system kupowałby to, co sprzedaje | Uwarunkowane stanem VALUE (M26) |
 | **O-38** | Cena docelowa jako liczba wpisana przy zakupie | Nie aktualizuje się wraz z wynikami spółki | Zastąpione percentylem implikowanych założeń (M55) |
+| **O-46** | QQQ jako benchmark całego satelity | Odpowiada na pytanie diagnostyczne (beta stylu), nie na cel ownera; amerykański ETF prawdopodobnie niedostępny dla fundacji jako klienta detalicznego (PRIIPs/KID) [S] | Zmiana celu ownera |
+| **O-47** | IRR jako miara decyzyjna satelity | Przy naprzemiennych przepływach może mieć wiele pierwiastków (kontrolka: −100, +230, −132 → 10% i 20% rocznie); miesza selekcję z rozmieszczeniem kapitału | Nic; dopuszczalny raportowo |
+| **O-48** | Bramki „IR > 0” i „drawdown satelity ≤ 1,5 × drawdown benchmarku” | Znak IR to tylko znak średniej nadwyżki, bez jej niepewności; mnożnik drawdownu zwiększa dopuszczalną stratę, gdy benchmarkowi idzie źle | Nic |
+| **O-49** | Zamrożony miks rdzenia (SPYI + V80A + V60A) jako benchmark decyzyjny | Kapitał satelity nie wraca do rdzenia (decyzja ownera 2026-10-02); owner wskazał SPYI jako próg | Zmiana przeznaczenia kapitału satelity |
+| **O-50** | EUR jako waluta oceny satelity | Werdykt nie zależy od waluty, gdy obie strony liczone są w tej samej (ΔW_EUR = ΔW_PLN / kurs EUR/PLN z dnia T); drugi widok bez nowej informacji | Nic |
 
 ### 26.4 Operacje
 
@@ -1371,9 +1471,9 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 **Pytania otwarte, należące do właściciela:**
 
 1. **Skład satelity.** Czy 31 pozycji plus GPW to docelowa liczba, czy podłoga konwikcji (M53) ma być zastosowana przed startem? To zmienia rozmiar problemu o ok. 30%.
-2. **Waluta raportowania.** M1 zakłada PLN jako bazową. Do potwierdzenia, czy widok „Mannaz USD" ma pozostać osobną perspektywą, czy zostaje wyłącznie ujęcie w PLN.
-3. **Benchmark całego satelity.** QQQ? Koszyk odzwierciedlający skład rynkowy? Coś w PLN? Od tego zależy M59 — najostrzejszy test całego przedsięwzięcia.
-4. **Cel zmienności portfela.** Poziom 3 budżetu ryzyka (15%) jest punktem startowym; docelowy poziom trzeba **zmierzyć, nie zgadnąć**.
+2. **Waluta raportowania.** **Zamknięte 2026-10-02:** jedynym ujęciem oceny jest PLN (M1, M81, O-50).
+3. **Benchmark całego satelity.** **Zamknięte 2026-10-02:** dwa progi — S&P 500 TR (UCITS ETF) i SPYI, w PLN (§21.6, M81).
+4. **Cel zmienności portfela.** Poziom 3 budżetu ryzyka (15%) jest punktem startowym; docelowy poziom trzeba **zmierzyć, nie zgadnąć**. **Przeformułowane 2026-10-02:** limit obsunięcia satelity L_max (T41), do decyzji ownera po pomiarze obsunięć progów.
 5. **Czy „straż cenowa" dobowa jest potrzebna**, skoro twarde stopy leżą u brokera (M62).
 
 ---
