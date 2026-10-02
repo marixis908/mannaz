@@ -635,3 +635,71 @@ def test_cli_satellite_parser():
     assert args.date_from == date(2023, 10, 2) and args.date_to == date(2026, 9, 30)
     assert args.account_values is None and args.symbol_map is None
     assert callable(args.func)
+
+
+# --- T45: wycena modelowa ----------------------------------------------------
+
+
+def _cal_open(code, d):
+    return CalendarFacts(is_session_on_d=True, sessions_before=[d - timedelta(days=1), d - timedelta(days=2)])
+
+
+def _t45_inputs(prices=None, extra_rows=(), positions_by_day=None):
+    info = sat.InstrumentInfo(id=1, ticker="CERT1", instrument_type="certificate", is_core=False, multiplier=None,
+                              yahoo_symbol=None, quote_currency="PLN", calendar_code="XWAR")
+    rows = [
+        sat.TxRow(date(2026, 1, 1), "AKCYJNY T", "PLN", "kupno", -1000.0, 1, 100.0, 10.0),
+        sat.TxRow(date(2026, 1, 11), "AKCYJNY T", "PLN", "sprzedaz", 2000.0, 1, 100.0, 20.0),
+        *extra_rows,
+    ]
+    prices = prices or {}
+    pbd = positions_by_day or {}
+    curves = sat.build_model_curves(rows, {1: info}, prices, {}, {}, pbd, {1})
+    return sat.Inputs(axis=[], compute_days=sorted(pbd), tx_rows=rows, kontraktowy_rows=[], instruments={1: info},
+                      prices=prices, layer_events={}, fx={}, positions_by_day=pbd, model_curves=curves)
+
+
+def test_t45_positive_buy_sell_path_gives_linear_intermediate_values():
+    inp = _t45_inputs()
+    v = sat.Valuer(inp, _cal_open)
+    for k in range(11):
+        px, status, _ = v.price(1, date(2026, 1, 1) + timedelta(days=k))
+        assert status == "model" and px == pytest.approx(10.0 + k)
+    # bez ekstrapolacji: przed pierwszym i za ostatnim punktem brak wyceny
+    assert v.price(1, date(2025, 12, 31))[1] == "incomplete"
+    assert v.price(1, date(2026, 1, 12))[1] == "incomplete"
+
+
+def test_t45_same_day_points_qty_weighted_and_redemption_amount_over_held_qty():
+    assert sat.model_curve([(date(2026, 1, 1), 100.0, 10.0), (date(2026, 1, 1), 300.0, 14.0)]) == ([date(2026, 1, 1)], [13.0])
+    redemption = sat.TxRow(date(2026, 1, 21), "AKCYJNY T", "PLN", "wykup_certyfikatow", 750.0, 1, None, None)
+    pbd = {date(2026, 1, 20): [{"instrument_id": 1, "qty": 50.0, "rachunek": "AKCYJNY T", "currency": "PLN"}]}
+    inp = _t45_inputs(extra_rows=[redemption], positions_by_day=pbd)
+    assert inp.model_curves[1] == ([date(2026, 1, 1), date(2026, 1, 11), date(2026, 1, 21)], [10.0, 20.0, 15.0])
+
+
+def test_t45_negative_quoted_instrument_never_gets_model_price():
+    quotes = {1: ([date(2026, 1, 1), date(2026, 1, 2)], [11.0, 12.0])}
+    inp = _t45_inputs(prices=quotes)
+    v = sat.Valuer(inp, _cal_open)
+    px, status, _ = v.price(1, date(2026, 1, 2))
+    assert (px, status) == (12.0, "ok")
+    # luka w notowaniach po pierwszym notowaniu -> regula T27 (incomplete), nigdy wycena modelowa
+    assert v.price(1, date(2026, 1, 8))[1] == "incomplete"
+    # punkty transakcyjne od daty pierwszego notowania nie tworza krzywej
+    assert 1 not in inp.model_curves
+
+
+def test_t45_model_curve_closed_by_first_quote():
+    quotes = {1: ([date(2026, 1, 21)], [30.0])}
+    inp = _t45_inputs(prices=quotes)
+    v = sat.Valuer(inp, _cal_open)
+    assert v.price(1, date(2026, 1, 16)) == (pytest.approx(25.0), "model", None)
+    assert v.price(1, date(2026, 1, 21))[1] == "ok"
+
+
+def test_t45_nav_model_share():
+    nav = nav_for_day([_pos(), _pos(ticker="CERT1", price=50.0, qty=2.0, price_status="model")], {}, {})
+    assert nav.complete and nav.model_tickers == ["CERT1"]
+    assert nav.model_value_pln == pytest.approx(100.0)
+    assert nav.model_share == pytest.approx(100.0 / 1100.0)
