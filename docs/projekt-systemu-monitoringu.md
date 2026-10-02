@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.8 · 2026-10-02**
+**Rewizja 4.9 · 2026-10-02**
 
 ---
 
@@ -33,7 +33,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.5 | 2026-09-27 | §23.2: etap lokalny — przebieg główny uruchamiany ręcznie przez ownera po wgraniu historii transakcji, raport lokalny zamiast Slacka i dead-mana; §22.3 T38: próg istotności zmiany zlecenia stop (brief CC-C) |
 | 4.6 | 2026-09-30 | §25.3: kolumna „stan” faz F0–F6 z dowodami; kolejność przekrojami pionowymi od 2026-09-26; F0 warunkiem wejścia w F3 (decyzja ownera 2026-09-30) |
 | 4.7 | 2026-09-30 | §19.2: poziom 1 liczony per nazwę = emitent — waluty rozliczenia i kontrakty na bazę pod jedną nazwą (decyzja ownera 6.3; B-30, brief CC-N) |
-| **4.8** | **2026-10-02** | **§21.6 ocena satelity jako całości (M78–M87, T39–T42): granica subportfela, nadwyżka majątku ΔW w PLN, dwa progi — S&P 500 TR (UCITS) i SPYI, werdykt w trzech statusach, trzy rejestry pomiaru, atrybucja w kwotach PLN; M59 i przykład M57 przepisane; §2.1 oznaczony jako stan historyczny; §28 pytania 2–4; O-46–O-50 (decyzje ownera 2026-10-02 po dwóch rundach recenzji zewnętrznej)** |
+| 4.8 | 2026-10-02 | §21.6 ocena satelity jako całości (M78–M87, T39–T42): granica subportfela, nadwyżka majątku ΔW w PLN, dwa progi — S&P 500 TR (UCITS) i SPYI, werdykt w trzech statusach, trzy rejestry pomiaru, atrybucja w kwotach PLN; M59 i przykład M57 przepisane; §2.1 oznaczony jako stan historyczny; §28 pytania 2–4; O-46–O-50 (decyzje ownera 2026-10-02 po dwóch rundach recenzji zewnętrznej) |
+| **4.9** | **2026-10-02** | **Limity mandatu ryzyka satelity: L_max = 35% (T41), L_rel = 20% wobec każdego progu (T43), progi alertów (T44); M88 — trzy składniki mandatu, koniunkcja, logika statusu przy brakach; M89 — okno kroczące, trwały rejestr naruszeń, alerty na obsunięciu bieżącym z histerezą i eskalacją, zmiany limitów prospektywnie; M83 i §28 pytanie 4 (decyzje ownera 2026-10-02)** |
 
 ### 0.3 Oznaczenia
 
@@ -1128,7 +1129,7 @@ Benchmark diagnostyczny: model ekspozycji zbudowany z benchmarków zastępczych 
 | Wymiar | Statusy | Podstawa |
 |---|---|---|
 | Wynik | przewaga (ΔW > 0 wobec obu progów) / częściowo (wobec jednego, z nazwą progu) / strata (wobec obu) / remis (T40) | M80, M81 |
-| Mandat ryzyka | spełniony / naruszony / nieoceniony | maksymalne obsunięcie TWR wobec L_max (T41) |
+| Mandat ryzyka | spełniony / naruszony / nieoceniony | maksymalne obsunięcie w oknie: bezwzględne indeksu TWR wobec L_max (T41) oraz względne wobec każdego progu wobec L_rel (T43); logika statusu w M88 |
 | Dane | zweryfikowane / niezweryfikowane | bramka M78, kompletna klasyfikacja M80, splity, kompletność historii |
 
 Przewaga przy naruszonym mandacie ma etykietę „przewaga z naruszeniem mandatu”. Status danych „niezweryfikowane” wyklucza werdykt wynikowy — wynik nie jest wtedy ani wygraną, ani przegraną.
@@ -1155,13 +1156,39 @@ Atrybucja obejmuje wszystkie pozycje utrzymywane w okresie, łącznie z zamknię
 
 **M87. Kadencja i skutek.** Owner aktualizuje portfel co tydzień; cykl tygodniowy liczy wszystkie wielkości z §21.6, a reguły §19 i M50 działają w każdym przebiegu. Werdykt M59 zapada wyłącznie przy przeglądzie kwartalnym. Strata wobec obu progów w rejestrze 2 po 24 miesiącach uruchamia obowiązkowy przegląd reguł i doboru pozycji z zapisanymi wnioskami (przyczyna: reguły, ich niestosowanie czy dobór), bez automatycznego ruchu kapitału. Koszt czasu ownera nie jest rejestrowany (decyzja ownera 2026-10-02).
 
+**M88. Mandat ryzyka — trzy składniki.** (1) maksymalne obsunięcie indeksu TWR satelity w oknie wobec L_max (T41); (2) i (3) maksymalne obsunięcie indeksu względnego `Q_j = I_sat / B_j`, osobno wobec S&P 500 i SPYI, wobec L_rel (T43):
+
+```
+d_rel,j,t = 1 − Q_j,t / max_{u≤t} Q_j,u
+```
+
+Składniki łączy koniunkcja: przekroczenie któregokolwiek limitu oznacza naruszenie mandatu, niezależnie od pozostałych; limit względny nie luzuje bezwzględnego. Status:
+
+- **naruszony** — co najmniej jeden dostępny składnik przekracza limit; raport wymienia znane naruszenia i osobno składniki niedostępne;
+- **spełniony** — wszystkie trzy składniki są dostępne i mieszczą się w limitach;
+- **nieoceniony** — brak znanego naruszenia, a co najmniej jeden składnik jest niedostępny.
+
+Limity rozstrzygają o statusie mandatu, nie zatrzymują straty; stratę ograniczają stopy u brokera (M62). L_rel ogranicza pogorszenie względne wynikające z całej polityki satelity — bety, gotówki, hedgingu i selekcji. Naruszenie L_rel nie jest samo w sobie dowodem złej selekcji; diagnozę daje model ekspozycji (M81).
+
+**M89. Alerty mandatu i okna.**
+
+- Status mandatu w werdykcie (M83) liczony jest na maksimum obsunięcia w kroczącym oknie 24 miesięcy, przeliczanym wraz z oknem.
+- Rejestr naruszeń jest trwały: naruszenie zapisane w oknie, w którym nastąpiło, nie znika po odrobieniu straty ani po przesunięciu okna.
+- Alerty liczone są na obsunięciu bieżącym: od najwyższego punktu indeksu od startu rejestru (dla składników względnych — od najwyższego punktu `Q_j`). Przesunięcie okna samo nie zmienia stanu alertu.
+- Ostrzeżenie przy przejściu przez 75% limitu, alert przy przejściu przez 100% (T44). Ostrzeżenie nie blokuje eskalacji do alertu. Po komunikacie danego poziomu jego ponawianie jest wstrzymane do zejścia obsunięcia bieżącego poniżej 50% limitu; stan naruszenia pozostaje widoczny w raporcie. Nowe naruszenie innego składnika zawsze generuje alert.
+- Zmiana L_max, L_rel lub T44 obowiązuje od daty decyzji, z uzasadnieniem w dzienniku decyzji; nie zmienia historycznych statusów. Zmierzona beta satelity sama w sobie nie jest podstawą podniesienia limitu.
+
 **T39.** Tolerancja uzgodnienia M78: ≤ 0,01% wartości rachunku na datę migawki. [S]
 
 **T40.** Remis w M83: |ΔW| ≤ 0,5% × `V_a`. [S] Do kalibracji po pierwszym pomiarze rejestru 1.
 
-**T41.** L_max — maksymalne dopuszczalne obsunięcie indeksu TWR satelity, w procentach i w PLN wobec NAV z dnia zapisu. **Do decyzji ownera.** Procedura: najpierw pomiar obsunięć obu progów w PLN, potem decyzja ownera, dopiero potem pomiar obsunięć satelity. Do czasu decyzji mandat ryzyka ma status „nieoceniony”.
+**T41.** L_max = 35% — maksymalne dopuszczalne obsunięcie indeksu TWR satelity (decyzja ownera 2026-10-02); kwota w PLN wobec NAV z dnia zapisu wyłącznie informacyjnie. Wartość jest tolerancją ownera, nie wynikiem kalibracji. Kontekst scenariuszowy [S]: przy obsunięciu S&P 500 TR w PLN o 22,29% (2025-01-17 → 2025-04-09, pomiar CC-OS) satelita o becie β traci w przybliżeniu β·D; limit 35% odpowiada spadkowi rynku o 26,9% przy β = 1,3 i o 23,3% przy β = 1,5. Heat (§19.2) i L_max są niezależnymi ograniczeniami.
 
 **T42.** Data startu rejestru 2 — wpisywana po pierwszym pełnym cyklu tygodniowym po rewizji 4.8.
+
+**T43.** L_rel = 20% — maksymalne dopuszczalne obsunięcie indeksu względnego `Q_j` (M88), osobno wobec S&P 500 i SPYI (decyzja ownera 2026-10-02). Kontekst scenariuszowy [S]: obsunięcie względne z samej bety wynosi `(β−1)·D/(1−D)` — 8,6% przy β = 1,3 i 14,4% przy β = 1,5 dla D = 22,29%; między samymi progami w oknie pomiaru CC-OS: 8,39% (S&P 500 / SPYI) i 7,40% (SPYI / S&P 500).
+
+**T44.** Progi alertów M89: ostrzeżenie przy 75% limitu, ponowne uzbrojenie po zejściu obsunięcia bieżącego poniżej 50% limitu. [S] Wybór operacyjny, nie kalibracja statystyczna.
 
 ## 22. Egzekucja
 
@@ -1473,7 +1500,7 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 1. **Skład satelity.** Czy 31 pozycji plus GPW to docelowa liczba, czy podłoga konwikcji (M53) ma być zastosowana przed startem? To zmienia rozmiar problemu o ok. 30%.
 2. **Waluta raportowania.** **Zamknięte 2026-10-02:** jedynym ujęciem oceny jest PLN (M1, M81, O-50).
 3. **Benchmark całego satelity.** **Zamknięte 2026-10-02:** dwa progi — S&P 500 TR (UCITS ETF) i SPYI, w PLN (§21.6, M81).
-4. **Cel zmienności portfela.** Poziom 3 budżetu ryzyka (15%) jest punktem startowym; docelowy poziom trzeba **zmierzyć, nie zgadnąć**. **Przeformułowane 2026-10-02:** limit obsunięcia satelity L_max (T41), do decyzji ownera po pomiarze obsunięć progów.
+4. **Cel zmienności portfela.** Poziom 3 budżetu ryzyka (15%) jest punktem startowym; docelowy poziom trzeba **zmierzyć, nie zgadnąć**. **Przeformułowane 2026-10-02:** limit obsunięcia satelity L_max (T41), do decyzji ownera po pomiarze obsunięć progów. **Zamknięte 2026-10-02:** L_max = 35%, L_rel = 20% (T41, T43).
 5. **Czy „straż cenowa" dobowa jest potrzebna**, skoro twarde stopy leżą u brokera (M62).
 
 ---
