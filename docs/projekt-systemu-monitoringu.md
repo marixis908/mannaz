@@ -35,7 +35,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.7 | 2026-09-30 | §19.2: poziom 1 liczony per nazwę = emitent — waluty rozliczenia i kontrakty na bazę pod jedną nazwą (decyzja ownera 6.3; B-30, brief CC-N) |
 | 4.8 | 2026-10-02 | §21.6 ocena satelity jako całości (M78–M87, T39–T42): granica subportfela, nadwyżka majątku ΔW w PLN, dwa progi — S&P 500 TR (UCITS) i SPYI, werdykt w trzech statusach, trzy rejestry pomiaru, atrybucja w kwotach PLN; M59 i przykład M57 przepisane; §2.1 oznaczony jako stan historyczny; §28 pytania 2–4; O-46–O-50 (decyzje ownera 2026-10-02 po dwóch rundach recenzji zewnętrznej) |
 | 4.9 | 2026-10-02 | Limity mandatu ryzyka satelity: L_max = 35% (T41), L_rel = 20% wobec każdego progu (T43), progi alertów (T44); M88 — trzy składniki mandatu, koniunkcja, logika statusu przy brakach; M89 — okno kroczące, trwały rejestr naruszeń, alerty na obsunięciu bieżącym z histerezą i eskalacją, zmiany limitów prospektywnie; M83 i §28 pytanie 4 (decyzje ownera 2026-10-02) |
-| **4.11** | **2026-10-04** | **§19.1: cena wejścia stopu 2N w walucie notowania — lot rozliczony w innej walucie przeliczany kursem krzyżowym NBP A z dnia transakcji przed średnią ważoną; brak kursu → brak stopu 2N (B-41, brief CC-W; numer 4.10 zarezerwowany dla T45/B-43)** |
+| 4.11 | 2026-10-04 | §19.1: cena wejścia stopu 2N w walucie notowania — lot rozliczony w innej walucie przeliczany kursem krzyżowym NBP A z dnia transakcji przed średnią ważoną; brak kursu → brak stopu 2N (B-41, brief CC-W; numer 4.10 zarezerwowany dla T45/B-43) |
+| **4.12** | **2026-10-04** | **§19.4: kapitał satelity w budżetach ryzyka = NAV satelity z §21.6 (M78), z gotówką; NAV niepełny → brak przebiegu ryzyka dla D (B-17); §19 M77: domyślne D kompletne w cenach i w rozliczeniu KONTRAKTOWY (B-36), detektor zdarzeń korporacyjnych etapem cyklu z bramką DATA REVIEW (B-29); §14.1 pytanie 7: hosting, IaaS i rejestracja domen nie są oprogramowaniem (decyzje ownera 2026-10-04, brief CC-W2)** |
 
 ### 0.3 Oznaczenia
 
@@ -694,7 +695,7 @@ Pytania zadaje się w podanej kolejności; pierwsze „tak" rozstrzyga. Dla kong
 4. Przychód to opłaty od zarządzanych aktywów (FRE) i carry? → **A7**.
 5. Przychód = wolumen płatności × take-rate, bez własnej książki? → **A6**.
 6. Przychód = GMV × take-rate, bez własnego zapasu? → **A4**.
-7. Oprogramowanie (SaaS, licencja z maintenance, platforma komunikacyjna CPaaS) z przychodem powtarzalnym co najmniej na progu T35? Do przychodu powtarzalnego wlicza się subskrypcję, ARR i przychód użyciowy na umowach. Subskrypcja treści albo usług niebędących oprogramowaniem nie spełnia tego pytania. → EBIT < 0: **A3**, inaczej **A2**.
+7. Oprogramowanie (SaaS, licencja z maintenance, platforma komunikacyjna CPaaS) z przychodem powtarzalnym co najmniej na progu T35? Do przychodu powtarzalnego wlicza się subskrypcję, ARR i przychód użyciowy na umowach. Subskrypcja treści albo usług niebędących oprogramowaniem nie spełnia tego pytania. Hosting, wynajem infrastruktury (IaaS) i rejestracja domen nie są oprogramowaniem w rozumieniu tego pytania. → EBIT < 0: **A3**, inaczej **A2**.
 8. Kapitalizacja co najmniej na progu T34 i EBIT > 0 w trzech ostatnich latach obrotowych? → **A1**.
 9. Capex/przychód powyżej progu T36 **albo** backlog, portfel zamówień, order intake lub book-to-bill raportowane jako KPI? RPO się nie liczy. → **A9**.
 10. Żadne → **A0**.
@@ -956,6 +957,8 @@ Kategoryzacja startowa:
 
 **M77.** Każda wielkość liczona na dzień D (pozycje, ilości, zdarzenia korporacyjne, ceny, FX, stan zapadki) korzysta wyłącznie z danych z datą ≤ D; wyjątkiem jest normalizacja warstwy cen skorygowanych o splity, która nie zmienia wartości w PLN; przeliczenie D zastępuje w całości poprzedni zapis dla D.
 
+Domyślne D przebiegu ryzyka to ostatnia data kompletna jednocześnie w cenach (T27) i w rozliczeniu rachunku KONTRAKTOWY, gdy na tę datę są otwarte kontrakty; jawnie podane D niekompletne kończy przebieg błędem (B-36). Detektor zdarzeń korporacyjnych jest etapem cyklu tygodniowego przed FIFO; nowe zdarzenie zatrzymuje cykl przed ryzykiem bramką DATA REVIEW z listą do potwierdzenia przez ownera, a po zapisie zdarzenia ponowny przebieg przelicza FIFO (B-29).
+
 ### 19.1 Hierarchia wyjść
 
 | Prio | Klasa | Reguła |
@@ -997,6 +1000,7 @@ Poziom 3: suma otwartych ryzyk       ≤ 15%
 - ATR, stop i REGIME liczy się na instrumencie bazowym.
 - Ryzyko = (close bazy − stop) × liczba × mnożnik; dla pozycji krótkiej lustrzanie, ze stopem nad ceną.
 - Kontrakty wchodzą do budżetów ryzyka poziomów 1–3. Nominał kontraktu nie wchodzi do kapitału satelity; wchodzi wartość rachunku KONTRAKTOWY = środki ogółem łącznie z depozytem zablokowanym. Broker rozlicza wynik zmienny codziennie w środkach, więc nie dolicza się go osobno.
+- Kapitał satelity w budżetach ryzyka poziomów 1–3 to NAV satelity z §21.6 (M78): pozycje satelity bez rdzenia i bez nominału kontraktów, gotówka rachunków AKCYJNY i ZAGRANICZNY (bez wierszy niegotówkowych) oraz wartość rachunku KONTRAKTOWY; NAV niepełny na D oznacza brak przebiegu ryzyka dla D (B-17).
 - Seria wygasła bez transakcji zamykającej jest zamykana w dniu wygaśnięcia (trzeci piątek miesiąca serii). Archetyp kontraktu to A0 (§14.1, pytanie 1); archetyp bazy jest zapisywany w `archetype_secondary` jako informacja.
 
 ---
