@@ -721,6 +721,40 @@ class WeightedEntryResult:
     qty: Decimal
     first_remaining_date: date | None
     last_remaining_date: date | None
+    fx_missing: bool = False  # brief CC-W, B-41: pozostały lot bez kursu FX
+
+
+def convert_entry_rows_to_quote(
+    rows: list[dict[str, Any]],
+    settlement_currency: str | None,
+    quote_currency: str | None,
+    fx_lookup: Callable[[str, date], Decimal | None],
+) -> list[dict[str, Any]]:
+    """Brief CC-W, B-41: transactions.price jest w walucie ROZLICZENIA, a ATR/close
+    w walucie notowania. Dla settlement != quote cena każdego wiersza jest
+    przeliczana na walutę notowania kursem NBP z dnia transakcji (fx_lookup =
+    ostatni fixing <= data; PLN -> 1): price * fx(settlement, d) / fx(quote, d).
+    Brak któregokolwiek kursu -> price None i `fx_missing: True` (nigdy kurs z
+    innego dnia ani brak przeliczenia). Wiersze z price None bez zmian.
+    settlement == quote -> zwraca `rows` bez zmian (ten sam obiekt)."""
+    if settlement_currency == quote_currency:
+        return rows
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        price = r.get("price")
+        if price is None:
+            out.append(r)
+            continue
+        fx_s = fx_lookup(settlement_currency, r["date"])
+        fx_q = fx_lookup(quote_currency, r["date"])
+        new = dict(r)
+        if fx_s is None or fx_q is None or fx_q == 0:
+            new["price"] = None
+            new["fx_missing"] = True
+        else:
+            new["price"] = price * fx_s / fx_q
+        out.append(new)
+    return out
 
 
 def compute_weighted_entry_price(
@@ -734,11 +768,16 @@ def compute_weighted_entry_price(
       - agregacja kosztu obejmuje loty OBU znaków (potrzebne dla wejścia
         krótkiej pozycji kontraktu, KONTRAKTOWY/allow_short=True),
       - first/last data = z KOŃCOWEGO stanu kolejki lotów (pozostałe loty),
-        nie z licznika aktualizowanego przy każdej transakcji kupna."""
+        nie z licznika aktualizowanego przy każdej transakcji kupna.
+    Brief CC-W, B-41: opcjonalny klucz wiersza `fx_missing` (True = brak kursu
+    przeliczenia na walutę notowania, patrz `convert_entry_rows_to_quote`) jest
+    przenoszony na utworzony lot; jeśli któryś POZOSTAŁY lot go ma ->
+    entry_price=None i fx_missing=True (qty/daty liczone normalnie). Lot w pełni
+    zamknięty późniejszą sprzedażą flagi nie wnosi. Brak klucza = zachowanie bez zmian."""
     rows_sorted = sorted(rows, key=lambda r: r["date"])
     events_sorted = sorted(events, key=lambda e: e["date"])
 
-    lots: deque[list] = deque()  # [qty, price, entry_date]
+    lots: deque[list] = deque()  # [qty, price, entry_date, fx_missing]
     i, j = 0, 0
     while i < len(events_sorted) or j < len(rows_sorted):
         take_event = i < len(events_sorted) and (
@@ -766,13 +805,14 @@ def compute_weighted_entry_price(
                 lot[0] += remaining
                 remaining = Decimal(0)
 
+        fxm = bool(r.get("fx_missing", False))
         if remaining > 0:
-            lots.append([remaining, price if price is not None else Decimal(0), r["date"]])
+            lots.append([remaining, price if price is not None else Decimal(0), r["date"], fxm])
         elif remaining < 0:
             if allow_short:
-                lots.append([remaining, price if price is not None else Decimal(0), r["date"]])
+                lots.append([remaining, price if price is not None else Decimal(0), r["date"], fxm])
             else:
-                lots.append([remaining, Decimal(0), r["date"]])
+                lots.append([remaining, Decimal(0), r["date"], False])
         j += 1
 
     if not lots:
@@ -783,12 +823,16 @@ def compute_weighted_entry_price(
     first_remaining = min(lot[2] for lot in lots)
     last_remaining = max(lot[2] for lot in lots)
     entry_price = (cost_total / qty_total) if qty_total != 0 else None
+    fx_missing = any(lot[3] for lot in lots)
+    if fx_missing:
+        entry_price = None
 
     return WeightedEntryResult(
         entry_price=entry_price,
         qty=qty_total,
         first_remaining_date=first_remaining,
         last_remaining_date=last_remaining,
+        fx_missing=fx_missing,
     )
 
 
@@ -1530,7 +1574,18 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
             # instrument_id kontraktu jest bezpieczne/nogatywne w praktyce).
             allow_short = rachunek.upper().startswith(KONTRAKTOWY_PREFIX)
             txn_rows = _entry_transactions(cur, rachunek, pos["instrument_id"], pos["settlement_currency"], as_of)
+            # Brief CC-W, B-41: price transakcji jest w walucie rozliczenia, ATR/close
+            # w walucie notowania — loty settlement != quote przeliczane kursem NBP
+            # z dnia transakcji (ostatni fixing <= data); qty/daty bez zmian.
+            txn_rows = convert_entry_rows_to_quote(
+                txn_rows,
+                pos["settlement_currency"],
+                quote_currency,
+                lambda c, d: _fx_rate_on_or_before(cur, c, d)[0],
+            )
             entry_result = compute_weighted_entry_price(txn_rows, events, allow_short=allow_short)
+            if entry_result.fx_missing:
+                note = (note + ";" if note else "") + "entry_fx_missing"
 
             # Porównanie w TEJ SAMEJ warstwie ("na D") — entry_result.qty i
             # qty_d pochodzą oba z FIFO punktowego na D (S3, brief CC-S).
