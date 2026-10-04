@@ -365,7 +365,9 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
         # pozycje (z NAV, float) = pozycje z risk_daily (Decimal) z dokladnoscia do grosza
         assert abs(summary.capital_satelite_positions_pln - ref_capital_positions) < Decimal("0.01")
         assert abs(summary.kontraktowy_account_value_pln - ref_kontraktowy) < Decimal("0.01")
-        assert summary.total_risk_pct_satellite_capital == ref_total_risk_pct
+        # suma Decimal (28 cyfr) w innej kolejnosci niz run_risk (kolejnosc
+        # wierszy risk_daily zmienia sie po przeliczeniu D) — roznica do 1e-27
+        assert abs(summary.total_risk_pct_satellite_capital - ref_total_risk_pct) < Decimal("1e-20")
     finally:
         conn.rollback()
 
