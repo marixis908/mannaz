@@ -263,6 +263,7 @@ class SymbolPricesResult:
     log_return_outliers: list[tuple[date, Decimal]] = field(default_factory=list)
     adjustment_convention: str = "yahoo_split_adjusted"
     note: str = ""
+    revisions: int = 0  # B-05 (Y3) — wiersze z wpisem `provider_revision`
 
 
 @dataclass
@@ -275,6 +276,34 @@ class PricesSummary:
     instruments_with_rejected_rows: int = 0
     instruments_empty_response: int = 0
     rows_rejected_total: int = 0
+    # B-05 (Y3) — rewizje dostawcy w tym przebiegu: liczba wierszy z wpisem
+    # `provider_revision` (per instrument: `SymbolPricesResult.revisions`).
+    revisions_total: int = 0
+
+
+# B-05 (Y3): kolumny OHLC split_adj wchodzące do porównania rewizji dostawcy
+# (kolejność = kolejność w `detail`). volume_split_adj i total return NIE wchodzą.
+_REVISION_COLUMNS = ("open_split_adj", "high_split_adj", "low_split_adj", "close_split_adj")
+
+
+def _format_revision_detail(stored: dict[str, Decimal | None], row: "OhlcRow") -> str | None:
+    """B-05 (Y3): rewizja dostawcy = zmiana ZAPISANEJ, kompletnej (nie NULL)
+    wartości którejkolwiek z kolumn OHLC split_adj przy ponownym pobraniu.
+    Porównanie dokładne (Decimal `!=`, bez kwantyzacji): kolumny NUMERIC w
+    `prices_daily` nie mają skali (sql/001_schema.sql), więc wartość z bazy
+    jest dokładnie tym Decimalem, który został zapisany; `Decimal('10.50') ==
+    Decimal('10.5')`, więc ponowny zapis identycznych wartości daje 0 rewizji.
+    Zwraca `detail` w stałym formacie `col=<kolumna> old=<x> new=<y>; ...`
+    (tylko kolumny zmienione) albo None, gdy rewizji nie ma."""
+    parts: list[str] = []
+    for col in _REVISION_COLUMNS:
+        old = stored.get(col)
+        new = getattr(row, col)
+        if old is None or new is None:
+            continue
+        if old != new:
+            parts.append(f"col={col} old={old} new={new}")
+    return "; ".join(parts) if parts else None
 
 
 def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -> list[dict[str, Any]]:
@@ -478,8 +507,51 @@ def run_prices_fetch(
                     result.status = "ok"
                     summary.instruments_ok += 1
 
+            # B-05 (Y3): JEDNO zapytanie o zapisane OHLC split_adj tego
+            # instrumentu (źródło yahoo) w zakresie dat pobranych, poprawnych
+            # wierszy — porównanie per wiersz PRZED upsertem. Wiersze
+            # odrzucone przez T12 nie są tu (nie ma ich w `valid_rows`).
+            stored_by_date: dict[date, dict[str, Decimal | None]] = {}
+            if valid_rows:
+                cur.execute(
+                    """
+                    SELECT price_date, open_split_adj, high_split_adj, low_split_adj, close_split_adj
+                    FROM prices_daily
+                    WHERE instrument_id = %s AND source = 'yahoo'
+                      AND price_date BETWEEN %s AND %s
+                    """,
+                    (
+                        instrument_id,
+                        min(r.price_date for r in valid_rows),
+                        max(r.price_date for r in valid_rows),
+                    ),
+                )
+                for pd_, o_, h_, l_, c_ in cur.fetchall():
+                    stored_by_date[pd_] = {
+                        "open_split_adj": o_,
+                        "high_split_adj": h_,
+                        "low_split_adj": l_,
+                        "close_split_adj": c_,
+                    }
+
             inserted = 0
             for row in valid_rows:
+                stored = stored_by_date.get(row.price_date)
+                if stored is not None:
+                    revision_detail = _format_revision_detail(stored, row)
+                    if revision_detail is not None:
+                        _log_ingest_error(
+                            cur,
+                            source="yahoo",
+                            instrument_id=instrument_id,
+                            price_date=row.price_date,
+                            error_type="provider_revision",
+                            detail=revision_detail,
+                            run_started_at=run_started_at,
+                        )
+                        result.revisions += 1
+                        summary.revisions_total += 1
+
                 close_raw = reconstruct_raw(row.close_split_adj, row.price_date, events)
                 open_raw = reconstruct_raw(row.open_split_adj, row.price_date, events)
                 high_raw = reconstruct_raw(row.high_split_adj, row.price_date, events)

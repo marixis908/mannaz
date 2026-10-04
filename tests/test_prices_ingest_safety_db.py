@@ -512,3 +512,129 @@ def test_i5_missing_table_raises_before_any_price_write(monkeypatch):
     finally:
         conn.rollback()
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# B-05 (Y5) — rewizje dostawcy (`provider_revision`) przy ponownym pobraniu.
+# Dane syntetyczne (1990-01-0x), jedna transakcja, rollback w `finally`.
+# ---------------------------------------------------------------------------
+
+
+def _run_with_rows(conn, inst, monkeypatch, rows):
+    monkeypatch.setattr("mannaz.prices.fetch_ohlc", lambda symbol, start, end: rows)
+    monkeypatch.setattr("mannaz.prices.fetch_currency", lambda symbol: inst["currency"])
+    return run_prices_fetch(conn, instrument_ids=[inst["id"]], start=D_PREV, end=D0, commit=False)
+
+
+def _revisions(conn, instrument_id: int) -> list[tuple]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT price_date, source, detail, degraded_state FROM ingest_errors "
+            "WHERE instrument_id = %s AND error_type = 'provider_revision' ORDER BY id",
+            (instrument_id,),
+        )
+        return cur.fetchall()
+
+
+def _stored(conn, instrument_id: int, price_date: date) -> tuple:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT open_split_adj, high_split_adj, low_split_adj, close_split_adj, volume_split_adj "
+            "FROM prices_daily WHERE instrument_id = %s AND price_date = %s AND source = 'yahoo'",
+            (instrument_id, price_date),
+        )
+        return cur.fetchone()
+
+
+@pytest.mark.db
+def test_b05_positive_changed_close_logs_one_revision_and_overwrites(db_conn, test_instrument, monkeypatch):
+    conn, inst = db_conn, test_instrument
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        first = _run_with_rows(conn, inst, monkeypatch, [_row(D0)])
+        assert first.revisions_total == 0 and _revisions(conn, inst["id"]) == []
+
+        second = _run_with_rows(conn, inst, monkeypatch, [_row(D0, close="11.25")])
+        assert second.revisions_total == 1
+        assert second.results[0].revisions == 1
+        revs = _revisions(conn, inst["id"])
+        assert len(revs) == 1
+        assert revs[0] == (D0, "yahoo", "col=close_split_adj old=10.5 new=11.25", False)
+        assert _stored(conn, inst["id"], D0)[3] == Decimal("11.25")
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_multiple_columns_detail_order_open_high_low_close(db_conn, test_instrument, monkeypatch):
+    conn, inst = db_conn, test_instrument
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        _run_with_rows(conn, inst, monkeypatch, [_row(D0)])
+        _run_with_rows(conn, inst, monkeypatch, [_row(D0, high="12", close="11.25")])
+        revs = _revisions(conn, inst["id"])
+        assert [r[2] for r in revs] == ["col=high_split_adj old=11 new=12; col=close_split_adj old=10.5 new=11.25"]
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_negative_identical_rewrite_zero_revisions(db_conn, test_instrument, monkeypatch):
+    conn, inst = db_conn, test_instrument
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        _run_with_rows(conn, inst, monkeypatch, [_row(D0), _row(D_PREV)])
+        # ta sama wartosc w innym zapisie dziesietnym (10.50 == 10.5) tez nie jest rewizja
+        again = _run_with_rows(conn, inst, monkeypatch, [_row(D0, close="10.50"), _row(D_PREV)])
+        assert again.revisions_total == 0
+        assert _revisions(conn, inst["id"]) == []
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_volume_only_change_is_not_a_revision(db_conn, test_instrument, monkeypatch):
+    import dataclasses
+
+    conn, inst = db_conn, test_instrument
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        _run_with_rows(conn, inst, monkeypatch, [_row(D0)])
+        changed = dataclasses.replace(_row(D0), volume_split_adj=Decimal("2000"))
+        again = _run_with_rows(conn, inst, monkeypatch, [changed])
+        assert again.revisions_total == 0
+        assert _revisions(conn, inst["id"]) == []
+        assert _stored(conn, inst["id"], D0)[4] == Decimal("2000")  # nadpisanie jak dzis
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_new_date_zero_revisions(db_conn, test_instrument, monkeypatch):
+    conn, inst = db_conn, test_instrument
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        _run_with_rows(conn, inst, monkeypatch, [_row(D_PREV)])
+        again = _run_with_rows(conn, inst, monkeypatch, [_row(D_PREV), _row(D0)])  # D0 = nowa data
+        assert again.revisions_total == 0
+        assert _revisions(conn, inst["id"]) == []
+        assert _stored(conn, inst["id"], D0) is not None
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_t12_rejected_row_no_revision_stored_value_unchanged(db_conn, test_instrument, monkeypatch):
+    conn, inst = db_conn, test_instrument
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        _run_with_rows(conn, inst, monkeypatch, [_row(D_PREV), _row(D0)])
+        again = _run_with_rows(conn, inst, monkeypatch, [_row(D_PREV), _row(D0, close=None)])
+        assert again.revisions_total == 0
+        assert _revisions(conn, inst["id"]) == []
+        with conn.cursor() as cur:
+            cur.execute("SELECT error_type FROM ingest_errors WHERE instrument_id = %s", (inst["id"],))
+            assert [r[0] for r in cur.fetchall()] == ["row_missing_price"]
+        assert _stored(conn, inst["id"], D0)[3] == Decimal("10.5")
+    finally:
+        conn.rollback()

@@ -1317,3 +1317,111 @@ def test_level1_report_incomplete_name_listed():
     )
     assert "niepełne: AAA (AAA)" in line
     assert "przekroczenia > 1%: brak" in line
+
+
+# ---------------------------------------------------------------------------
+# B-05 (Y5) — rewizje cen dostawcy i przeliczenie D wobec zapisu poprzedniego
+# ---------------------------------------------------------------------------
+
+from mannaz.cycle import (  # noqa: E402
+    RiskDRow,
+    compare_risk_recompute,
+    parse_provider_revision,
+)
+
+
+def _risk_key(n: int, cur: str = "PLN"):
+    return ("AKCYJNY 000001", n, cur)
+
+
+def test_b05_risk_recompute_state_change_shows_ticker_not_account_number():
+    state = _complete_state()
+    before = {
+        _risk_key(1): RiskDRow("AAA", "NORMAL", Decimal("10"), Decimal("0.5")),
+        _risk_key(2): RiskDRow("BBB", "NORMAL", Decimal("20"), Decimal("1.0")),
+    }
+    after = {
+        _risk_key(1): RiskDRow("AAA", "HIGH", Decimal("10"), Decimal("0.5")),
+        _risk_key(2): RiskDRow("BBB", "NORMAL", Decimal("25"), Decimal("1.25")),
+    }
+    state.risk_recompute = compare_risk_recompute(before, after)
+    text = render_report(state)
+    assert "## Przeliczenie D wobec zapisu poprzedniego" in text
+    assert "AAA: NORMAL -> HIGH" in text
+    assert "BBB: NORMAL ->" not in text
+    assert "wiersze ze zmienionym risk_pln: 1" in text
+    assert "000001" not in text
+    rc = state.risk_recompute
+    assert (rc.sum_pln_before, rc.sum_pln_after) == (Decimal("30"), Decimal("35"))
+    assert (rc.heat_before, rc.heat_after) == (Decimal("1.5"), Decimal("1.75"))
+    assert (rc.only_before, rc.only_after) == (0, 0)
+
+
+def test_b05_risk_recompute_only_before_only_after_counted():
+    before = {_risk_key(1): RiskDRow("AAA", "NORMAL", None, None), _risk_key(2): RiskDRow("BBB", "HIGH", None, None)}
+    after = {_risk_key(1): RiskDRow("AAA", "NORMAL", None, None), _risk_key(3): RiskDRow("CCC", "HIGH", None, None)}
+    diff = compare_risk_recompute(before, after)
+    assert (diff.only_before, diff.only_after) == (1, 1)
+    assert diff.changed_states == [] and diff.changed_pln_rows == 0
+
+
+def test_b05_risk_recompute_first_recompute_message():
+    state = _complete_state()
+    state.risk_recompute = compare_risk_recompute({}, {_risk_key(1): RiskDRow("AAA", "NORMAL", None, None)})
+    assert "pierwsze przeliczenie D" in render_report(state)
+
+
+def test_b05_risk_recompute_not_executed_when_risk_stage_stopped():
+    state = _complete_state()
+    state.stage_not_executed = {"ryzyko"}
+    state.risk_recompute = None
+    text = render_report(state)
+    section = text.split("## Przeliczenie D wobec zapisu poprzedniego")[1].split("## ")[0]
+    assert "nie wykonano" in section
+
+
+def test_b05_revisions_section_brak_when_none():
+    text = render_report(_complete_state())
+    section = text.split("## Rewizje cen dostawcy")[1].split("## ")[0]
+    assert section.strip() == "brak"
+
+
+def test_b05_revisions_section_content_top_and_d():
+    state = _complete_state()  # d = 2026-09-25
+    state.provider_revisions = [
+        parse_provider_revision("AAA", 1, state.d, "col=close_split_adj old=100 new=110"),
+        parse_provider_revision(
+            "BBB", 2, date(2026, 9, 1), "col=close_split_adj old=50 new=49.5; col=high_split_adj old=1 new=2"
+        ),
+        parse_provider_revision("CCC", 3, date(2026, 9, 2), "col=open_split_adj old=1 new=2"),
+    ]
+    assert state.provider_revisions[0].close_delta_pct == Decimal(10)
+    text = render_report(state)
+    section = text.split("## Rewizje cen dostawcy")[1].split("## ")[0]
+    assert "rewizji w tym przebiegu: 3; instrumentów: 3" in section
+    assert "najstarsza price_date: 2026-09-01; najnowsza: 2026-09-25" in section
+    assert "| AAA | 2026-09-25 | 100 | 110 |" in section
+    assert section.index("| AAA |") < section.index("| BBB |")  # |10%| > |1%|
+    assert "col=close_split_adj old=100 new=110" in section.split("price_date = D")[1]
+    assert not has_data_failures(state)
+
+
+def test_b05_revisions_section_d_unknown():
+    state = _complete_state()
+    state.d = None
+    state.provider_revisions = [parse_provider_revision("AAA", 1, date(2026, 9, 1), "col=close_split_adj old=1 new=2")]
+    assert "D nieustalone" in render_report(state)
+
+
+def test_b05_revision_alone_is_not_data_failure_exit_0():
+    state = _complete_state()
+    state.provider_revisions = [parse_provider_revision("AAA", 1, date(2026, 9, 1), "col=close_split_adj old=1 new=2")]
+    state.exit_code = 2 if has_data_failures(state) else 0
+    assert not has_data_failures(state)
+    assert "Kod wyjścia: 0" in render_report(state)
+
+
+def test_b05_report_still_has_original_six_headers_in_order():
+    text = render_report(_complete_state())
+    positions = [text.index(h) for h in EXPECTED_HEADERS]
+    assert positions == sorted(positions)

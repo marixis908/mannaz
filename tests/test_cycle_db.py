@@ -527,3 +527,108 @@ def test_z2_real_account_numbers_never_leak_into_rendered_report(db_conn, tmp_pa
         assert identity_hits >= 1, "kontrolka dodatnia: z account_label=tozsamosc raport powinien ujawnic numer"
     finally:
         conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# B-05 (Y5) — przeliczenie D wobec zapisu poprzedniego i rewizje w cyklu.
+# Synteza: rachunek TEST 000001, D=1990-03-09; stub risk_fn przepisuje
+# risk_daily D (jak run_risk: DELETE + INSERT); FIFO/rejestracja stubowane.
+# ---------------------------------------------------------------------------
+
+D_B05 = date(1990, 3, 9)
+
+
+def _b05_instrument(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, broker_ticker FROM instruments ORDER BY id LIMIT 1")
+        row = cur.fetchone()
+    if row is None:
+        pytest.skip("brak instrumentu w bazie testowej")
+    return row
+
+
+def _b05_put_risk_row(conn, inst_id: int, state: str, pln: str, pct: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM risk_daily WHERE risk_date = %s AND rachunek = %s", (D_B05, RACHUNEK))
+        cur.execute(
+            "INSERT INTO risk_daily (rachunek, instrument_id, risk_date, risk_state, settlement_currency, "
+            "risk_pln, risk_pct_satellite_capital) VALUES (%s, %s, %s, %s, 'PLN', %s, %s)",
+            (RACHUNEK, inst_id, D_B05, state, Decimal(pln), Decimal(pct)),
+        )
+
+
+def _b05_run(tmp_path, conn, monkeypatch, risk_fn, fetch_prices=None):
+    monkeypatch.setattr("mannaz.cycle.run_fifo", lambda *a, **k: None)
+    monkeypatch.setattr("mannaz.cycle._registration_rows", lambda cur: [])
+    kwargs = _run_cycle_kwargs(tmp_path, conn, risk_fn=risk_fn, resolve_date_fn=lambda conn_, **k: D_B05)
+    if fetch_prices is not None:
+        kwargs["fetch_prices"] = fetch_prices
+    return run_cycle(**kwargs)
+
+
+@pytest.mark.db
+def test_b05_cycle_recompute_state_change_visible_with_ticker(db_conn, tmp_path, monkeypatch):
+    conn = db_conn
+    try:
+        inst_id, ticker = _b05_instrument(conn)
+        _b05_put_risk_row(conn, inst_id, "NORMAL", "10", "0.5")
+
+        def risk_fn(c, as_of, commit):
+            _b05_put_risk_row(c, inst_id, "HIGH", "12", "0.6")
+            return RiskSummary(risk_date=as_of)
+
+        result = _b05_run(tmp_path, conn, monkeypatch, risk_fn)
+        assert result.state.risk_recompute is not None
+        assert result.state.risk_recompute.changed_states == [(ticker, "NORMAL", "HIGH")]
+        text = result.report_path.read_text(encoding="utf-8")
+        assert f"{ticker}: NORMAL -> HIGH" in text
+        assert RACHUNEK.split(" ")[1] not in text
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_cycle_first_recompute_of_d(db_conn, tmp_path, monkeypatch):
+    conn = db_conn
+    try:
+        inst_id, _ = _b05_instrument(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM risk_daily WHERE risk_date = %s", (D_B05,))
+
+        def risk_fn(c, as_of, commit):
+            _b05_put_risk_row(c, inst_id, "NORMAL", "10", "0.5")
+            return RiskSummary(risk_date=as_of)
+
+        result = _b05_run(tmp_path, conn, monkeypatch, risk_fn)
+        assert result.state.risk_recompute.first_recompute is True
+        assert "pierwsze przeliczenie D" in result.report_path.read_text(encoding="utf-8")
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b05_cycle_provider_revision_reported_but_not_data_failure(db_conn, tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    conn = db_conn
+    try:
+        inst_id, ticker = _b05_instrument(conn)
+
+        def fetch_prices(c):
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ingest_errors (source, instrument_id, price_date, error_type, detail, "
+                    "degraded_state, run_started_at) VALUES ('yahoo', %s, %s, 'provider_revision', %s, FALSE, %s)",
+                    (inst_id, D_B05, "col=close_split_adj old=100 new=105", datetime.now(timezone.utc)),
+                )
+            return PricesSummary()
+
+        result = _b05_run(tmp_path, conn, monkeypatch, _stub_risk_fn(D_B05), fetch_prices=fetch_prices)
+        assert result.state.price_ingest_errors == []
+        assert len(result.state.provider_revisions) == 1
+        text = result.report_path.read_text(encoding="utf-8")
+        section = text.split("## Rewizje cen dostawcy")[1].split("## ")[0]
+        assert f"| {ticker} | 1990-03-09 | 100 | 105 |" in section
+        assert "col=close_split_adj old=100 new=105" in section.split("price_date = D")[1]
+    finally:
+        conn.rollback()

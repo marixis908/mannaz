@@ -14,6 +14,7 @@ wyjątku (złapanym per etap i zamienionym w DATA FAILURE, brief C8).
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -793,6 +794,121 @@ class RiskReportAggregates:
         )
 
 
+# ---------------------------------------------------------------------------
+# B-05 (Y4) — rewizje cen dostawcy i przeliczenie D wobec zapisu poprzedniego
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProviderRevision:
+    """Jedna rewizja dostawcy z bieżącego przebiegu (wiersz `ingest_errors`
+    z `error_type='provider_revision'`; format `detail` — patrz
+    `prices._format_revision_detail`). `close_old`/`close_new` wypełnione tylko,
+    gdy rewizja objęła `close_split_adj`."""
+
+    ticker: str
+    instrument_id: int | None
+    price_date: date | None
+    detail: str
+    close_old: Decimal | None = None
+    close_new: Decimal | None = None
+
+    @property
+    def close_delta_pct(self) -> Decimal | None:
+        if self.close_old is None or self.close_new is None or self.close_old == 0:
+            return None
+        return (self.close_new - self.close_old) / self.close_old * Decimal(100)
+
+
+_REVISION_CLOSE_RE = re.compile(r"col=close_split_adj old=(\S+) new=(\S+?)(?:;|$)")
+
+
+def parse_provider_revision(
+    ticker: str, instrument_id: int | None, price_date: date | None, detail: str | None
+) -> ProviderRevision:
+    """Czysta funkcja: buduje `ProviderRevision` z wiersza `ingest_errors`."""
+    text = detail or ""
+    close_old = close_new = None
+    m = _REVISION_CLOSE_RE.search(text)
+    if m:
+        try:
+            close_old, close_new = Decimal(m.group(1)), Decimal(m.group(2))
+        except Exception:  # noqa: BLE001 — niepoprawny format detail -> bez delty
+            close_old = close_new = None
+    return ProviderRevision(ticker, instrument_id, price_date, text, close_old, close_new)
+
+
+# klucz wiersza risk_daily: (rachunek, instrument_id, settlement_currency)
+RiskRowKey = tuple[str, int, "str | None"]
+
+
+@dataclass
+class RiskDRow:
+    """Wiersz risk_daily na D do porównania przed/po przeliczeniu."""
+
+    ticker: str
+    risk_state: str | None
+    risk_pln: Decimal | None
+    risk_pct: Decimal | None  # risk_pct_satellite_capital
+
+
+@dataclass
+class RiskRecomputeDiff:
+    """Wynik porównania stanu `risk_daily` na D przed i po `risk_fn`."""
+
+    first_recompute: bool  # przed risk_fn brak wierszy dla D
+    changed_states: list[tuple[str, str | None, str | None]] = field(default_factory=list)  # (ticker, stary, nowy)
+    changed_pln_rows: int = 0
+    sum_pln_before: Decimal = Decimal(0)
+    sum_pln_after: Decimal = Decimal(0)
+    heat_before: Decimal = Decimal(0)
+    heat_after: Decimal = Decimal(0)
+    only_before: int = 0
+    only_after: int = 0
+
+
+def compare_risk_recompute(
+    before: dict[RiskRowKey, RiskDRow], after: dict[RiskRowKey, RiskDRow]
+) -> RiskRecomputeDiff:
+    """B-05 (Y4): czysta funkcja. Klucz wiersza (rachunek, instrument_id,
+    settlement_currency). `heat` = suma `risk_pct_satellite_capital` wierszy D
+    (NULL pomijane) — TA SAMA metoda po obu stronach; `sum_pln` = suma
+    `risk_pln` wierszy D (NULL pomijane). Sumy dotyczą WSZYSTKICH wierszy
+    strony (także tych tylko przed / tylko po). Raport nie niesie numeru
+    rachunku — tylko `ticker` (broker_ticker)."""
+    diff = RiskRecomputeDiff(first_recompute=not before)
+    diff.sum_pln_before = sum((r.risk_pln for r in before.values() if r.risk_pln is not None), Decimal(0))
+    diff.sum_pln_after = sum((r.risk_pln for r in after.values() if r.risk_pln is not None), Decimal(0))
+    diff.heat_before = sum((r.risk_pct for r in before.values() if r.risk_pct is not None), Decimal(0))
+    diff.heat_after = sum((r.risk_pct for r in after.values() if r.risk_pct is not None), Decimal(0))
+    diff.only_before = sum(1 for k in before if k not in after)
+    diff.only_after = sum(1 for k in after if k not in before)
+    for key in sorted(before.keys() & after.keys(), key=lambda k: (before[k].ticker, k[0], k[1], k[2] or "")):
+        b, a = before[key], after[key]
+        if b.risk_state != a.risk_state:
+            diff.changed_states.append((a.ticker, b.risk_state, a.risk_state))
+        if b.risk_pln != a.risk_pln:
+            diff.changed_pln_rows += 1
+    return diff
+
+
+def _risk_daily_snapshot(cur: psycopg.Cursor, d: date) -> dict[RiskRowKey, RiskDRow]:
+    cur.execute(
+        """
+        SELECT r.rachunek, r.instrument_id, r.settlement_currency, i.broker_ticker,
+               r.risk_state, r.risk_pln, r.risk_pct_satellite_capital
+        FROM risk_daily r
+        JOIN instruments i ON i.id = r.instrument_id
+        WHERE r.risk_date = %s
+        """,
+        (d,),
+    )
+    return {
+        (rachunek, inst_id, cur_): RiskDRow(ticker, state, pln, pct)
+        for rachunek, inst_id, cur_, ticker, state, pln, pct in cur.fetchall()
+    }
+
+
 @dataclass
 class ReportState:
     """Stan wejściowy `render_report` — czysty (bez bazy), budowany przez
@@ -833,6 +949,12 @@ class ReportState:
 
     # Ryzyko
     risk_aggregates: RiskReportAggregates | None = None
+
+    # B-05: informacja (NIE DATA FAILURE, nie zatrzymuje cyklu, nie zmienia
+    # kodu wyjścia): rewizje cen dostawcy z bieżącego przebiegu oraz
+    # przeliczenie D wobec zapisu poprzedniego.
+    provider_revisions: list[ProviderRevision] = field(default_factory=list)
+    risk_recompute: RiskRecomputeDiff | None = None
 
     # Zmiany pozycji
     position_changes: list[PositionChange] = field(default_factory=list)
@@ -1111,6 +1233,78 @@ def _render_risk_section(state: ReportState) -> list[str]:
     return lines
 
 
+def _render_provider_revisions_section(state: ReportState) -> list[str]:
+    """B-05 (Y4): sekcja informacyjna (poza DATA FAILURE), po sekcji Ryzyko."""
+    lines = ["## Rewizje cen dostawcy"]
+    if STAGE_PRICES_FX in state.stage_not_executed:
+        lines.append(f"nie wykonano (cykl zatrzymany na etapie {STAGE_LABELS[STAGE_PRICES_FX]})")
+        return lines
+    revs = state.provider_revisions
+    if not revs:
+        lines.append("brak")
+        return lines
+    dates = [r.price_date for r in revs if r.price_date is not None]
+    n_inst = len({(r.instrument_id, r.ticker) for r in revs})
+    lines.append(f"- rewizji w tym przebiegu: {len(revs)}; instrumentów: {n_inst}")
+    lines.append(f"- najstarsza price_date: {_fmt_date(min(dates) if dates else None)}; "
+                 f"najnowsza: {_fmt_date(max(dates) if dates else None)}")
+
+    def _row(r: ProviderRevision) -> str:
+        delta = r.close_delta_pct
+        delta_txt = format_pct(delta.quantize(Decimal("0.01"))) if delta is not None else "brak"
+        return f"| {r.ticker} | {_fmt_date(r.price_date)} | {r.close_old} | {r.close_new} | {delta_txt} |"
+
+    header = ["| ticker | data | stara close_split_adj | nowa close_split_adj | delta |", "|---|---|---|---|---|"]
+    close_revs = [r for r in revs if r.close_delta_pct is not None]
+    lines.append("- 20 największych zmian close_split_adj (wg |delta%|):")
+    if close_revs:
+        top = sorted(close_revs, key=lambda r: abs(r.close_delta_pct), reverse=True)[:20]
+        lines.extend(header)
+        lines.extend(_row(r) for r in top)
+    else:
+        lines.append("brak")
+    lines.append("- rewizje z price_date = D:")
+    if state.d is None:
+        lines.append("D nieustalone")
+    else:
+        on_d = [r for r in revs if r.price_date == state.d]
+        if on_d:
+            lines.append("| ticker | data | zmienione kolumny |")
+            lines.append("|---|---|---|")
+            for r in on_d:
+                lines.append(f"| {r.ticker} | {_fmt_date(r.price_date)} | {r.detail} |")
+        else:
+            lines.append("brak")
+    return lines
+
+
+def _render_risk_recompute_section(state: ReportState) -> list[str]:
+    """B-05 (Y4): przeliczenie D wobec zapisu poprzedniego (risk_daily na D
+    przed i po `risk_fn`). Po sekcji Ryzyko."""
+    lines = ["## Przeliczenie D wobec zapisu poprzedniego"]
+    if STAGE_RISK in state.stage_not_executed or state.risk_recompute is None:
+        lines.append(f"nie wykonano (cykl zatrzymany na etapie {STAGE_LABELS[STAGE_RISK]})")
+        return lines
+    rc = state.risk_recompute
+    if rc.first_recompute:
+        lines.append(f"pierwsze przeliczenie D (D={_fmt_date(state.d)})")
+        return lines
+    if rc.changed_states:
+        lines.append("- zmiana risk_state:")
+        for ticker, old, new in rc.changed_states:
+            lines.append(f"    - {ticker}: {old or 'brak'} -> {new or 'brak'}")
+    else:
+        lines.append("- zmiana risk_state: brak")
+    lines.append(f"- wiersze ze zmienionym risk_pln: {rc.changed_pln_rows}")
+    lines.append(
+        f"- suma risk_pln przed -> po: {format_money(rc.sum_pln_before, 'PLN')} -> "
+        f"{format_money(rc.sum_pln_after, 'PLN')}"
+    )
+    lines.append(f"- heat przed -> po: {format_pct(rc.heat_before)} -> {format_pct(rc.heat_after)}")
+    lines.append(f"- wiersze tylko przed: {rc.only_before}; tylko po: {rc.only_after}")
+    return lines
+
+
 def _render_position_changes_section(state: ReportState) -> list[str]:
     lines = ["## Zmiany pozycji"]
     if STAGE_FIFO in state.stage_not_executed:
@@ -1176,6 +1370,12 @@ def render_report(state: ReportState) -> str:
     lines.extend(_render_stop_orders_section(state))
     lines.append("")
     lines.extend(_render_risk_section(state))
+    lines.append("")
+    # B-05: dwie sekcje informacyjne tuż po "Ryzyko" (kolejność 6 dotychczasowych
+    # nagłówków bez zmian).
+    lines.extend(_render_provider_revisions_section(state))
+    lines.append("")
+    lines.extend(_render_risk_recompute_section(state))
     lines.append("")
     lines.extend(_render_position_changes_section(state))
     lines.append("")
@@ -1613,6 +1813,7 @@ def run_cycle(
                 FROM ingest_errors ie
                 LEFT JOIN instruments i ON i.id = ie.instrument_id
                 WHERE ie.run_started_at >= %s
+                  AND ie.error_type <> 'provider_revision'
                 ORDER BY ie.id
                 """,
                 (run_started_at,),
@@ -1621,6 +1822,22 @@ def run_cycle(
                 state.price_ingest_errors.append(
                     f"{source} {symbol or 'brak'} data={_fmt_date(price_date)} {error_type}: {detail}"
                 )
+            # B-05: rewizja dostawcy NIE jest DATA FAILURE (wykluczona wyżej) —
+            # trafia do osobnej sekcji informacyjnej raportu.
+            cur.execute(
+                """
+                SELECT COALESCE(i.broker_ticker, i.yahoo_symbol), ie.instrument_id, ie.price_date, ie.detail
+                FROM ingest_errors ie
+                LEFT JOIN instruments i ON i.id = ie.instrument_id
+                WHERE ie.run_started_at >= %s AND ie.error_type = 'provider_revision'
+                ORDER BY ie.id
+                """,
+                (run_started_at,),
+            )
+            state.provider_revisions = [
+                parse_provider_revision(ticker or "brak", inst_id, price_date, detail)
+                for ticker, inst_id, price_date, detail in cur.fetchall()
+            ]
 
         for r in fx_summary.results:
             if r.error:
@@ -1642,12 +1859,21 @@ def run_cycle(
             prev_date = cur.fetchone()[0]
         state.prev_risk_date = prev_date
 
+        # B-05 (Y4): migawka risk_daily na D PRZED przeliczeniem (run_risk robi
+        # DELETE + INSERT dla D), porównanie zaraz po risk_fn.
+        with conn.cursor() as cur:
+            risk_before = _risk_daily_snapshot(cur, d)
+
         try:
             risk_summary = risk_fn(conn, as_of=d, commit=commit)
         except IncompleteRiskDateError as exc:
             state.date_incomplete_items = list(exc.items)
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop() from exc
+
+        with conn.cursor() as cur:
+            risk_after = _risk_daily_snapshot(cur, d)
+        state.risk_recompute = compare_risk_recompute(risk_before, risk_after)
 
         name_ids = sorted({r.name_key for r in risk_summary.rows if r.name_key is not None})
         name_labels: dict[int, str] = {}
