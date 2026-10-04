@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.9 · 2026-10-02**
+**Rewizja 4.13 · 2026-10-04**
 
 ---
 
@@ -36,7 +36,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.8 | 2026-10-02 | §21.6 ocena satelity jako całości (M78–M87, T39–T42): granica subportfela, nadwyżka majątku ΔW w PLN, dwa progi — S&P 500 TR (UCITS) i SPYI, werdykt w trzech statusach, trzy rejestry pomiaru, atrybucja w kwotach PLN; M59 i przykład M57 przepisane; §2.1 oznaczony jako stan historyczny; §28 pytania 2–4; O-46–O-50 (decyzje ownera 2026-10-02 po dwóch rundach recenzji zewnętrznej) |
 | 4.9 | 2026-10-02 | Limity mandatu ryzyka satelity: L_max = 35% (T41), L_rel = 20% wobec każdego progu (T43), progi alertów (T44); M88 — trzy składniki mandatu, koniunkcja, logika statusu przy brakach; M89 — okno kroczące, trwały rejestr naruszeń, alerty na obsunięciu bieżącym z histerezą i eskalacją, zmiany limitów prospektywnie; M83 i §28 pytanie 4 (decyzje ownera 2026-10-02) |
 | 4.11 | 2026-10-04 | §19.1: cena wejścia stopu 2N w walucie notowania — lot rozliczony w innej walucie przeliczany kursem krzyżowym NBP A z dnia transakcji przed średnią ważoną; brak kursu → brak stopu 2N (B-41, brief CC-W; numer 4.10 zarezerwowany dla T45/B-43) |
-| **4.12** | **2026-10-04** | **§19.4: kapitał satelity w budżetach ryzyka = NAV satelity z §21.6 (M78), z gotówką; NAV niepełny → brak przebiegu ryzyka dla D (B-17); §19 M77: domyślne D kompletne w cenach i w rozliczeniu KONTRAKTOWY (B-36), detektor zdarzeń korporacyjnych etapem cyklu z bramką DATA REVIEW (B-29); §14.1 pytanie 7: hosting, IaaS i rejestracja domen nie są oprogramowaniem (decyzje ownera 2026-10-04, brief CC-W2)** |
+| 4.12 | 2026-10-04 | §19.4: kapitał satelity w budżetach ryzyka = NAV satelity z §21.6 (M78), z gotówką; NAV niepełny → brak przebiegu ryzyka dla D (B-17); §19 M77: domyślne D kompletne w cenach i w rozliczeniu KONTRAKTOWY (B-36), detektor zdarzeń korporacyjnych etapem cyklu z bramką DATA REVIEW (B-29); §14.1 pytanie 7: hosting, IaaS i rejestracja domen nie są oprogramowaniem (decyzje ownera 2026-10-04, brief CC-W2) |
+| **4.13** | **2026-10-04** | **§9.6: konwencja „raw” w yfinance (`*_split_adj` = stan u dostawcy w chwili pobrania, `*_raw` ze zdarzeń w `corporate_events`, detektor z ilorazu, ryzyko w warstwie `*_split_adj`); M67: rewizja dostawcy — definicja, zapis do `ingest_errors` (`provider_revision`), sekcje raportu cyklu, bez zatrzymania cyklu (B-05, brief CC-B05)** |
 
 ### 0.3 Oznaczenia
 
@@ -560,6 +561,16 @@ Pozostałe kanały:
 **Wniosek [S]: fundamentów GPW nie da się zautomatyzować w sposób, na którym można oprzeć archiwum point-in-time.** Zostaje wpis ręczny — co jest zbieżne z wersją minimalną i nie jest obejściem, tylko właściwą kolejnością.
 
 **Jedno działanie pilne:** jednorazowy backfill z `filings.xbrl.org` za FY2020–FY2023 dla ok. 150 polskich emitentów. Regulamin serwisu wprost zastrzega prawo do wycofania API. To jedyne darmowe, czyste XBRL dla polskich spółek, jakie istnieje, i daje historyczną głębokość mnożników nieodtwarzalną później. Biblioteka `xbrl-filings-api` istnieje i jest gotowa.
+
+### 9.6 Konwencja „raw” w yfinance [Z]
+
+`auto_adjust=False` nie daje ceny z dnia sesji. Yahoo koryguje historię o splity wstecz, także wtedy, gdy w `Ticker.splits` nie ma rekordu zdarzenia (zmierzone 2026-09-26: SPYI.DE ok. 7 EUR w 2023-10 wobec ok. 170 EUR w zapisie brokera; B-05). Dlatego:
+
+1. `*_split_adj` w `prices_daily` to wartość taka, jaką Yahoo pokazuje w chwili pobrania. Nie jest gwarancją ceny z dnia sesji.
+2. `*_raw` odtwarza się, cofając zdarzenia z `corporate_events` (`split`, `reverse_split` ze znanym `ratio`). Bez takich zdarzeń `*_raw = *_split_adj`, a `adjustment_convention = yahoo_split_adjusted`.
+3. Split bez rekordu u dostawcy wykrywa detektor z ilorazu cena brokera / close Yahoo — etap cyklu przed FIFO z potwierdzeniem ownera (§19, akapit po M77).
+4. Ryzyko (stopy, ATR, Chandelier, cena zamknięcia na D) liczy się w warstwie `*_split_adj` (T6). Ilość i cenę wejścia z brokera przenosi się do tej warstwy czynnikiem ze zdarzeń w `corporate_events`. Brak zdarzenia przy cenach już skorygowanych przez Yahoo daje błąd rzędu ratio — dlatego detektor jest etapem cyklu, a nie kontrolą okazjonalną.
+5. Wartości historyczne zmieniają się między pobraniami także bez splitu — rewizje dostawcy (M67).
 
 ## 10. Wielowalutowość, FX i konwencje
 
@@ -1267,7 +1278,7 @@ Etap lokalny (do przeniesienia na VPS): przebieg główny uruchamia owner ręczn
 
 **M66.** Godzina 04:30 UTC omija zmierzoną anomalię obciążenia VPS o 06:00 UTC (§7.1). Przebieg sobotni o 07:00 UTC działa na domkniętym tygodniu wszystkich giełd.
 
-**M67.** Dane sesji D są **odświeżane w oknie D−5** przy każdym przebiegu, a rozbieżności logowane do `ingest_errors`. Dostawcy doprecyzowują sesje i nakładają korekty korporacyjne po fakcie.
+**M67.** Dane sesji D są **odświeżane w oknie D−5** przy każdym przebiegu, a rozbieżności logowane do `ingest_errors`. Dostawcy doprecyzowują sesje i nakładają korekty korporacyjne po fakcie. Rewizja dostawcy to zmiana zapisanej, kompletnej wartości `open/high/low/close_split_adj` przy ponownym pobraniu; porównanie dokładne. Importer zapisuje ją do `ingest_errors` (`error_type = provider_revision`, stara i nowa wartość) przed nadpisaniem. Raport cyklu pokazuje rewizje z przebiegu oraz zmianę `risk_daily` dla przeliczanego D wobec poprzedniego zapisu (stany ryzyka, suma `risk_pln`, heat). Rewizja nie zatrzymuje cyklu. Wolumen i warstwa total return są poza porównaniem (B-05).
 
 ### 23.3 Dead-man switch
 
