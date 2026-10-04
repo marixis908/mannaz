@@ -5,15 +5,15 @@ i uzupełnia datę — wiersz zostaje.
 
 | id | pozycja | status | otwarte | zamknięte | uwagi |
 |---|---|---|---|---|---|
-| B-01 | Skrypty Pine (TradingView) w scripts/pine/ | otwarte | 2026-09-25 |  | us_b, us_c, eu_2 w d92b9f5; us_a w 15acbb3; strażnik US-B w 5ee8dbc; zamknięcie po teście strażnika w TradingView (owner) |
+| B-01 | Skrypty Pine (TradingView) w scripts/pine/ | zamknięte | 2026-09-25 | 2026-10-04 | us_b, us_c, eu_2 w d92b9f5; us_a w 15acbb3; strażnik US-B w 5ee8dbc; zamknięcie po teście strażnika w TradingView (owner); strażnik US-B przetestowany w TradingView 2026-09-25: QQQ bez błędu, ASML `RE10142`; wpis w docs/decyzje.md 2026-09-25 |
 | B-02 | Rewizja 3 dokumentu projektowego: §28 P-07 → zamknięty (firewall frank-web aktywny, 22/80/443, pomiar 2026-09-25); P-09 → pomiar zapasu RAM zamiast decyzji o upgrade (VPS to już KVM 2); §5.5 zdanie o KVM 1 rozstrzygnięte | zamknięte | 2026-09-25 | 2026-09-25 | 32ddd50 |
-| B-03 | Odświeżenie kopii dokumentu projektowego w projekcie Claude po każdej zmianie w repo | otwarte | 2026-09-25 |  | kopia jest pochodną, sama się nie synchronizuje |
+| B-03 | Odświeżenie kopii dokumentu projektowego w projekcie Claude po każdej zmianie w repo | odrzucone | 2026-09-25 | 2026-10-04 | kopia jest pochodną, sama się nie synchronizuje; bezprzedmiotowe: dokument w projekcie Claude wyłącznie przez synchronizację GitHub, ręcznych kopii nie trzymamy (instrukcja projektu) |
 | B-04 | Magazyn danych: „docelowo w NocoDB” (decyzja 25.09) vs §6/§7.3 (NocoDB tylko podgląd) i §5.5 (wspólna instancja Postgresa vs osobny kontener) | zamknięte | 2026-09-25 | 2026-09-25 | osobny kontener PostgreSQL; decyzja w docs/decyzje.md |
 | B-05 | Konwencja „raw” yfinance: `auto_adjust=False` bywa retroaktywnie skorygowany o splity, także bez rekordu splitu (SPYI.DE ~7 EUR vs broker ~170 EUR) — do dokumentu §9/§10 | otwarte | 2026-09-26 |  | **priorytet**; rew. 5; w kodzie: close_raw odtwarzany ze zdarzeń, detektor splitów z ilorazu ceny zostaje |
 | B-06 | Semantyka zapadki Chandeliera na dzień zero | otwarte | 2026-09-26 |  | rozwiązane erratum §19.3 w rew. 4 (zapadka od inicjalizacji); przegląd w shadow mode |
 | B-07 | σ w OSTRZEŻENIU (§19.1): odchylenie populacyjne czy z próby | otwarte | 2026-09-26 |  | kod: `statistics.pstdev` |
 | B-08 | Migawka pozycji brokera jako warunek prawdziwej kontroli FIFO (P2.6) | otwarte | 2026-09-26 |  | bez migawki kontrola jest kołowa |
-| B-09 | MDV + FMDVZ26 jako jedna nazwa w budżecie poziomu 1 (§19.2) | otwarte | 2026-09-26 |  | decyzja ownera 2026-09-26; rew. 5; kod bez zmian; **zastąpione w tej części przez B-30** (nazwa = emitent); część o nazwie zamknięta przez B-30 |
+| B-09 | MDV + FMDVZ26 jako jedna nazwa w budżecie poziomu 1 (§19.2) | zamknięte | 2026-09-26 | 2026-10-04 | decyzja ownera 2026-09-26; rew. 5; kod bez zmian; **zastąpione w tej części przez B-30** (nazwa = emitent); część o nazwie zamknięta przez B-30; zastąpione w całości przez B-30 (1c38d21) |
 | B-10 | Budżet poziomu 2 na korelacjach zamiast tematów (M50) | otwarte | 2026-09-26 |  | propozycja nadzorcy |
 | B-11 | VRC → temat software; archetyp CBF (klucz v2: A2, opis ownera: A4) | otwarte | 2026-09-26 |  | czeka na ownera |
 | B-12 | Kapitał satelity: wartość rachunku KONTRAKTOWY (środki + wynik zmienny) zgodnie z §19.4 | zamknięte | 2026-09-26 | 2026-09-26 | brief CC-R, merge `feat/risk-kontrakty`; wartość = środki ogółem z depozytem (§19.4 rew. 4.1) |
@@ -45,6 +45,6 @@ i uzupełnia datę — wiersz zostaje.
 | B-38 | Implementacja §21.6: dzienny NAV satelity z gotówką, klasyfikator przepływów M80, ΔW wobec dwóch progów, TWR i obsunięcie, atrybucja M85, raport M83 | otwarte | 2026-10-02 |  | zrobione: NAV, przepływy, TWR, ΔW, obsunięcia, mandat, beta (CC-OS2); zostaje: atrybucja M85, raport M86, rejestr 2, alerty w cyklu |
 | B-39 | L_max (T41): decyzja ownera po pomiarze obsunięć obu progów w PLN, przed pomiarem obsunięć satelity | zamknięte | 2026-10-02 | 2026-10-02 | L_max = 35%, L_rel = 20% (T41, T43, rew. 4.9) |
 | B-40 | Rewizja 4.9 dokumentu: T41 = 35%, T43 = 20%, T44, M88, M89, M83, §28 pytanie 4 | zamknięte | 2026-10-02 | 2026-10-02 | brief CC-OS2, część D; decyzje ownera 2026-10-02 |
-| B-41 | risk.py:1532-1555 stop_2n moze laczyc cene wejscia w walucie rozliczenia z ATR w walucie notowania; dotyczy otwartych CSU, GRAB, META; heat i M50 potencjalnie bledne | otwarte | 2026-10-02 | | raport-OS2 §6 |
+| B-41 | risk.py:1532-1555 stop_2n moze laczyc cene wejscia w walucie rozliczenia z ATR w walucie notowania; dotyczy otwartych CSU, GRAB, META; heat i M50 potencjalnie bledne | zamknięte | 2026-10-02 | 2026-10-04 | raport-OS2 §6; potwierdzone (price w walucie rozliczenia, 8/8 lotów w [Low, High] dopiero po przeliczeniu); poprawka 8b3915c, testy 3d83a09, rew. 4.11 (brief CC-W) |
 | B-42 | Import eksportu CSV z TradingView do prices_daily (zrodlo dozwolone w instrukcji projektu); po nim zastapic wycene modelowa SHO 2025-01-07..2026-07-16 cenami rzeczywistymi | otwarte | 2026-10-02 | | raport-OS2 §7 |
 | B-43 | Rew. 4.10: T45 - wycena modelowa instrumentow bez notowan w zrodlach systemu (zakres rozszerzony 2026-10-02 o SHO), odcinkami liniowa miedzy cenami transakcyjnymi, wykup = kwota / ilosc, flaga, prog 10% | otwarte | 2026-10-02 | | raport-OS2 §7 |
