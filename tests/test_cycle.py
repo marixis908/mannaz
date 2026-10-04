@@ -1273,7 +1273,7 @@ def _l1_summary(rows):
         rows=rows, theme_budgets={}, total_risk_pct_satellite_capital=None,
         total_risk_pct_zagraniczny_satellite_capital=None, level3_breach=False,
         capital_satelite_positions_pln=Decimal(0), kontraktowy_account_value_pln=Decimal(0),
-        capital_satelite_pln=Decimal(0), level1_breach_tickers=["STALE-ROW-LIST"],
+        capital_satelite_pln=Decimal(0), capital_satelite_cash_pln=Decimal(0), level1_breach_tickers=["STALE-ROW-LIST"],
     )
 
 

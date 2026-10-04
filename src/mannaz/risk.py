@@ -82,8 +82,7 @@ CC-R, krok K4 (§19.4 dokumentu projektowego — kontrakty w budżetach ryzyka):
 kontrakty terminowe WCHODZĄ do budżetów poziomów 1-3 (`is_risk_budget_eligible`
 = equity/etf spoza core LUB future) ryzykiem (`risk_pln`), analogicznie do
 akcji/ETF satelitarnych — ale ich NOMINAŁ nigdy nie wchodzi do kapitału
-satelity (kapitał liczy tylko wartość pozycji equity/etf spoza core, patrz
-komentarz przy `capital_satelite_positions_pln` w `run_risk`). Zamiast
+satelity (pozycje w kapitale to tylko equity/etf spoza core). Zamiast
 nominału do kapitału satelity wchodzi WARTOŚĆ RACHUNKU KONTRAKTOWY (decyzja
 nadzorcy K3): środki ogółem łącznie z depozytem zablokowanym, liczone przez
 `kontraktowy_account_value` z historii `transactions` (rachunek KONTRAKTOWY) —
@@ -92,6 +91,13 @@ w środkach (wiersze `depozyt_doplata`/`depozyt_zwrot`). `capital_by_rachunek`
 i metryki ZAGRANICZNY (wagi pozycji/below_stop/below_chandelier_hold w %
 wartości) pozostają BEZ ZMIAN — kontrakty tam nie wchodzą, tylko w budżety
 i w łączny kapitał satelity (`capital_satelite_pln`).
+
+B-17 (decyzja ownera 2026-10-04, M78): kapitał satelity w budżetach §19 =
+NAV satelity z §21.6 — pozycje equity/etf spoza core + gotówka rachunków
+AKCYJNY i ZAGRANICZNY (bez `NON_CASH_ROW_TYPES`) + wartość rachunku
+KONTRAKTOWY. Jedna definicja: `run_risk` woła `satellite.nav_on` (ta sama
+funkcja NAV co ocena satelity); NAV niepełny na D -> `IncompleteRiskDateError`
+bez zapisu (pozycje `nav_incomplete:*`).
 
 Brief CC-U (B-19), U2-U5 (T27 dokumentu projektowego — forward-fill max 1-2
 dni, wyłącznie rynek faktycznie zamknięty, zawsze z flagą stale): pozycja bez
@@ -1115,9 +1121,11 @@ class RiskSummary:
     multiplier_missing_tickers: list[str] = field(default_factory=list)
     futures_nominal_sanity: dict[str, bool] = field(default_factory=dict)
     theme_budgets: dict[str, ThemeBudgetResult] = field(default_factory=dict)
-    # CC-R (§19.4): kapitał satelity = wartość pozycji (equity/etf spoza core,
-    # BEZ futures) + wartość rachunku KONTRAKTOWY (nominał futures nie wchodzi).
+    # B-17 (M78): kapitał satelity = NAV z §21.6 (nominał futures nie wchodzi,
+    # §19.4; do 2026-10-04 bez gotówki, CC-R); poniżej rozkład informacyjny
+    # (pozycje + gotówka AKCYJNY/ZAGRANICZNY + KONTRAKTOWY = capital_satelite_pln).
     capital_satelite_positions_pln: Decimal = Decimal(0)
+    capital_satelite_cash_pln: Decimal = Decimal(0)
     kontraktowy_account_value_pln: Decimal = Decimal(0)
     capital_satelite_pln: Decimal = Decimal(0)
     # CC-U (U4, T27): pozycje z cena forward-filled (rynek zamkniety w D,
@@ -1495,7 +1503,6 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         }
 
         capital_by_rachunek: dict[str, Decimal] = {}
-        capital_satelite_positions_pln = Decimal(0)
         positions_count_by_rachunek: dict[str, int] = {}
 
         computed: list[PositionRiskRow] = []
@@ -1698,7 +1705,6 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
             # zamiast niego wchodzi wartość rachunku KONTRAKTOWY, patrz niżej). ---
             if instrument_type in ("equity", "etf") and not is_core:
                 value_pln = close_d * qty * fx_rate
-                capital_satelite_positions_pln += value_pln
                 capital_by_rachunek[rachunek] = capital_by_rachunek.get(rachunek, Decimal(0)) + value_pln
                 positions_count_by_rachunek[rachunek] = positions_count_by_rachunek.get(rachunek, 0) + 1
                 summary.capital_satelite_positions_total += 1
@@ -1709,24 +1715,41 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         # zmienionych, rollback PRZED jakimkolwiek zapisem (przed DELETE, S4).
         # Zbieramy WSZYSTKIE pozycje niekompletne (nie przerywamy na
         # pierwszej) — patrz `incomplete_items.append(...)` w pętli wyżej. ---
+        # --- B-17 (M78): kapitał satelity = NAV z §21.6 (jedna definicja,
+        # `satellite.nav_on`). NAV niepełny na D -> te same ścieżki co pozycje
+        # niekompletne (rollback przed zapisem + wyjątek z listą przyczyn). ---
+        # import lokalny: satellite importuje risk na poziomie modułu (cykl)
+        from mannaz.satellite import nav_on
+
+        nav = nav_on(cur, as_of)
+        if not nav.complete:
+            for component, reason in nav.missing:
+                incomplete_items.append(
+                    IncompleteRiskItem(component, None, None, f"nav_incomplete:{reason}")
+                )
         if incomplete_items:
             conn.rollback()
             raise IncompleteRiskDateError(as_of, incomplete_items)
 
-        # --- kapitał satelity CC-R (§19.4 + decyzja nadzorcy K3): pozycje
-        # equity/etf (wyżej) + wartość rachunku KONTRAKTOWY (środki ogółem
-        # łącznie z depozytem zablokowanym; wynik zmienny już w niej —
-        # patrz docstring modułu / kontraktowy_account_value). Kontrola
-        # pokrycia PRZED liczeniem wartości — nigdy cichego zera. ---
+        # --- kapitał satelity B-17: NAV (pozycje equity/etf spoza core, BEZ
+        # nominału futures + gotówka AKCYJNY/ZAGRANICZNY + wartość rachunku
+        # KONTRAKTOWY, §19.4). Kontrola pokrycia KONTRAKTOWY zostaje jako
+        # bramka — nigdy cichego zera. Rozkład tylko informacyjny, z NavResult. ---
         kontraktowy_rows = _kontraktowy_rows(cur, as_of)
         has_open_futures = any(p["instrument_type"] == "future" for p in positions)
         max_kontraktowy_date = max((r["transaction_date"] for r in kontraktowy_rows), default=None)
         check_kontraktowy_coverage(len(kontraktowy_rows), max_kontraktowy_date, has_open_futures, as_of)
-        kontraktowy_value_pln = kontraktowy_account_value(kontraktowy_rows, as_of)
 
-        summary.capital_satelite_positions_pln = capital_satelite_positions_pln
+        capital_satelite_pln = Decimal(str(nav.value))
+        kontraktowy_value_pln = Decimal(str(nav.by_account_pln.get(("KONTRAKTOWY", "PLN"), 0.0)))
+        cash_pln = Decimal(str(sum(
+            amount * nav.rates[cur_code]
+            for (grp, cur_code), amount in nav.cash_native.items()
+            if grp != "KONTRAKTOWY" and amount != 0  # 0 bez kursu nie trafia do nav.rates
+        )))
         summary.kontraktowy_account_value_pln = kontraktowy_value_pln
-        capital_satelite_pln = capital_satelite_positions_pln + kontraktowy_value_pln
+        summary.capital_satelite_cash_pln = cash_pln
+        summary.capital_satelite_positions_pln = capital_satelite_pln - cash_pln - kontraktowy_value_pln
         summary.capital_satelite_pln = capital_satelite_pln
 
         # --- U4 (brief CC-U): udział pozycji stale w kapitale satelity. ---

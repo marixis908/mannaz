@@ -12,6 +12,7 @@ import pytest
 from mannaz.db import get_connection
 from mannaz.fifo import KONTRAKTOWY_PREFIX, positions_as_of
 from mannaz.risk import (
+    NON_CASH_ROW_TYPES,
     RATCHET_INIT_DATE,
     IncompleteRiskDateError,
     is_risk_budget_eligible,
@@ -19,6 +20,7 @@ from mannaz.risk import (
     resolve_default_risk_date,
     run_risk,
 )
+from mannaz.satellite import nav_on
 
 
 @pytest.fixture
@@ -271,8 +273,12 @@ def test_u5_open_market_gap_on_real_data_raises_and_writes_nothing(db_conn):
             run_risk(conn, as_of=d, commit=False)
 
         items = exc_info.value.items
-        assert {it.broker_ticker for it in items} == expected_gpw
-        assert all(it.reason == "market_open_no_price" for it in items)
+        # B-17: NAV (kapital satelity) tez jest niepelny z tej samej przyczyny — wpisy
+        # nav_incomplete:* dochodza do listy; pozycje risk sprawdzamy jak dotad.
+        risk_items = [it for it in items if not it.reason.startswith("nav_incomplete:")]
+        assert {it.broker_ticker for it in risk_items} == expected_gpw
+        assert all(it.reason == "market_open_no_price" for it in risk_items)
+        assert any(it.reason.startswith("nav_incomplete:") for it in items)
 
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
@@ -341,7 +347,11 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
             cols = ("transaction_date", "currency", "row_type", "amount", "qty", "price", "multiplier", "broker_ticker")
             kontraktowy_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
         ref_kontraktowy = kontraktowy_account_value(kontraktowy_rows, as_of=d)
-        ref_capital_total = ref_capital_positions + ref_kontraktowy
+        # B-17 (M78): mianownik = NAV z §21.6 (satellite.nav_on), nie pozycje + KONTRAKTOWY.
+        with conn.cursor() as cur:
+            ref_nav = nav_on(cur, d)
+        assert ref_nav.complete
+        ref_capital_total = Decimal(str(ref_nav.value))
         ref_total_risk_pct = (
             (ref_satellite_risk_total / ref_capital_total * Decimal(100)) if ref_capital_total else None
         )
@@ -350,7 +360,101 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
 
         assert len(summary.rows) == 57
         assert summary.stale_positions_count == 0
-        assert summary.capital_satelite_positions_pln == ref_capital_positions
+        assert summary.capital_satelite_pln == ref_capital_total
+        # pozycje (z NAV, float) = pozycje z risk_daily (Decimal) z dokladnoscia do grosza
+        assert abs(summary.capital_satelite_positions_pln - ref_capital_positions) < Decimal("0.01")
+        assert abs(summary.kontraktowy_account_value_pln - ref_kontraktowy) < Decimal("0.01")
         assert summary.total_risk_pct_satellite_capital == ref_total_risk_pct
+    finally:
+        conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# B-17 (M78): kapital satelity w budzetach ryzyka = NAV z par. 21.6.
+# ---------------------------------------------------------------------------
+
+B17_DATE = date(2026, 9, 30)
+
+
+@pytest.mark.db
+def test_b17_run_risk_capital_is_nav_and_cash_lowers_pct(db_conn):
+    """Kontrolka dodatnia: gotowka > 0 -> capital_satelite_pln == NAV (nav_on),
+    skladniki sumuja sie do NAV, a procent ryzyka jest nizszy niz przy starej
+    definicji (pozycje + KONTRAKTOWY)."""
+    conn = db_conn
+    try:
+        with conn.cursor() as cur:
+            nav = nav_on(cur, B17_DATE)
+        assert nav.complete, "NAV niepelny na 2026-09-30 w bazie testowej"
+        summary = run_risk(conn, as_of=B17_DATE, commit=False)
+        assert summary.capital_satelite_pln == Decimal(str(nav.value))
+        assert (
+            summary.capital_satelite_positions_pln
+            + summary.capital_satelite_cash_pln
+            + summary.kontraktowy_account_value_pln
+            == summary.capital_satelite_pln
+        )
+        if summary.capital_satelite_cash_pln <= 0:
+            pytest.skip("brak gotowki AKCYJNY/ZAGRANICZNY na D w bazie testowej")
+        old_capital = summary.capital_satelite_positions_pln + summary.kontraktowy_account_value_pln
+        assert summary.capital_satelite_pln > old_capital
+        total_risk = sum(
+            (r.risk_pln for r in summary.rows
+             if is_risk_budget_eligible(r.instrument_type, r.is_core) and r.risk_pln is not None),
+            Decimal(0),
+        )
+        assert summary.total_risk_pct_satellite_capital == total_risk / summary.capital_satelite_pln * Decimal(100)
+        assert summary.total_risk_pct_satellite_capital < total_risk / old_capital * Decimal(100)
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b17_run_risk_zero_cash_equals_old_definition(db_conn):
+    """Kontrolka ujemna: po wyzerowaniu (w transakcji, rollback) kwot gotowkowych
+    wierszy AKCYJNY/ZAGRANICZNY gotowka = 0 i kapital == pozycje + KONTRAKTOWY."""
+    conn = db_conn
+    try:
+        with conn.cursor() as cur:
+            # wiersz kompensujacy na D: suma gotowki per (rachunek, waluta) -> 0
+            cur.execute(
+                "INSERT INTO transactions (transaction_date, rachunek, currency, title_raw, amount, row_type, "
+                "source_file, source_sha256) "
+                "SELECT %s, rachunek, currency, 'B-17 TEST ZEROWANIE GOTOWKI', -sum(amount), 'przelew_zewnetrzny', "
+                "'b17_test', %s FROM transactions "
+                "WHERE rachunek NOT LIKE %s AND transaction_date <= %s AND row_type <> ALL(%s) "
+                "GROUP BY rachunek, currency",
+                (B17_DATE, "0" * 64, f"{KONTRAKTOWY_PREFIX}%", B17_DATE, list(NON_CASH_ROW_TYPES)),
+            )
+        summary = run_risk(conn, as_of=B17_DATE, commit=False)
+        assert abs(summary.capital_satelite_cash_pln) < Decimal("0.000001")  # szum float
+        old_capital = summary.capital_satelite_positions_pln + summary.kontraktowy_account_value_pln
+        assert abs(summary.capital_satelite_pln - old_capital) < Decimal("0.000001")
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b17_incomplete_nav_raises_and_writes_nothing(db_conn, monkeypatch):
+    """NAV niepelny na D -> IncompleteRiskDateError z przyczyna nav_incomplete:*,
+    zero zmian w risk_daily (rollback przed DELETE)."""
+    conn = db_conn
+    import mannaz.satellite as sat_mod
+
+    fake = sat_mod.NavResult(
+        value=None, partial_value=0.0, complete=False, missing=[("XYZ", "brak cen")], stale=[],
+        by_account_pln={}, by_account_native={}, core_by_account_native={},
+    )
+    monkeypatch.setattr(sat_mod, "nav_on", lambda cur, d, *a, **k: fake)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (B17_DATE,))
+            count_before = cur.fetchone()[0]
+        with pytest.raises(IncompleteRiskDateError) as exc_info:
+            run_risk(conn, as_of=B17_DATE, commit=False)
+        assert [(i.broker_ticker, i.reason) for i in exc_info.value.items] == [("XYZ", "nav_incomplete:brak cen")]
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (B17_DATE,))
+            assert cur.fetchone()[0] == count_before
     finally:
         conn.rollback()

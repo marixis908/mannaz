@@ -704,6 +704,7 @@ class RiskReportAggregates:
     capital_satelite_pln: Decimal
     stale_tickers: list[tuple[str, date]]  # (ticker, price_date_used)
     high_risk_tickers: list[str] = field(default_factory=list)  # satelita, below_stop=True na D (RISK=HIGH)
+    capital_satelite_cash_pln: Decimal = Decimal(0)  # B-17: gotówka AKCYJNY/ZAGRANICZNY w NAV
     # Poprawka po przeglądzie nadzorcy (P1): udział wartości pozycji HIGH w C —
     # None gdy C==0 albo brak pozycji equity/etf HIGH z policzalną wartością.
     high_risk_capital_pct: Decimal | None = None
@@ -781,6 +782,7 @@ class RiskReportAggregates:
             capital_satelite_positions_pln=summary.capital_satelite_positions_pln,
             kontraktowy_account_value_pln=summary.kontraktowy_account_value_pln,
             capital_satelite_pln=summary.capital_satelite_pln,
+            capital_satelite_cash_pln=summary.capital_satelite_cash_pln,
             stale_tickers=stale,
             high_risk_tickers=high_risk,
             high_risk_capital_pct=high_risk_capital_pct,
@@ -1049,8 +1051,9 @@ def _render_risk_section(state: ReportState) -> list[str]:
     else:
         lines.append("    brak")
     lines.append(f"- poziom 3 (> 15%): {'tak' if a.level3_breach else 'nie'}")
-    lines.append(f"- C — kapitał satelity (PLN): {format_money(a.capital_satelite_pln, 'PLN')}")
+    lines.append(f"- C — kapitał satelity = NAV §21.6 (PLN): {format_money(a.capital_satelite_pln, 'PLN')}")
     lines.append(f"    - w tym pozycje equity/etf: {format_money(a.capital_satelite_positions_pln, 'PLN')}")
+    lines.append(f"    - w tym gotówka AKCYJNY/ZAGRANICZNY: {format_money(a.capital_satelite_cash_pln, 'PLN')}")
     lines.append(f"- K — wartość rachunku KONTRAKTOWY (PLN): {format_money(a.kontraktowy_account_value_pln, 'PLN')}")
     lines.append(
         f"- pozycje HIGH: {len(a.high_risk_tickers)}, udział w kapitale satelity {format_pct(a.high_risk_capital_pct)}"

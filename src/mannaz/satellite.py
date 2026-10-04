@@ -246,6 +246,14 @@ def model_price_on(curve: tuple[list[date], list[float]], d: date) -> float | No
     return prices[k - 1] + (prices[k] - prices[k - 1]) * (d - d0).days / (d1 - d0).days
 
 
+def nav_on(cur: Any, d: date, calendar_facts_fn: Callable[[str | None, date], Any] = _risk._default_calendar_facts) -> NavResult:
+    """Wspolna definicja NAV_D dla satellite i risk (B-17, M78): NAV satelity
+    z par. 21.6 na jeden dzien D. Tylko SELECT (bez sieci: symbol_map=None,
+    out_dir=None); instrumenty bez cen daja NAV niepelny."""
+    inp = load_inputs(cur, d, d, None, None, extra_days=[d])
+    return compute_daily(inp, calendar_facts_fn).navs[d]
+
+
 def nav_for_day(
     positions: Sequence[PositionInput],
     cash: dict[tuple[str, str], float],

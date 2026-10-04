@@ -703,3 +703,40 @@ def test_t45_nav_model_share():
     assert nav.complete and nav.model_tickers == ["CERT1"]
     assert nav.model_value_pln == pytest.approx(100.0)
     assert nav.model_share == pytest.approx(100.0 / 1100.0)
+
+
+# --- B-17: NAV jako kapital satelity w budzetach ryzyka ----------------------
+
+
+def test_b17_cash_positive_nav_exceeds_old_capital_and_lowers_pct():
+    """Kontrolka dodatnia: gotowka > 0 -> NAV = pozycje + gotowka + KONTRAKTOWY;
+    stary kapital (pozycje + KONTRAKTOWY) jest nizszy, wiec procenty ryzyka tez."""
+    positions = [_pos()]  # 10 x 100 = 1000 PLN
+    nav = nav_for_day(positions, {("AKCYJNY", "PLN"): 500.0}, {}, kontraktowy_pln=250.0)
+    old_capital = 1000.0 + 250.0
+    assert nav.value == pytest.approx(1750.0)
+    assert nav.value > old_capital
+    risk_pln = 100.0
+    assert risk_pln / nav.value < risk_pln / old_capital
+
+
+def test_b17_cash_zero_nav_equals_old_capital():
+    """Kontrolka ujemna: gotowka 0 -> NAV == pozycje + KONTRAKTOWY (stara definicja)."""
+    nav = nav_for_day([_pos()], {("AKCYJNY", "PLN"): 0.0}, {}, kontraktowy_pln=250.0)
+    assert nav.value == pytest.approx(1000.0 + 250.0)
+    nav_nocash = nav_for_day([_pos()], {}, {}, kontraktowy_pln=250.0)
+    assert nav_nocash.value == pytest.approx(nav.value)
+
+
+def test_b17_bilans_otwarcia_does_not_increase_cash():
+    """Wiersz bilans_otwarcia (NON_CASH_ROW_TYPES) nie zwieksza gotowki w NAV."""
+    base = sat.compute_daily(_inputs(), ALL_OPEN)
+    inp = _inputs()
+    inp.tx_rows.append(TxRow(AXIS[2], "AKCYJNY TEST", "PLN", "bilans_otwarcia", 0.0, 1, 3.0, 50.0, False, "equity"))
+    inp.tx_rows.sort(key=lambda r: r.date)
+    res = sat.compute_daily(inp, ALL_OPEN)
+    for d in AXIS:
+        assert res.navs[d].cash_native.get(("AKCYJNY", "PLN"), 0.0) == pytest.approx(
+            base.navs[d].cash_native.get(("AKCYJNY", "PLN"), 0.0)
+        )
+        assert res.navs[d].value == pytest.approx(base.navs[d].value)

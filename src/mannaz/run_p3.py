@@ -193,9 +193,10 @@ def cmd_risk(args: argparse.Namespace) -> None:
           f"(per rachunek: {summary.capital_satelite_positions_by_rachunek})")
     print(f"kapital_satelity_pozycje_PLN (equity/etf spoza core, BEZ futures): "
           f"{summary.capital_satelite_positions_pln}")
+    print(f"kapital_satelity_gotowka_AKCYJNY+ZAGRANICZNY_PLN: {summary.capital_satelite_cash_pln}")
     print(f"wartosc_rachunku_KONTRAKTOWY_PLN (srodki ogolem + depozyt zablokowany): "
           f"{summary.kontraktowy_account_value_pln}")
-    print(f"kapital_satelity_PLN (pozycje + KONTRAKTOWY, §19.4): {summary.capital_satelite_pln}")
+    print(f"kapital_satelity_PLN (NAV §21.6, M78; B-17): {summary.capital_satelite_pln}")
     print(f"below_stop (RISK=HIGH) ogolem: {len(summary.below_stop_tickers)} {summary.below_stop_tickers}")
     print(f"below_stop ZAGRANICZNY: {len(summary.below_stop_zagraniczny_tickers)} {summary.below_stop_zagraniczny_tickers}")
     print(f"pct_wartosci_ZAGRANICZNY_satelity_pod_stop_effective: {summary.zagraniczny_satellite_value_pct_below_stop}")
