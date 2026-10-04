@@ -27,7 +27,7 @@ from typing import Any, Callable
 import psycopg
 
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
-from mannaz.corp_actions import detect_new_corporate_events
+from mannaz.corp_actions import CorpEventsClassification, detect_new_corporate_events
 from mannaz.fifo import run_fifo
 from mannaz.fx import NBP_CURRENCIES, FxSummary, run_fx_fetch
 from mannaz.import_history import (
@@ -813,6 +813,10 @@ class ReportState:
     # B-29: nowe zdarzenia korporacyjne do potwierdzenia przez ownera (bramka
     # DATA REVIEW przed FIFO/ryzykiem); elementy: corp_actions.DetectedEvent.
     corp_events_review: list = field(default_factory=list)
+    # B-45: informacja (NIE DATA FAILURE, nie zatrzymuje cyklu): kandydaci
+    # price_ratio z ratio zgodnym z zapisanym zdarzeniem, ale inną datą;
+    # elementy: corp_actions.DriftEvent.
+    corp_events_date_drift: list = field(default_factory=list)
     price_ingest_errors: list[str] = field(default_factory=list)
     fx_failures: list[str] = field(default_factory=list)
     date_incomplete_items: list[IncompleteRiskItem] = field(default_factory=list)
@@ -908,6 +912,13 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
         )
     else:
         lines.append("brak")
+    # B-45: informacja o rozjeździe daty (bez zapisu, bez wpływu na bramkę).
+    for dr in state.corp_events_date_drift:
+        ev = dr.event
+        lines.append(
+            f"- informacja (date_drift): {ev.broker_ticker} {ev.event_type} ratio={ev.ratio}: "
+            f"zapisane {_fmt_date(dr.stored_date)}, wykryte {_fmt_date(ev.event_date)}, bez zapisu"
+        )
 
     lines.append("")
     lines.append("### ingest_errors (ten przebieg)")
@@ -1426,7 +1437,7 @@ def run_cycle(
     calendar_facts_fn: Callable[[str | None, date], Any] = _default_calendar_facts,
     sessions_fn: SessionsFn = _default_sessions_fn,
     check_ignored: Callable[[Path], bool] = _default_check_ignored,
-    detect_corp_events_fn: Callable[[psycopg.Connection], list] = detect_new_corporate_events,
+    detect_corp_events_fn: Callable[[psycopg.Connection], CorpEventsClassification] = detect_new_corporate_events,
 ) -> CycleResult:
     """Brief CC-C, C2–C8: orkiestracja jednego przebiegu cyklu tygodniowego.
     Etapy w kolejności: import -> detektor zdarzeń korporacyjnych (B-29, bramka
@@ -1549,13 +1560,14 @@ def run_cycle(
         # Split musi być wykryty, zanim cokolwiek użyje pozycji (FIFO, ryzyko).
         # Detektor nie zapisuje (zapis po potwierdzeniu ownera: run_p3 corp-actions).
         try:
-            new_corp_events = detect_corp_events_fn(conn)
+            corp_result = detect_corp_events_fn(conn)
         except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (nic nie wypada po cichu)
             state.import_failures.append(f"błąd etapu detektora zdarzeń: {type(exc).__name__}: {exc}")
             state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
             raise _StageStop() from exc
-        if new_corp_events:
-            state.corp_events_review = list(new_corp_events)
+        state.corp_events_date_drift = list(corp_result.date_drift)  # B-45: informacja, ZAWSZE
+        if corp_result.saved:
+            state.corp_events_review = list(corp_result.saved)
             state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
             raise _StageStop()
 

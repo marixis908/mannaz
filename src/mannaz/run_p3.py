@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path
 
 from mannaz.calendar_check import run_calendar_check
-from mannaz.corp_actions import run_corp_actions_detector
+from mannaz.corp_actions import run_corp_actions
 from mannaz.cycle import (
     DEFAULT_INCOMING_DIR,
     DEFAULT_RAW_ARCHIVE_DIR,
@@ -252,20 +252,36 @@ def cmd_satellite(args: argparse.Namespace) -> None:
 
 
 def cmd_corp_actions(args: argparse.Namespace) -> None:
-    """B-29: potwierdzenie ownera — ZAPIS zdarzeń korporacyjnych wykrytych przez
-    detektor (commit=True) do corporate_events. Po nim ponowny `cycle`
-    (FIFO przelicza pozycje od zera z corporate_events)."""
+    """B-29/B-45: potwierdzenie ownera — ZAPIS zdarzeń korporacyjnych wykrytych
+    przez detektor do corporate_events (tożsamość: `classify_against_existing`).
+    `--dry-run` — ta sama klasyfikacja, zero zapisu. Po zapisie ponowny `cycle`
+    (FIFO przelicza pozycje od zera z corporate_events). Wydruk bez numerów
+    rachunków."""
     conn = get_connection()
     try:
-        summary = run_corp_actions_detector(conn)
+        result = run_corp_actions(conn, dry_run=bool(args.dry_run))
     finally:
         conn.close()
-    events = list(summary.yfinance_splits_imported) + list(summary.price_ratio_detected)
-    print(f"zapisane zdarzenia: {len(events)}")
-    for ev in events:
-        print(
+
+    def _line(ev) -> str:
+        return (
             f"  ticker={ev.broker_ticker} data={ev.event_date} typ={ev.event_type} "
             f"ratio={ev.ratio} zrodlo={ev.source}/{ev.date_source}"
+        )
+
+    print(f"tryb: {'dry-run (bez zapisu)' if args.dry_run else 'zapis'}")
+    print(f"zapisane: {len(result.saved)}")
+    for ev in result.saved:
+        print(_line(ev))
+    print(f"znane: {len(result.known)}")
+    for ev in result.known:
+        print(_line(ev))
+    print(f"date_drift: {len(result.date_drift)}")
+    for dr in result.date_drift:
+        ev = dr.event
+        print(
+            f"  ticker={ev.broker_ticker} typ={ev.event_type} ratio={ev.ratio} "
+            f"zapisane={dr.stored_date} wykryte={ev.event_date} zrodlo={ev.source}/{ev.date_source}"
         )
 
 
@@ -357,6 +373,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_corp = sub.add_parser(
         "corp-actions", help="B-29 — potwierdzenie: zapis wykrytych zdarzen korporacyjnych do corporate_events"
     )
+    p_corp.add_argument("--dry-run", action="store_true",
+                        help="B-45: ta sama klasyfikacja (zapisane/znane/date_drift), zero zapisu")
     p_corp.set_defaults(func=cmd_corp_actions)
 
     p_cycle = sub.add_parser(

@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 
 from mannaz import corp_actions
-from mannaz.corp_actions import CorpActionsSummary, DetectedEvent, detect_new_corporate_events
+from mannaz.corp_actions import (
+    CorpActionsSummary,
+    CorpEventsClassification,
+    DetectedEvent,
+    DriftEvent,
+    detect_new_corporate_events,
+)
 from mannaz.cycle import (
     STAGE_CORP_EVENTS,
     STAGE_FIFO,
@@ -110,7 +116,7 @@ def test_synthetic_split_stops_cycle_with_data_review_before_risk(db_conn, tmp_p
     conn = db_conn
     try:
         risk_spy = _Spy(RiskSummary(risk_date=date(1990, 1, 1)))
-        det = _Spy([_event(ticker="TESTSYM", d=date(1990, 3, 5), ratio="4")])
+        det = _Spy(CorpEventsClassification(saved=[_event(ticker="TESTSYM", d=date(1990, 3, 5), ratio="4")]))
         result = run_cycle(**_cycle_kwargs(tmp_path, conn, det, risk_spy=risk_spy))
 
         assert det.calls == 1
@@ -131,7 +137,7 @@ def test_no_new_event_does_not_block_and_corporate_events_unchanged(db_conn, tmp
     conn = db_conn
     try:
         before = _count_events(conn)
-        det = _Spy([])
+        det = _Spy(CorpEventsClassification())
         result = run_cycle(**_cycle_kwargs(tmp_path, conn, det))
         assert det.calls == 1
         assert result.state.corp_events_review == []
@@ -158,51 +164,106 @@ def test_detector_exception_is_data_failure_and_fifo_not_executed(db_conn, tmp_p
         conn.rollback()
 
 
+# --- B-45: date_drift w stanie raportu i w cyklu --------------------------------
+
+
+def _drift(ticker="TESTSYM", stored=date(1990, 2, 1), detected=date(1990, 3, 1)) -> DriftEvent:
+    ev = _event(ticker=ticker, d=detected, ratio="2")
+    ev.source = "price_ratio_detector"
+    return DriftEvent(event=ev, stored_date=stored)
+
+
+def test_date_drift_is_rendered_and_is_not_a_data_failure():
+    from mannaz.cycle import _render_data_failure_section
+
+    state = ReportState(d=None, run_started_at=__import__("datetime").datetime.now())
+    state.corp_events_date_drift = [_drift()]
+    assert not has_data_failures(state)
+    text = "\n".join(_render_data_failure_section(state))
+    assert (
+        "- informacja (date_drift): TESTSYM split ratio=2: zapisane 1990-02-01, wykryte 1990-03-01, bez zapisu"
+        in text
+    )
+
+
+@pytest.mark.db
+def test_date_drift_does_not_stop_cycle_and_fills_state(db_conn, tmp_path):
+    conn = db_conn
+    try:
+        det = _Spy(CorpEventsClassification(date_drift=[_drift()]))
+        result = run_cycle(**_cycle_kwargs(tmp_path, conn, det))
+        assert len(result.state.corp_events_date_drift) == 1
+        assert result.state.corp_events_review == []
+        assert STAGE_FIFO not in result.state.stage_not_executed
+        text = result.report_path.read_text(encoding="utf-8")
+        assert "informacja (date_drift): TESTSYM split ratio=2" in text
+    finally:
+        conn.rollback()
+
+
 # --- detect_new_corporate_events ----------------------------------------------
+
+_INDEX_SQL_PATH = Path(__file__).resolve().parents[1] / "sql" / "013_corporate_events_klucz_splitu.sql"
+
+
+def _apply_013_in_tx(conn) -> None:
+    """Tresc sql/013 bez BEGIN/COMMIT (test dziala w jednej transakcji z rollbackiem)."""
+    body = "\n".join(
+        ln for ln in _INDEX_SQL_PATH.read_text(encoding="utf-8").splitlines() if ln.strip() not in ("BEGIN;", "COMMIT;")
+    )
+    with conn.cursor() as cur:
+        cur.execute(body)
+
+
+def _free_instrument(conn) -> tuple[int, str]:
+    """Instrument bez zadnych zdarzen korporacyjnych (regula 2 patrzy na ratio niezaleznie od daty)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, broker_ticker FROM instruments i "
+            "WHERE NOT EXISTS (SELECT 1 FROM corporate_events c WHERE c.instrument_id = i.id) ORDER BY id LIMIT 1"
+        )
+        return cur.fetchone()
+
+
+def _stored(conn, inst_id, ticker, d, ratio="4", source="price_ratio_detector", title="tytul A (median_ratio=0.2500 n=5)"):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO corporate_events (instrument_id, broker_ticker, event_date, event_type,
+                                          ratio, title_raw, source, date_source)
+            VALUES (%s, %s, %s, 'split', %s, %s, %s, 'inferred_boundary')
+            """,
+            (inst_id, ticker, d, Decimal(ratio), title, source),
+        )
+
+
+def _stub_collect(monkeypatch, candidates):
+    s = CorpActionsSummary()
+    s.candidates = list(candidates)
+    monkeypatch.setattr(corp_actions, "collect_corp_action_candidates", lambda c: s)
 
 
 @pytest.mark.db
 def test_detect_new_events_filters_existing_key_and_does_not_write(db_conn, monkeypatch):
+    """B-45: intencja bez zmian (znany klucz nie jest zgłaszany, baza bez zmian);
+    kandydat price_ratio z ta sama data i innym title_raw wychodzi 'known'."""
     conn = db_conn
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, broker_ticker FROM instruments ORDER BY id LIMIT 1")
-            inst_id, ticker = cur.fetchone()
-            d_old, d_new = date(1990, 2, 1), date(1990, 2, 2)
-            cur.execute(
-                """
-                INSERT INTO corporate_events (instrument_id, broker_ticker, event_date, event_type,
-                                              ratio, title_raw, source, date_source)
-                VALUES (%s, %s, %s, 'split', 4, 'tytul A (median_ratio=0.2500 n=5)',
-                        'price_ratio_detector', 'inferred_boundary')
-                """,
-                (inst_id, ticker, d_old),
-            )
+        _apply_013_in_tx(conn)
+        inst_id, ticker = _free_instrument(conn)
+        d_old, d_new = date(1990, 2, 1), date(1990, 2, 2)
+        _stored(conn, inst_id, ticker, d_old)
         before = _count_events(conn)
 
-        def fake_detector(c, commit=True):
-            assert commit is False
-            # ten sam klucz (inst, data, typ), zmieniony title_raw => INSERT by przeszedl
-            with c.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO corporate_events (instrument_id, broker_ticker, event_date, event_type,
-                                                  ratio, title_raw, source, date_source)
-                    VALUES (%s, %s, %s, 'split', 4, 'tytul B (median_ratio=0.2490 n=6)',
-                            'price_ratio_detector', 'inferred_boundary')
-                    """,
-                    (inst_id, ticker, d_old),
-                )
-            s = CorpActionsSummary()
-            s.price_ratio_detected.append(_event(inst_id, ticker, d_old))
-            s.yfinance_splits_imported.append(_event(inst_id, ticker, d_new))
-            return s
-
-        monkeypatch.setattr(corp_actions, "run_corp_actions_detector", fake_detector)
+        known_cand = _event(inst_id, ticker, d_old)
+        known_cand.source = "price_ratio_detector"
+        known_cand.title_raw = "tytul B (median_ratio=0.2490 n=6)"
+        _stub_collect(monkeypatch, [known_cand, _event(inst_id, ticker, d_new)])
         result = detect_new_corporate_events(conn)
 
-        assert [(e.instrument_id, e.event_date, e.event_type) for e in result] == [(inst_id, d_new, "split")]
-        assert _count_events(conn) == before  # INSERT detektora wycofany
+        assert [(e.instrument_id, e.event_date, e.event_type) for e in result.saved] == [(inst_id, d_new, "split")]
+        assert [e.event_date for e in result.known] == [d_old]
+        assert _count_events(conn) == before  # zapis w savepoincie wycofany
     finally:
         conn.rollback()
 
@@ -211,20 +272,31 @@ def test_detect_new_events_filters_existing_key_and_does_not_write(db_conn, monk
 def test_detect_new_events_empty_when_only_existing(db_conn, monkeypatch):
     conn = db_conn
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, broker_ticker FROM instruments ORDER BY id LIMIT 1")
-            inst_id, ticker = cur.fetchone()
-            cur.execute(
-                """
-                INSERT INTO corporate_events (instrument_id, broker_ticker, event_date, event_type,
-                                              ratio, title_raw, source, date_source)
-                VALUES (%s, %s, %s, 'split', 4, 'x', 'yfinance_splits', 'yfinance_splits')
-                """,
-                (inst_id, ticker, date(1990, 2, 1)),
-            )
-        s = CorpActionsSummary()
-        s.yfinance_splits_imported.append(_event(inst_id, ticker, date(1990, 2, 1)))
-        monkeypatch.setattr(corp_actions, "run_corp_actions_detector", lambda c, commit=True: s)
-        assert detect_new_corporate_events(conn) == []
+        _apply_013_in_tx(conn)
+        inst_id, ticker = _free_instrument(conn)
+        _stored(conn, inst_id, ticker, date(1990, 2, 1), source="yfinance_splits", title="x")
+        _stub_collect(monkeypatch, [_event(inst_id, ticker, date(1990, 2, 1))])
+        result = detect_new_corporate_events(conn)
+        assert result.saved == [] and len(result.known) == 1
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_detect_new_events_date_drift_not_in_saved(db_conn, monkeypatch):
+    """B-45 test 2: price_ratio inferred_boundary z inna data -> date_drift, nie saved, zapis 0."""
+    conn = db_conn
+    try:
+        _apply_013_in_tx(conn)
+        inst_id, ticker = _free_instrument(conn)
+        _stored(conn, inst_id, ticker, date(1990, 2, 1), ratio="25", source="yfinance_splits", title="x")
+        before = _count_events(conn)
+        cand = _event(inst_id, ticker, date(1990, 3, 1), ratio="25")
+        cand.source, cand.date_source = "price_ratio_detector", "inferred_boundary"
+        _stub_collect(monkeypatch, [cand])
+        result = detect_new_corporate_events(conn)
+        assert result.saved == []
+        assert [(d.stored_date, d.event.event_date) for d in result.date_drift] == [(date(1990, 2, 1), date(1990, 3, 1))]
+        assert _count_events(conn) == before
     finally:
         conn.rollback()

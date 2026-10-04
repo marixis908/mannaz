@@ -19,10 +19,11 @@ posiadanym (bez hardkodowania konkretnych tickerów):
      zdarzenie split/reverse_split z ratio = zaokrąglony iloraz.
 
 Obie ścieżki piszą do `corporate_events` z kolumną `source`
-('yfinance_splits' | 'price_ratio_detector'); przed zapisem #2 sprawdzamy, czy
-to samo zdarzenie nie zostało już zarejestrowane przez #1 dla tego samego
-instrumentu i tej samej daty — żeby nie liczyć jednego realnego splitu dwa
-razy pod dwoma źródłami.
+('yfinance_splits' | 'price_ratio_detector'). B-45: kolektor tylko ZBIERA
+kandydatów (bez INSERT); o zapisie decyduje jedna funkcja tożsamości
+`classify_against_existing` (new | known | date_drift), używana i przez
+`detect_new_corporate_events`, i przez ścieżkę zapisu — żeby jeden realny split
+nie był liczony dwa razy ani pod dwoma źródłami, ani pod dwoma datami.
 
 Mapowanie broker_ticker -> symbol Yahoo jest CELOWO minimalne (pełne
 mapowanie: P3.1) — tylko trzy jednoznaczne wzorce (GPW `.WA`, US bez sufiksu,
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from statistics import median
-from typing import Any
+from typing import Any, Literal
 
 import psycopg
 import yfinance as yf
@@ -238,19 +239,40 @@ class DetectedEvent:
     source: str
     n_samples: int
     median_ratio: Decimal
+    # B-45: title_raw budowany przez kolektor (zapis go używa); pierwsza
+    # transakcja instrumentu w walucie, z której detektor liczył próbki.
+    title_raw: str = ""
+    first_txn_date: date | None = None
+
+
+@dataclass
+class DriftEvent:
+    """B-45: kandydat price_ratio_detector z ratio zgodnym z już zapisanym
+    zdarzeniem, ale z inną datą — informacja, bez zapisu."""
+
+    event: DetectedEvent
+    stored_date: date
+
+
+@dataclass
+class CorpEventsClassification:
+    saved: list[DetectedEvent] = field(default_factory=list)
+    known: list[DetectedEvent] = field(default_factory=list)
+    date_drift: list[DriftEvent] = field(default_factory=list)
 
 
 @dataclass
 class CorpActionsSummary:
+    # B-45: kandydaci (bez zapisu), per instrument najpierw yfinance_splits.
     yfinance_splits_imported: list[DetectedEvent] = field(default_factory=list)
     price_ratio_detected: list[DetectedEvent] = field(default_factory=list)
-    price_ratio_duplicates_skipped: int = 0
+    candidates: list[DetectedEvent] = field(default_factory=list)
     instruments_checked: int = 0  # symbol Yahoo rozwiązany
     instruments_skipped_no_symbol: int = 0
     instruments_no_data: int = 0  # symbol rozwiązany, ale brak danych cenowych/próbek
     # Kontrolka ujemna/dodatnia detektora #2 (price_ratio_detector), liczona na
     # WSZYSTKICH instrumentach z policzalną medianą (niezależnie od tego, czy
-    # trafienie zostało finalnie zapisane, czy zdedupowane względem źródła 1):
+    # trafienie zostało finalnie zapisane, czy uznane za znane):
     ratio_detector_evaluated: int = 0
     ratio_detector_hit_tickers: list[str] = field(default_factory=list)
     ratio_detector_clean_tickers: list[str] = field(default_factory=list)
@@ -294,6 +316,9 @@ def _instrument_transactions(cur: psycopg.Cursor, instrument_id: int, currency: 
     return [(d, p) for d, p in cur.fetchall()]
 
 
+_SPLIT_TYPES = ("split", "reverse_split")
+
+
 def _insert_event(
     cur: psycopg.Cursor,
     *,
@@ -306,13 +331,21 @@ def _insert_event(
     date_source: str | None,
     title_raw: str,
 ) -> bool:
+    # B-45: splity/scalenia — konflikt na kluczu (instrument_id, event_date,
+    # event_type) (indeks częściowy z sql/013); pozostałe typy — stary klucz.
+    conflict = (
+        "ON CONFLICT (instrument_id, event_date, event_type) "
+        "WHERE event_type IN ('split', 'reverse_split') DO NOTHING"
+        if event_type in _SPLIT_TYPES
+        else "ON CONFLICT (broker_ticker, event_date, event_type, title_raw) DO NOTHING"
+    )
     cur.execute(
-        """
+        f"""
         INSERT INTO corporate_events (
             instrument_id, broker_ticker, event_date, event_type,
             ratio, title_raw, source, date_source
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (broker_ticker, event_date, event_type, title_raw) DO NOTHING
+        {conflict}
         RETURNING id
         """,
         (instrument_id, broker_ticker, event_date, event_type, ratio, title_raw, source, date_source),
@@ -320,20 +353,56 @@ def _insert_event(
     return cur.fetchone() is not None
 
 
-def _existing_yfinance_event_dates(cur: psycopg.Cursor, instrument_id: int) -> set[date]:
+def classify_against_existing(
+    cur: psycopg.Cursor, ev: DetectedEvent
+) -> tuple[Literal["new", "known", "date_drift"], date | None]:
+    """B-45: JEDNA reguła tożsamości (decyzja nadzorcy), tylko SELECT.
+
+    - yfinance_splits: znane, gdy istnieje wiersz z tym samym (instrument_id,
+      event_date, event_type).
+    - price_ratio_detector: znane, gdy istnieje wiersz z tym samym instrument_id
+      i event_type oraz ratio zgodnym wg `_ratios_match`, NIEZALEŻNIE od daty i
+      źródła; pod uwagę tylko wiersze z event_date PO pierwszej transakcji
+      instrumentu (`ev.first_txn_date`; None -> bez filtra). Ta sama data ->
+      'known'; inna -> 'date_drift' (najwcześniejsza zapisana data).
+    Zwraca (stan, zapisana data pasującego wiersza | None)."""
+    if ev.source != "price_ratio_detector":
+        cur.execute(
+            """
+            SELECT 1 FROM corporate_events
+            WHERE instrument_id = %s AND event_date = %s AND event_type = %s
+            LIMIT 1
+            """,
+            (ev.instrument_id, ev.event_date, ev.event_type),
+        )
+        if cur.fetchone() is not None:
+            return "known", ev.event_date
+        return "new", None
+
     cur.execute(
         """
-        SELECT event_date FROM corporate_events
-        WHERE instrument_id = %s AND source = 'yfinance_splits'
+        SELECT event_date, ratio FROM corporate_events
+        WHERE instrument_id = %s AND event_type = %s AND ratio IS NOT NULL AND ratio <> 0
+        ORDER BY event_date
         """,
-        (instrument_id,),
+        (ev.instrument_id, ev.event_type),
     )
-    return {row[0] for row in cur.fetchall()}
+    matching = [
+        d
+        for d, r in cur.fetchall()
+        if (ev.first_txn_date is None or d > ev.first_txn_date) and _ratios_match(ev.ratio, Decimal(r))
+    ]
+    if not matching:
+        return "new", None
+    if ev.event_date in matching:
+        return "known", ev.event_date
+    return "date_drift", min(matching)
 
 
-def run_corp_actions_detector(conn: psycopg.Connection, commit: bool = True) -> CorpActionsSummary:
-    """`commit=False` (B-29) — bez `conn.commit()`; INSERTy zostają w transakcji
-    wywołującego (wzorzec `run_fifo`/`run_risk`)."""
+def collect_corp_action_candidates(conn: psycopg.Connection) -> CorpActionsSummary:
+    """B-45: zbiera kandydatów z obu źródeł BEZ zapisu (tylko SELECT do bazy +
+    sieć Yahoo). Kolejność: per instrument najpierw yfinance_splits, potem
+    price_ratio_detector."""
     summary = CorpActionsSummary()
 
     with conn.cursor() as cur:
@@ -377,31 +446,21 @@ def run_corp_actions_detector(conn: psycopg.Connection, commit: bool = True) -> 
                     f"[auto] yfinance_splits: {broker_ticker} ({symbol}) "
                     f"{event_type} ratio={ratio} date={d.isoformat()}"
                 )
-                inserted = _insert_event(
-                    cur,
-                    instrument_id=inst["id"],
+                ev = DetectedEvent(
                     broker_ticker=broker_ticker,
-                    event_date=d,
+                    instrument_id=inst["id"],
                     event_type=event_type,
                     ratio=ratio,
-                    source="yfinance_splits",
+                    event_date=d,
                     date_source="yfinance_splits",
+                    source="yfinance_splits",
+                    n_samples=0,
+                    median_ratio=ratio,
                     title_raw=title_raw,
+                    first_txn_date=min_date,
                 )
-                if inserted:
-                    summary.yfinance_splits_imported.append(
-                        DetectedEvent(
-                            broker_ticker=broker_ticker,
-                            instrument_id=inst["id"],
-                            event_type=event_type,
-                            ratio=ratio,
-                            event_date=d,
-                            date_source="yfinance_splits",
-                            source="yfinance_splits",
-                            n_samples=0,
-                            median_ratio=ratio,
-                        )
-                    )
+                summary.yfinance_splits_imported.append(ev)
+                summary.candidates.append(ev)
 
             # --- Źródło 2: detektor z ilorazu ceny (kontrolka dodatnia/ujemna) ---
             close_series = fetch_close_series(symbol, min_date, max_date)
@@ -436,76 +495,88 @@ def run_corp_actions_detector(conn: psycopg.Connection, commit: bool = True) -> 
             event_type, ratio_final = decision
             event_date, date_source = resolve_event_date(samples, ratio_final, yf_splits_full)
 
-            if date_source == "yfinance_splits" and event_date in _existing_yfinance_event_dates(cur, inst["id"]):
-                # to samo zdarzenie już zapisane pod source='yfinance_splits' — nie duplikuj
-                summary.price_ratio_duplicates_skipped += 1
-                continue
-
             title_raw = (
                 f"[auto] price_ratio_detector: {broker_ticker} ({symbol}) {event_type} "
                 f"median_ratio={med_ratio:.4f} n={len(samples)} date_source={date_source}"
             )
-            inserted = _insert_event(
-                cur,
-                instrument_id=inst["id"],
+            ev = DetectedEvent(
                 broker_ticker=broker_ticker,
-                event_date=event_date,
+                instrument_id=inst["id"],
                 event_type=event_type,
                 ratio=ratio_final,
-                source="price_ratio_detector",
+                event_date=event_date,
                 date_source=date_source,
+                source="price_ratio_detector",
+                n_samples=len(samples),
+                median_ratio=med_ratio,
                 title_raw=title_raw,
+                first_txn_date=min_date,
             )
-            if inserted:
-                summary.price_ratio_detected.append(
-                    DetectedEvent(
-                        broker_ticker=broker_ticker,
-                        instrument_id=inst["id"],
-                        event_type=event_type,
-                        ratio=ratio_final,
-                        event_date=event_date,
-                        date_source=date_source,
-                        source="price_ratio_detector",
-                        n_samples=len(samples),
-                        median_ratio=med_ratio,
-                    )
-                )
-
-        if commit:
-            conn.commit()
+            summary.price_ratio_detected.append(ev)
+            summary.candidates.append(ev)
 
     return summary
 
 
-def detect_new_corporate_events(conn: psycopg.Connection) -> list[DetectedEvent]:
-    """B-29: etap cyklu tygodniowego PRZED FIFO — wykrywa NOWE zdarzenia
-    korporacyjne bez ich zapisu (zapis dopiero po potwierdzeniu ownera:
-    `python -m mannaz.run_p3 corp-actions`).
-
-    Uruchamia `run_corp_actions_detector(conn, commit=False)` wewnątrz
-    transakcji/savepointu, który na końcu jest WYCOFYWANY (`psycopg.Rollback`)
-    — baza po wywołaniu jest bez zmian. Zwraca tylko zdarzenia, których klucz
-    (instrument_id, event_date, event_type) nie istniał w `corporate_events`
-    przed wywołaniem; zdarzenie już zapisane nie jest zgłaszane ponownie, także
-    gdy zmienił się jego `title_raw` (detektor z ilorazu zapisuje w nim
-    median_ratio i n próbek, więc ON CONFLICT go wtedy nie łapie).
-    Detektor sam pobiera dane z Yahoo (sieć)."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT instrument_id, event_date, event_type FROM corporate_events")
-        existing = {(r[0], r[1], r[2]) for r in cur.fetchall()}
-
-    found: list[DetectedEvent] = []
-    with conn.transaction() as tx:
-        summary = run_corp_actions_detector(conn, commit=False)
-        found = list(summary.yfinance_splits_imported) + list(summary.price_ratio_detected)
-        raise psycopg.Rollback(tx)
-
-    new_events: list[DetectedEvent] = []
-    seen: set[tuple[int, date, str]] = set()
-    for ev in found:
-        key = (ev.instrument_id, ev.event_date, ev.event_type)
-        if key in existing or key in seen:
+def apply_candidates(cur: psycopg.Cursor, candidates: list[DetectedEvent]) -> CorpEventsClassification:
+    """B-45: dla każdego kandydata po kolei `classify_against_existing` na
+    BIEŻĄCYM stanie bazy (ta sama transakcja); 'new' -> `_insert_event`. INSERT
+    bez wiersza (konflikt indeksu) = 'known'. Dzięki zapisowi w pętli kandydat
+    price_ratio po yfinance tego samego splitu w jednym przebiegu wychodzi 'known'."""
+    result = CorpEventsClassification()
+    for ev in candidates:
+        state, stored = classify_against_existing(cur, ev)
+        if state == "known":
+            result.known.append(ev)
             continue
-        seen.add(key)
-        new_events.append(ev)
-    return new_events
+        if state == "date_drift":
+            assert stored is not None
+            result.date_drift.append(DriftEvent(event=ev, stored_date=stored))
+            continue
+        inserted = _insert_event(
+            cur,
+            instrument_id=ev.instrument_id,
+            broker_ticker=ev.broker_ticker,
+            event_date=ev.event_date,
+            event_type=ev.event_type,
+            ratio=ev.ratio,
+            source=ev.source,
+            date_source=ev.date_source,
+            title_raw=ev.title_raw
+            or f"[auto] {ev.source}: {ev.broker_ticker} {ev.event_type} ratio={ev.ratio} date={ev.event_date.isoformat()}",
+        )
+        (result.saved if inserted else result.known).append(ev)
+    return result
+
+
+def run_corp_actions(conn: psycopg.Connection, *, dry_run: bool) -> CorpEventsClassification:
+    """B-45: collect -> apply w `conn.transaction()`; dry_run -> Rollback
+    (zero zapisu), inaczej commit (`run_p3 corp-actions`)."""
+    summary = collect_corp_action_candidates(conn)
+    with conn.transaction() as tx:
+        with conn.cursor() as cur:
+            result = apply_candidates(cur, summary.candidates)
+        if dry_run:
+            raise psycopg.Rollback(tx)
+    if not dry_run:
+        conn.commit()
+    return result
+
+
+def detect_new_corporate_events(conn: psycopg.Connection) -> CorpEventsClassification:
+    """B-29/B-45: etap cyklu tygodniowego PRZED FIFO — klasyfikuje kandydatów
+    względem `corporate_events` bez ZAPISU (zapis dopiero po potwierdzeniu
+    ownera: `python -m mannaz.run_p3 corp-actions`).
+
+    collect -> `apply_candidates` w transakcji/savepoincie ZAWSZE wycofywanej
+    (`psycopg.Rollback`) — baza po wywołaniu bez zmian. `saved` = zdarzenia nowe
+    do potwierdzenia (bramka), `known` = już zapisane, `date_drift` = ratio
+    zgodne z zapisanym zdarzeniem, inna data (informacja, bez bramki).
+    Detektor sam pobiera dane z Yahoo (sieć)."""
+    summary = collect_corp_action_candidates(conn)
+    result = CorpEventsClassification()
+    with conn.transaction() as tx:
+        with conn.cursor() as cur:
+            result = apply_candidates(cur, summary.candidates)
+        raise psycopg.Rollback(tx)
+    return result
