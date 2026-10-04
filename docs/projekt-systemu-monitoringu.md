@@ -34,7 +34,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.6 | 2026-09-30 | §25.3: kolumna „stan” faz F0–F6 z dowodami; kolejność przekrojami pionowymi od 2026-09-26; F0 warunkiem wejścia w F3 (decyzja ownera 2026-09-30) |
 | 4.7 | 2026-09-30 | §19.2: poziom 1 liczony per nazwę = emitent — waluty rozliczenia i kontrakty na bazę pod jedną nazwą (decyzja ownera 6.3; B-30, brief CC-N) |
 | 4.8 | 2026-10-02 | §21.6 ocena satelity jako całości (M78–M87, T39–T42): granica subportfela, nadwyżka majątku ΔW w PLN, dwa progi — S&P 500 TR (UCITS) i SPYI, werdykt w trzech statusach, trzy rejestry pomiaru, atrybucja w kwotach PLN; M59 i przykład M57 przepisane; §2.1 oznaczony jako stan historyczny; §28 pytania 2–4; O-46–O-50 (decyzje ownera 2026-10-02 po dwóch rundach recenzji zewnętrznej) |
-| **4.9** | **2026-10-02** | **Limity mandatu ryzyka satelity: L_max = 35% (T41), L_rel = 20% wobec każdego progu (T43), progi alertów (T44); M88 — trzy składniki mandatu, koniunkcja, logika statusu przy brakach; M89 — okno kroczące, trwały rejestr naruszeń, alerty na obsunięciu bieżącym z histerezą i eskalacją, zmiany limitów prospektywnie; M83 i §28 pytanie 4 (decyzje ownera 2026-10-02)** |
+| 4.9 | 2026-10-02 | Limity mandatu ryzyka satelity: L_max = 35% (T41), L_rel = 20% wobec każdego progu (T43), progi alertów (T44); M88 — trzy składniki mandatu, koniunkcja, logika statusu przy brakach; M89 — okno kroczące, trwały rejestr naruszeń, alerty na obsunięciu bieżącym z histerezą i eskalacją, zmiany limitów prospektywnie; M83 i §28 pytanie 4 (decyzje ownera 2026-10-02) |
+| **4.11** | **2026-10-04** | **§19.1: cena wejścia stopu 2N w walucie notowania — lot rozliczony w innej walucie przeliczany kursem krzyżowym NBP A z dnia transakcji przed średnią ważoną; brak kursu → brak stopu 2N (B-41, brief CC-W; numer 4.10 zarezerwowany dla T45/B-43)** |
 
 ### 0.3 Oznaczenia
 
@@ -964,6 +965,8 @@ Kategoryzacja startowa:
 | 3 | **THESIS EXIT** | naruszone kryterium falsyfikacji z rejestru tez |
 | 4 | **RELATIVE EXIT** | porażka wobec benchmarku zastępczego przez 24 miesiące — **tylko przy VALUE ≠ CHEAP** (M26) |
 | 5 | **OSTRZEŻENIE** | `σ20 > 2 × σ60` albo `close/max(close,252) < 0,75` — nie wyjście |
+
+**Cena wejścia stopu 2N:** cenę każdego lotu rozliczonego w walucie innej niż waluta notowania przelicza się na walutę notowania kursem krzyżowym NBP A z dnia transakcji (ostatni fixing z datą ≤ data transakcji), przed średnią ważoną pozostałych lotów; brak kursu dla lotu → brak stopu 2N, nigdy podstawienie innego kursu (B-41).
 
 ### 19.2 Sizing i budżety
 
