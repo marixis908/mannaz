@@ -120,6 +120,7 @@ def _run_cycle_kwargs(tmp_path: Path, conn, **overrides):
         fetch_fx=_stub_fetch_fx(),
         risk_fn=_stub_risk_fn(),
         check_ignored=lambda p: True,
+        detect_corp_events_fn=lambda conn: [],  # B-29: zero sieci w testach
     )
     kwargs.update(overrides)
     return kwargs

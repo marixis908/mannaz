@@ -5,6 +5,7 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 prices [--instrument-ids ID [ID ...]] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     python -m mannaz.run_p3 fx [--currencies USD EUR ...] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
     python -m mannaz.run_p3 calendar
+    python -m mannaz.run_p3 corp-actions
     python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
     python -m mannaz.run_p3 satellite --from YYYY-MM-DD --to YYYY-MM-DD --out DIR [--account-values CSV] [--symbol-map CSV]
 
@@ -29,6 +30,7 @@ from datetime import date
 from pathlib import Path
 
 from mannaz.calendar_check import run_calendar_check
+from mannaz.corp_actions import run_corp_actions_detector
 from mannaz.cycle import (
     DEFAULT_INCOMING_DIR,
     DEFAULT_RAW_ARCHIVE_DIR,
@@ -249,6 +251,24 @@ def cmd_satellite(args: argparse.Namespace) -> None:
     print(f"wyniki: {args.out}")
 
 
+def cmd_corp_actions(args: argparse.Namespace) -> None:
+    """B-29: potwierdzenie ownera — ZAPIS zdarzeń korporacyjnych wykrytych przez
+    detektor (commit=True) do corporate_events. Po nim ponowny `cycle`
+    (FIFO przelicza pozycje od zera z corporate_events)."""
+    conn = get_connection()
+    try:
+        summary = run_corp_actions_detector(conn)
+    finally:
+        conn.close()
+    events = list(summary.yfinance_splits_imported) + list(summary.price_ratio_detected)
+    print(f"zapisane zdarzenia: {len(events)}")
+    for ev in events:
+        print(
+            f"  ticker={ev.broker_ticker} data={ev.event_date} typ={ev.event_type} "
+            f"ratio={ev.ratio} zrodlo={ev.source}/{ev.date_source}"
+        )
+
+
 def cmd_cycle(args: argparse.Namespace) -> None:
     conn = get_connection()
     try:
@@ -333,6 +353,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV broker_ticker,isin,yahoo_symbol,exchange_mic,currency dla instrumentow bez cen"
     )
     p_sat.set_defaults(func=cmd_satellite)
+
+    p_corp = sub.add_parser(
+        "corp-actions", help="B-29 — potwierdzenie: zapis wykrytych zdarzen korporacyjnych do corporate_events"
+    )
+    p_corp.set_defaults(func=cmd_corp_actions)
 
     p_cycle = sub.add_parser(
         "cycle", help="C2-C7 — cykl tygodniowy: import -> FIFO -> bramka rejestracji -> ceny/FX -> ryzyko -> raport"

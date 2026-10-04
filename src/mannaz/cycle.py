@@ -27,6 +27,7 @@ from typing import Any, Callable
 import psycopg
 
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
+from mannaz.corp_actions import detect_new_corporate_events
 from mannaz.fifo import run_fifo
 from mannaz.fx import NBP_CURRENCIES, FxSummary, run_fx_fetch
 from mannaz.import_history import (
@@ -653,6 +654,7 @@ def account_label(rachunek: str) -> str:
 # ---------------------------------------------------------------------------
 
 STAGE_IMPORT = "import"
+STAGE_CORP_EVENTS = "zdarzenia"
 STAGE_FIFO = "fifo"
 STAGE_REGISTRATION = "rejestracja"
 STAGE_PRICES_FX = "ceny_fx"
@@ -660,6 +662,7 @@ STAGE_RISK = "ryzyko"
 
 STAGE_LABELS = {
     STAGE_IMPORT: "import",
+    STAGE_CORP_EVENTS: "detektor zdarzeń korporacyjnych",
     STAGE_FIFO: "FIFO",
     STAGE_REGISTRATION: "bramka rejestracji",
     STAGE_PRICES_FX: "ceny/FX",
@@ -807,6 +810,9 @@ class ReportState:
     # DATA FAILURE — podsekcje
     import_failures: list[str] = field(default_factory=list)
     registration_queue: list[Gap] = field(default_factory=list)
+    # B-29: nowe zdarzenia korporacyjne do potwierdzenia przez ownera (bramka
+    # DATA REVIEW przed FIFO/ryzykiem); elementy: corp_actions.DetectedEvent.
+    corp_events_review: list = field(default_factory=list)
     price_ingest_errors: list[str] = field(default_factory=list)
     fx_failures: list[str] = field(default_factory=list)
     date_incomplete_items: list[IncompleteRiskItem] = field(default_factory=list)
@@ -839,6 +845,7 @@ def has_data_failures(state: ReportState) -> bool:
     return bool(
         state.import_failures
         or state.registration_queue
+        or state.corp_events_review
         or state.price_ingest_errors
         or state.fx_failures
         or state.date_incomplete_items
@@ -879,6 +886,26 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
         lines.append("|---|---|---|---|")
         for g in state.registration_queue:
             lines.append(f"| {g.ticker} | {account_label(g.rachunek)} | {g.brak} | {g.gdzie_uzupelnic} |")
+    else:
+        lines.append("brak")
+
+    lines.append("")
+    lines.append("### DATA REVIEW — zdarzenia korporacyjne do potwierdzenia")
+    note = stage_note(STAGE_CORP_EVENTS)
+    if note:
+        lines.append(note)
+    elif state.corp_events_review:
+        lines.append("| ticker | data | ratio | zrodlo |")
+        lines.append("|---|---|---|---|")
+        for ev in state.corp_events_review:
+            lines.append(
+                f"| {ev.broker_ticker} | {_fmt_date(ev.event_date)} | {ev.ratio} | {ev.source}/{ev.date_source} |"
+            )
+        lines.append("")
+        lines.append(
+            "potwierdzenie: `python -m mannaz.run_p3 corp-actions` (zapis do corporate_events), "
+            "potem ponowny `python -m mannaz.run_p3 cycle` (FIFO przeliczone od zdarzenia)"
+        )
     else:
         lines.append("brak")
 
@@ -1399,9 +1426,11 @@ def run_cycle(
     calendar_facts_fn: Callable[[str | None, date], Any] = _default_calendar_facts,
     sessions_fn: SessionsFn = _default_sessions_fn,
     check_ignored: Callable[[Path], bool] = _default_check_ignored,
+    detect_corp_events_fn: Callable[[psycopg.Connection], list] = detect_new_corporate_events,
 ) -> CycleResult:
     """Brief CC-C, C2–C8: orkiestracja jednego przebiegu cyklu tygodniowego.
-    Etapy w kolejności: import -> FIFO -> bramka rejestracji -> ceny/FX ->
+    Etapy w kolejności: import -> detektor zdarzeń korporacyjnych (B-29, bramka
+    DATA REVIEW, bez zapisu) -> FIFO -> bramka rejestracji -> ceny/FX ->
     ryzyko -> raport. Wyjątek złapany per etap zamienia się w DATA FAILURE
     (raport powstaje zawsze)."""
     run_started_at = datetime.now(timezone.utc)
@@ -1513,6 +1542,20 @@ def run_cycle(
             )
 
         if import_stopped:
+            state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
+            raise _StageStop()
+
+        # --- C2b: detektor zdarzeń korporacyjnych (B-29) ------------------------
+        # Split musi być wykryty, zanim cokolwiek użyje pozycji (FIFO, ryzyko).
+        # Detektor nie zapisuje (zapis po potwierdzeniu ownera: run_p3 corp-actions).
+        try:
+            new_corp_events = detect_corp_events_fn(conn)
+        except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (nic nie wypada po cichu)
+            state.import_failures.append(f"błąd etapu detektora zdarzeń: {type(exc).__name__}: {exc}")
+            state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
+            raise _StageStop() from exc
+        if new_corp_events:
+            state.corp_events_review = list(new_corp_events)
             state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
             raise _StageStop()
 

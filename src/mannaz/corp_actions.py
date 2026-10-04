@@ -331,7 +331,9 @@ def _existing_yfinance_event_dates(cur: psycopg.Cursor, instrument_id: int) -> s
     return {row[0] for row in cur.fetchall()}
 
 
-def run_corp_actions_detector(conn: psycopg.Connection) -> CorpActionsSummary:
+def run_corp_actions_detector(conn: psycopg.Connection, commit: bool = True) -> CorpActionsSummary:
+    """`commit=False` (B-29) — bez `conn.commit()`; INSERTy zostają w transakcji
+    wywołującego (wzorzec `run_fifo`/`run_risk`)."""
     summary = CorpActionsSummary()
 
     with conn.cursor() as cur:
@@ -469,6 +471,41 @@ def run_corp_actions_detector(conn: psycopg.Connection) -> CorpActionsSummary:
                     )
                 )
 
-        conn.commit()
+        if commit:
+            conn.commit()
 
     return summary
+
+
+def detect_new_corporate_events(conn: psycopg.Connection) -> list[DetectedEvent]:
+    """B-29: etap cyklu tygodniowego PRZED FIFO — wykrywa NOWE zdarzenia
+    korporacyjne bez ich zapisu (zapis dopiero po potwierdzeniu ownera:
+    `python -m mannaz.run_p3 corp-actions`).
+
+    Uruchamia `run_corp_actions_detector(conn, commit=False)` wewnątrz
+    transakcji/savepointu, który na końcu jest WYCOFYWANY (`psycopg.Rollback`)
+    — baza po wywołaniu jest bez zmian. Zwraca tylko zdarzenia, których klucz
+    (instrument_id, event_date, event_type) nie istniał w `corporate_events`
+    przed wywołaniem; zdarzenie już zapisane nie jest zgłaszane ponownie, także
+    gdy zmienił się jego `title_raw` (detektor z ilorazu zapisuje w nim
+    median_ratio i n próbek, więc ON CONFLICT go wtedy nie łapie).
+    Detektor sam pobiera dane z Yahoo (sieć)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT instrument_id, event_date, event_type FROM corporate_events")
+        existing = {(r[0], r[1], r[2]) for r in cur.fetchall()}
+
+    found: list[DetectedEvent] = []
+    with conn.transaction() as tx:
+        summary = run_corp_actions_detector(conn, commit=False)
+        found = list(summary.yfinance_splits_imported) + list(summary.price_ratio_detected)
+        raise psycopg.Rollback(tx)
+
+    new_events: list[DetectedEvent] = []
+    seen: set[tuple[int, date, str]] = set()
+    for ev in found:
+        key = (ev.instrument_id, ev.event_date, ev.event_type)
+        if key in existing or key in seen:
+            continue
+        seen.add(key)
+        new_events.append(ev)
+    return new_events
