@@ -15,6 +15,7 @@ from mannaz.risk import (
     NON_CASH_ROW_TYPES,
     RATCHET_INIT_DATE,
     IncompleteRiskDateError,
+    _open_positions_as_of,
     is_risk_budget_eligible,
     kontraktowy_account_value,
     resolve_default_risk_date,
@@ -455,6 +456,47 @@ def test_b17_incomplete_nav_raises_and_writes_nothing(db_conn, monkeypatch):
         assert [(i.broker_ticker, i.reason) for i in exc_info.value.items] == [("XYZ", "nav_incomplete:brak cen")]
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (B17_DATE,))
+            assert cur.fetchone()[0] == count_before
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b36_explicit_d_with_incomplete_kontraktowy_raises_default_d_skips_it(db_conn):
+    """B-36 (M77): w transakcji (rollback) usuwamy wiersze depozytowe
+    KONTRAKTOWY z D, tak że rozliczenie nie sięga D przy otwartych
+    kontraktach: jawne D -> RuntimeError KONTRAKTOWY (bez zapisu), domyślne D
+    jest wcześniejsze od D."""
+    conn = db_conn
+    try:
+        d = resolve_default_risk_date(conn)
+        assert d is not None, "brak kompletnej daty w bazie testowej"
+        with conn.cursor() as cur:
+            positions_before = positions_as_of(cur, d)
+            if not any(p["instrument_type"] == "future" for p in _open_positions_as_of(cur, d)):
+                pytest.skip("brak otwartych kontraktow na D")
+            cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
+            count_before = cur.fetchone()[0]
+            cur.execute(
+                "DELETE FROM transactions WHERE rachunek LIKE %s AND transaction_date >= %s",
+                (f"{KONTRAKTOWY_PREFIX}%", d),
+            )
+            if len(positions_as_of(cur, d)) != len(positions_before):
+                pytest.skip("usuniete wiersze zmieniaja pozycje - test nie izoluje KONTRAKTOWY")
+        with pytest.raises(RuntimeError, match="KONTRAKTOWY"):
+            run_risk(conn, as_of=d, commit=False)
+        conn.rollback()
+        # po rollbacku bramka nie zostala naruszona; powtorz usuniecie i sprawdz domyslne D
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM transactions WHERE rachunek LIKE %s AND transaction_date >= %s",
+                (f"{KONTRAKTOWY_PREFIX}%", d),
+            )
+        d_after = resolve_default_risk_date(conn)
+        assert d_after is None or d_after < d
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
             assert cur.fetchone()[0] == count_before
     finally:
         conn.rollback()

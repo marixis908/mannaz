@@ -1574,7 +1574,10 @@ def run_cycle(
         # --- C6: ryzyko ---------------------------------------------------
         d = resolve_date_fn(conn, calendar_facts_fn=calendar_facts_fn)
         if d is None:
-            state.d_resolution_failure = "brak kompletnej daty w oknie 30 dat cenowych"
+            state.d_resolution_failure = (
+                "brak daty kompletnej jednoczesnie w cenach (T27) i w rozliczeniu KONTRAKTOWY (M77) "
+                "w oknie 30 dat cenowych"
+            )
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop()
         state.d = d

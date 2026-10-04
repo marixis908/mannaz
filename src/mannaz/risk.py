@@ -1458,6 +1458,12 @@ def resolve_default_risk_date(
     od razu najpóźniejsza). Brak kompletu w oknie -> `None` (`run_risk`
     wtedy rzuca `RuntimeError` jak dotychczas).
 
+    B-36 (M77): kandydat musi być kompletny JEDNOCZEŚNIE w cenach (T27) i w
+    rozliczeniu rachunku KONTRAKTOWY (`check_kontraktowy_coverage`, ta sama
+    reguła co bramka w `run_risk`; istotne gdy na D są otwarte kontrakty).
+    Jawnie podane D (`run_risk(as_of=D)`) nie przechodzi przez ten wybór i
+    nadal kończy się błędem przy niekompletności.
+
     `today` (brief CC-C, C6): opcjonalny, domyślnie `date.today()` jak
     dotychczas — wstrzykiwalny, żeby cykl (`cycle.py`) i testy mogły podać
     dzień przebiegu bez podmiany zegara systemowego."""
@@ -1479,6 +1485,16 @@ def resolve_default_risk_date(
                 if incomplete is not None:
                     complete = False
                     break
+            if complete:
+                # B-36 (M77): ta sama reguła co bramka w `run_risk` — jedno
+                # wywołanie `check_kontraktowy_coverage`, bez kopii warunku.
+                kontraktowy_rows = _kontraktowy_rows(cur, d)
+                has_open_futures = any(p["instrument_type"] == "future" for p in positions)
+                max_kontraktowy_date = max((r["transaction_date"] for r in kontraktowy_rows), default=None)
+                try:
+                    check_kontraktowy_coverage(len(kontraktowy_rows), max_kontraktowy_date, has_open_futures, d)
+                except RuntimeError:
+                    complete = False
             completeness.append((d, complete))
             if complete:
                 break
@@ -1492,7 +1508,10 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
     if as_of is None:
         as_of = resolve_default_risk_date(conn)
         if as_of is None:
-            raise RuntimeError("brak sesji z kompletnymi close_split_adj dla instrumentow satelity — nie da sie ustalic D")
+            raise RuntimeError(
+                "brak daty kompletnej jednoczesnie w cenach (T27) i w rozliczeniu KONTRAKTOWY (M77) "
+                "w oknie kandydatow - nie da sie ustalic D"
+            )
 
     summary = RiskSummary(risk_date=as_of)
 
