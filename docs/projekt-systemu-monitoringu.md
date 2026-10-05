@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.13 · 2026-10-04**
+**Rewizja 4.14 · 2026-10-05**
 
 ---
 
@@ -37,7 +37,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.9 | 2026-10-02 | Limity mandatu ryzyka satelity: L_max = 35% (T41), L_rel = 20% wobec każdego progu (T43), progi alertów (T44); M88 — trzy składniki mandatu, koniunkcja, logika statusu przy brakach; M89 — okno kroczące, trwały rejestr naruszeń, alerty na obsunięciu bieżącym z histerezą i eskalacją, zmiany limitów prospektywnie; M83 i §28 pytanie 4 (decyzje ownera 2026-10-02) |
 | 4.11 | 2026-10-04 | §19.1: cena wejścia stopu 2N w walucie notowania — lot rozliczony w innej walucie przeliczany kursem krzyżowym NBP A z dnia transakcji przed średnią ważoną; brak kursu → brak stopu 2N (B-41, brief CC-W; numer 4.10 zarezerwowany dla T45/B-43) |
 | 4.12 | 2026-10-04 | §19.4: kapitał satelity w budżetach ryzyka = NAV satelity z §21.6 (M78), z gotówką; NAV niepełny → brak przebiegu ryzyka dla D (B-17); §19 M77: domyślne D kompletne w cenach i w rozliczeniu KONTRAKTOWY (B-36), detektor zdarzeń korporacyjnych etapem cyklu z bramką DATA REVIEW (B-29); §14.1 pytanie 7: hosting, IaaS i rejestracja domen nie są oprogramowaniem (decyzje ownera 2026-10-04, brief CC-W2) |
-| **4.13** | **2026-10-04** | **§9.6: konwencja „raw” w yfinance (`*_split_adj` = stan u dostawcy w chwili pobrania, `*_raw` ze zdarzeń w `corporate_events`, detektor z ilorazu, ryzyko w warstwie `*_split_adj`); M67: rewizja dostawcy — definicja, zapis do `ingest_errors` (`provider_revision`), sekcje raportu cyklu, bez zatrzymania cyklu (B-05, brief CC-B05)** |
+| 4.13 | 2026-10-04 | §9.6: konwencja „raw” w yfinance (`*_split_adj` = stan u dostawcy w chwili pobrania, `*_raw` ze zdarzeń w `corporate_events`, detektor z ilorazu, ryzyko w warstwie `*_split_adj`); M67: rewizja dostawcy — definicja, zapis do `ingest_errors` (`provider_revision`), sekcje raportu cyklu, bez zatrzymania cyklu (B-05, brief CC-B05) |
+| **4.14** | **2026-10-05** | **§4.1 T46: świeca dzienna zapisywana dopiero po zamknięciu sesji jej giełdy + 30 min; bez kalendarza i gdy kalendarza nie da się zastosować — reguła daty; świeca sesji niezamkniętej nie jest błędem danych (B-48, brief CC-B48)** |
 
 ### 0.3 Oznaczenia
 
@@ -247,6 +248,8 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 **T13.** Throttling: SEC ≤ 10 req/s (twardy, z nagłówkiem User-Agent zawierającym kontakt), yfinance ~1 req/s z jitterem (token bucket), NBP z chunkowaniem po 93 dni.
 
 **T14.** Korekta splitów dla danych fundamentalnych **as reported** żyje w jednej funkcji, wołanej w jednym miejscu. Mnożnik przed i po splicie bez tej korekty to dwa różne byty.
+
+**T46.** Świeca dzienna trafia do `prices_daily` dopiero po zamknięciu sesji jej giełdy: `teraz_UTC ≥ zamknięcie_sesji_UTC + 30 min` według kalendarza `exchange_calendars` giełdy instrumentu [S]. Instrument bez przypisanego kalendarza: zapisywane są wyłącznie sesje o dacie wcześniejszej niż bieżąca data UTC. Ta sama reguła daty obowiązuje, gdy kalendarza nie da się zastosować (nieznany kod, data poza zakresem kalendarza, data niebędąca sesją), z osobnym licznikiem w podsumowaniu przebiegu. Świeca sesji niezamkniętej nie jest błędem danych: nie trafia do `ingest_errors`, liczy się w podsumowaniu przebiegu. *Uzasadnienie: zmierzone 2026-10-05 — przebieg w godzinach sesji zapisał śródsesyjne ceny XAMS/XETR/XWAR, a następny przebieg zgłosił je jako 12 rewizji dostawcy; przebieg wieczorny dałby kompletne D na niezamkniętych świecach US.*
 
 ### 4.2 O obliczeniach
 
