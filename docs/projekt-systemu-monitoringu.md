@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.14 · 2026-10-05**
+**Rewizja 4.15 · 2026-10-05**
 
 ---
 
@@ -38,7 +38,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.11 | 2026-10-04 | §19.1: cena wejścia stopu 2N w walucie notowania — lot rozliczony w innej walucie przeliczany kursem krzyżowym NBP A z dnia transakcji przed średnią ważoną; brak kursu → brak stopu 2N (B-41, brief CC-W; numer 4.10 zarezerwowany dla T45/B-43) |
 | 4.12 | 2026-10-04 | §19.4: kapitał satelity w budżetach ryzyka = NAV satelity z §21.6 (M78), z gotówką; NAV niepełny → brak przebiegu ryzyka dla D (B-17); §19 M77: domyślne D kompletne w cenach i w rozliczeniu KONTRAKTOWY (B-36), detektor zdarzeń korporacyjnych etapem cyklu z bramką DATA REVIEW (B-29); §14.1 pytanie 7: hosting, IaaS i rejestracja domen nie są oprogramowaniem (decyzje ownera 2026-10-04, brief CC-W2) |
 | 4.13 | 2026-10-04 | §9.6: konwencja „raw” w yfinance (`*_split_adj` = stan u dostawcy w chwili pobrania, `*_raw` ze zdarzeń w `corporate_events`, detektor z ilorazu, ryzyko w warstwie `*_split_adj`); M67: rewizja dostawcy — definicja, zapis do `ingest_errors` (`provider_revision`), sekcje raportu cyklu, bez zatrzymania cyklu (B-05, brief CC-B05) |
-| **4.14** | **2026-10-05** | **§4.1 T46: świeca dzienna zapisywana dopiero po zamknięciu sesji jej giełdy + 30 min; bez kalendarza i gdy kalendarza nie da się zastosować — reguła daty; świeca sesji niezamkniętej nie jest błędem danych (B-48, brief CC-B48)** |
+| 4.14 | 2026-10-05 | §4.1 T46: świeca dzienna zapisywana dopiero po zamknięciu sesji jej giełdy + 30 min; bez kalendarza i gdy kalendarza nie da się zastosować — reguła daty; świeca sesji niezamkniętej nie jest błędem danych (B-48, brief CC-B48) |
+| **4.15** | **2026-10-05** | **§19.3: zapadka „nigdy w dół” z §19.1 obejmuje stop efektywny w okresie posiadania (najwyższy 2N od początku zapadki), sygnał „Dokupienia poniżej stopu” w raporcie cyklu, kontrakty poza zakresem sygnału (B-52, wariant A, brief CC-B52 rew. 3)** |
 
 ### 0.3 Oznaczenia
 
@@ -1006,6 +1007,7 @@ Poziom 3: suma otwartych ryzyk       ≤ 15%
 
 - Pozycje **już poniżej** poziomu stopu w dniu pierwszym → stan `RISK = HIGH` i **jednorazowy raport inicjalizacyjny**, nie 31 alertów. Alert właściwy dopiero przy kolejnym przecięciu.
 - Stop 2N od historycznego wejścia dla pozycji z dużym zyskiem jest **martwy** — zastępowany przez Chandelier z §19.1 (`max(high,22) − 3×ATR22`), z zapadką „nigdy w dół" biegnącą od dnia inicjalizacji systemu. Dla pozycji otwartej po dniu inicjalizacji zapadka biegnie od otwarcia bieżącego okresu posiadania; zamknięcie pozycji zeruje stan zapadki.
+- Zapadka „nigdy w dół” z §19.1 obejmuje **stop efektywny** w bieżącym okresie posiadania, nie tylko składnik Chandeliera: stop efektywny = wyższy z Chandeliera z zapadką i najwyższego stopu 2N obowiązującego od początku zapadki (dla pozycji krótkiej lustrzanie). Dokupienie poniżej ceny wejścia obniża bieżący składnik 2N, ale nie obniża stopu efektywnego. Dokupienie pozycji akcyjnej po cenie (w walucie notowania) niższej niż stop efektywny z ostatniej oceny przed transakcją jest zdarzeniem do przeglądu w raporcie cyklu (sekcja „Dokupienia poniżej stopu”); kontrakty są poza zakresem tego sygnału, bo ich stop liczony jest na cenie bazy. *Decyzja ownera 2026-10-05 (B-52, wariant A); przypadek: FTAI 2026-10-01 — kod do tego dnia stosował zapadkę wyłącznie do Chandeliera.*
 - Raport inicjalizacyjny jest **poza limitem 15 alertów miesięcznie** i występuje dokładnie raz.
 
 ### 19.4 Instrumenty pochodne
