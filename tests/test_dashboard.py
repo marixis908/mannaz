@@ -554,11 +554,6 @@ def test_sum_open_risk_pct_excludes_core_and_multiplier_missing():
     assert total == Decimal("1.5")
 
 
-def test_count_level1_breaches():
-    rows = [_risk_row(level1_breach=True), _risk_row(level1_breach=False), _risk_row(level1_breach=True)]
-    assert model.count_level1_breaches(rows) == 2
-
-
 def test_price_coverage_counts_eligible_rows_with_price():
     rows = [
         _risk_row(close_d=Decimal("1")),

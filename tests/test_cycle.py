@@ -1320,6 +1320,36 @@ def test_level1_report_incomplete_name_listed():
     assert "przekroczenia > 1%: brak" in line
 
 
+def test_b34_run_p3_risk_prints_level1_per_name_not_per_row(monkeypatch, capsys):
+    """B-34: CLI `run_p3 risk` drukuje poziom 1 per nazwa (ta sama linia co
+    raport cyklu), a nie listę przekroczeń per wiersz."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from mannaz import run_p3
+
+    class _Summary(SimpleNamespace):
+        def __getattr__(self, name):  # pola spoza poziomu 1 nie są tu sprawdzane
+            return {}
+
+    summary = _Summary(
+        rows=[_l1_row("AAA", "USD", 1, Decimal("0.6"), Decimal("1.2"), True),
+              _l1_row("AAA", "PLN", 1, Decimal("0.6"), Decimal("1.2"), True)],
+        level1_breach_tickers=["AAA", "AAA"],
+    )
+    conn = SimpleNamespace(cursor=lambda: nullcontext(), close=lambda: None)
+    monkeypatch.setattr(run_p3, "get_connection", lambda: conn)
+    monkeypatch.setattr(run_p3, "run_risk", lambda conn, as_of: summary)
+    monkeypatch.setattr(run_p3, "level1_name_labels", lambda cur, s: {1: "AAA"})
+
+    run_p3.cmd_risk(SimpleNamespace(date=None))
+    out = capsys.readouterr().out
+
+    assert "poziom 1 (per nazwa): max AAA" in out
+    assert "przekroczenia > 1%: AAA" in out
+    assert "level1_breach_tickers" not in out
+
+
 # ---------------------------------------------------------------------------
 # B-05 (Y5) — rewizje cen dostawcy i przeliczenie D wobec zapisu poprzedniego
 # ---------------------------------------------------------------------------

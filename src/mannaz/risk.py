@@ -616,6 +616,35 @@ def level1_by_name(items, labels: dict | None = None) -> list[Level1Name]:
     return out
 
 
+def level1_names_for_summary(summary: "RiskSummary", labels: dict | None = None) -> list[Level1Name]:
+    """Poziom 1 per nazwa dla wierszy `run_risk` — jedno mapowanie wierszy na
+    `level1_by_name` dla raportu cyklu i CLI `run_p3 risk` (B-34)."""
+    return level1_by_name(
+        [
+            (
+                r.name_key,
+                is_risk_budget_eligible(r.instrument_type, r.is_core),
+                r.broker_ticker,
+                r.settlement_currency,
+                r.risk_pct_satellite_capital,
+                r.name_risk_pct,
+                r.level1_breach,
+            )
+            for r in summary.rows
+        ],
+        labels,
+    )
+
+
+def level1_name_labels(cur: psycopg.Cursor, summary: "RiskSummary") -> dict[int, str]:
+    """Etykiety nazw poziomu 1: `broker_ticker` instrumentu bazowego (`name_key`)."""
+    name_ids = sorted({r.name_key for r in summary.rows if r.name_key is not None})
+    if not name_ids:
+        return {}
+    cur.execute("SELECT id, broker_ticker FROM instruments WHERE id = ANY(%s)", (name_ids,))
+    return {i: t for i, t in cur.fetchall()}
+
+
 @dataclass
 class RiskBudgetAggregateResult:
     satellite_risk_total: Decimal

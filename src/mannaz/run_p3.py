@@ -38,6 +38,7 @@ from mannaz.cycle import (
     DEFAULT_INCOMING_DIR,
     DEFAULT_RAW_ARCHIVE_DIR,
     DEFAULT_REPORTS_DIR,
+    render_level1_by_name,
     run_cycle,
     safe_print,
 )
@@ -47,7 +48,7 @@ from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
 from mannaz.instruments_map import run_instrument_mapping, run_instrument_mapping_from_file
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
 from mannaz.prices import run_prices_fetch, session_closed
-from mannaz.risk import run_risk
+from mannaz.risk import level1_name_labels, level1_names_for_summary, run_risk
 from mannaz.satellite import run_satellite
 
 
@@ -185,6 +186,8 @@ def cmd_risk(args: argparse.Namespace) -> None:
     conn = get_connection()
     try:
         summary = run_risk(conn, as_of=args.date)
+        with conn.cursor() as cur:
+            name_labels = level1_name_labels(cur, summary)
     finally:
         conn.close()
 
@@ -209,7 +212,9 @@ def cmd_risk(args: argparse.Namespace) -> None:
     print(f"heat_pct_kapital_satelity_ogolem: {summary.total_risk_pct_satellite_capital}")
     print(f"heat_pct_kapital_satelity_ZAGRANICZNY: {summary.total_risk_pct_zagraniczny_satellite_capital}")
     print(f"level3_breach (>15%): {summary.level3_breach}")
-    print(f"level1_breach_tickers (>1%): {summary.level1_breach_tickers}")
+    # B-34: poziom 1 per nazwa, ta sama linia co w raporcie cyklu.
+    level1_line = render_level1_by_name(level1_names_for_summary(summary, name_labels))
+    print(level1_line.removeprefix("- "))
     print(f"REGIME: {summary.regime_tickers}")
     print(f"OSTRZEZENIE: {summary.warning_tickers}")
     print(f"liczba_pod_chandelier_from_entry: {len(summary.below_chandelier_from_entry_tickers)} {summary.below_chandelier_from_entry_tickers}")

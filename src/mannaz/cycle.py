@@ -44,7 +44,8 @@ from mannaz.risk import (
     IncompleteRiskItem,
     Level1Name,
     RiskSummary,
-    level1_by_name,
+    level1_name_labels,
+    level1_names_for_summary,
     _default_calendar_facts,
     _fx_rate_on_or_before,
     convert_entry_rows_to_quote,
@@ -943,21 +944,7 @@ class RiskReportAggregates:
     def from_risk_summary(
         cls, summary: RiskSummary, name_labels: dict[int, str] | None = None
     ) -> "RiskReportAggregates":
-        level1_names = level1_by_name(
-            [
-                (
-                    r.name_key,
-                    is_risk_budget_eligible(r.instrument_type, r.is_core),
-                    r.broker_ticker,
-                    r.settlement_currency,
-                    r.risk_pct_satellite_capital,
-                    r.name_risk_pct,
-                    r.level1_breach,
-                )
-                for r in summary.rows
-            ],
-            name_labels,
-        )
+        level1_names = level1_names_for_summary(summary, name_labels)
         full_names = [n for n in level1_names if not n.incomplete]
         if full_names:
             level1_max_ticker, level1_max_pct = full_names[0].label, full_names[0].pct
@@ -1449,7 +1436,7 @@ def _level1_composition(n: Level1Name) -> str:
     )
 
 
-def _render_level1_by_name(names: list[Level1Name]) -> str:
+def render_level1_by_name(names: list[Level1Name]) -> str:
     full = [n for n in names if not n.incomplete]
     incomplete = [n for n in names if n.incomplete]
     if full:
@@ -1482,7 +1469,7 @@ def _render_risk_section(state: ReportState) -> list[str]:
     lines.append(f"- heat ogółem (% kapitału satelity): {format_pct(a.heat_pct_total)}")
     lines.append(f"- heat ZAGRANICZNY (% kapitału satelity): {format_pct(a.heat_pct_zagraniczny)}")
     if a.level1_names:
-        lines.append(_render_level1_by_name(a.level1_names))
+        lines.append(render_level1_by_name(a.level1_names))
     else:
         lines.append(
             f"- poziom 1: max {a.level1_max_ticker or 'brak'} ({format_pct(a.level1_max_pct)}); "
@@ -2176,12 +2163,8 @@ def run_cycle(
             risk_after = _risk_daily_snapshot(cur, d)
         state.risk_recompute = compare_risk_recompute(risk_before, risk_after)
 
-        name_ids = sorted({r.name_key for r in risk_summary.rows if r.name_key is not None})
-        name_labels: dict[int, str] = {}
-        if name_ids:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, broker_ticker FROM instruments WHERE id = ANY(%s)", (name_ids,))
-                name_labels = {i: t for i, t in cur.fetchall()}
+        with conn.cursor() as cur:
+            name_labels = level1_name_labels(cur, risk_summary)
         state.risk_aggregates = RiskReportAggregates.from_risk_summary(risk_summary, name_labels)
 
         # Poprzednia ocena (D-1): stop_effective (M62) I risk_state (STOP §2,
