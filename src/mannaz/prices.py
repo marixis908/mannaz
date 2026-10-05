@@ -67,6 +67,7 @@ import functools
 import hashlib
 import math
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -80,6 +81,7 @@ import pandas as pd
 import psycopg
 import requests
 import yfinance as yf
+from yfinance.exceptions import YFException, YFRateLimitError
 
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
 
@@ -127,12 +129,26 @@ def fetch_ohlc(symbol: str, start: date, end: date) -> list[OhlcRow]:
     """`auto_adjust=False, actions=True` (brief P3.2). `end` traktowany
     inkluzywnie (Yahoo `history(end=...)` jest wyłączający, stąd +1 dzień)."""
     ticker = yf.Ticker(symbol)
-    hist = ticker.history(
-        start=start.isoformat(),
-        end=(end + timedelta(days=1)).isoformat(),
-        auto_adjust=False,
-        actions=True,
-    )
+    # B-48 C2a: yfinance domyslnie POLYKA wyjatki GET (history.py: `raise_errors or
+    # not YfConfig.debug.hide_exceptions`). `raise_errors=True` dziala tylko dla
+    # tego wywolania (bez zmiany globalnej konfiguracji); wywoluje
+    # DeprecationWarning, wyciszany lokalnie (kontekst jest przywracany).
+    # Mapowanie: YFRateLimitError -> propaguje (ponowienie w run_prices_fetch);
+    # pozostale YFException -> pusta odpowiedz (`empty_response`); reszta propaguje.
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            hist = ticker.history(
+                start=start.isoformat(),
+                end=(end + timedelta(days=1)).isoformat(),
+                auto_adjust=False,
+                actions=True,
+                raise_errors=True,
+            )
+    except YFRateLimitError:
+        raise
+    except YFException:
+        return []
     rows: list[OhlcRow] = []
     if hist is None or hist.empty:
         return rows
@@ -172,6 +188,8 @@ NETWORK_ERRORS: tuple[type[BaseException], ...] = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
 )
+# B-48 C2a: sciezka Yahoo ponawia dodatkowo limit zapytan (YFRateLimitError).
+YAHOO_RETRYABLE_ERRORS: tuple[type[BaseException], ...] = NETWORK_ERRORS + (YFRateLimitError,)
 NETWORK_RETRY_SLEEP_SECONDS = 5
 
 _T = TypeVar("_T")
@@ -180,13 +198,14 @@ _T = TypeVar("_T")
 def call_with_network_retry(
     func: Callable[[], _T],
     sleep: Callable[[float], None] = time.sleep,
+    errors: tuple[type[BaseException], ...] = NETWORK_ERRORS,
 ) -> _T:
-    """Wywołuje `func()`; po błędzie z `NETWORK_ERRORS` czeka
+    """Wywołuje `func()`; po błędzie z `errors` (domyślnie `NETWORK_ERRORS`) czeka
     `NETWORK_RETRY_SLEEP_SECONDS` i próbuje JEDEN raz ponownie. Druga porażka
     propaguje wyjątek (łapie go wołający). Inne wyjątki propagują od razu."""
     try:
         return func()
-    except NETWORK_ERRORS:
+    except errors:
         sleep(NETWORK_RETRY_SLEEP_SECONDS)
         return func()
 
@@ -565,11 +584,11 @@ def run_prices_fetch(
 
     `commit=False` (jak `run_risk`, brief CC-S) — do testów DB z rollbackiem.
 
-    B-49: `fetch_ohlc` przy błędzie sieci (`NETWORK_ERRORS`) jest ponawiany raz
+    B-49: `fetch_ohlc` przy błędzie sieci (`YAHOO_RETRYABLE_ERRORS` = `NETWORK_ERRORS` + `YFRateLimitError`) jest ponawiany raz
     po `NETWORK_RETRY_SLEEP_SECONDS` (`sleep` wstrzykiwalne); druga porażka =
     wpis `ingest_errors` (`connection_error`), status instrumentu
     "connection_error", zero zapisów, przejście do następnego instrumentu.
-    Wyjątek spoza `NETWORK_ERRORS` przerywa etap."""
+    Wyjątek spoza tej krotki przerywa etap (inne `YFException` -> `fetch_ohlc` zwraca [])."""
     if end is None:
         end = date.today()
 
@@ -603,8 +622,10 @@ def run_prices_fetch(
             result.adjustment_convention = adjustment_convention
 
             try:
-                rows = call_with_network_retry(lambda: fetch_ohlc(symbol, start, end), sleep)
-            except NETWORK_ERRORS as exc:
+                rows = call_with_network_retry(
+                    lambda: fetch_ohlc(symbol, start, end), sleep, YAHOO_RETRYABLE_ERRORS
+                )
+            except YAHOO_RETRYABLE_ERRORS as exc:
                 _log_ingest_error(
                     cur,
                     source="yahoo",
