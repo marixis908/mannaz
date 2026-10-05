@@ -142,6 +142,7 @@ import psycopg
 
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
 from mannaz.fifo import KONTRAKTOWY_PREFIX, positions_as_of
+from mannaz.provenance import code_sha
 
 # ---------------------------------------------------------------------------
 # Stałe (§19 dokumentu projektowego + brief P4.1/P4.2)
@@ -2059,7 +2060,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             risk_pct_satellite_capital, level1_breach,
             regime, warning, multiplier_missing, price_is_stale, price_date_used,
             name_key, name_risk_pct,
-            note, computed_at
+            note, computed_at, code_sha
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s,
@@ -2070,7 +2071,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s,
-            %s, %s
+            %s, %s, %s
         )
         """,
         (
@@ -2083,6 +2084,6 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             row.risk_pct_satellite_capital, row.level1_breach,
             row.regime, row.warning, row.multiplier_missing, row.price_is_stale, row.price_date_used,
             row.name_key, row.name_risk_pct,
-            row.note, computed_at,
+            row.note, computed_at, code_sha(),
         ),
     )

@@ -48,6 +48,7 @@ from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
 from mannaz.instruments_map import run_instrument_mapping, run_instrument_mapping_from_file
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
 from mannaz.prices import run_prices_fetch, session_closed
+from mannaz.provenance import triggered_by
 from mannaz.risk import level1_name_labels, level1_names_for_summary, run_risk
 from mannaz.satellite import run_satellite
 
@@ -523,6 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@triggered_by("cli")  # B-54: pojedyncze polecenie; `run_cycle` nadpisuje na 'cycle'
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)

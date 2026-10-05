@@ -39,6 +39,7 @@ from mannaz.import_history import (
 )
 from mannaz.parse_history import ParsedFile, parse_source_file
 from mannaz.prices import PricesSummary, run_prices_fetch
+from mannaz.provenance import triggered_by
 from mannaz.risk import (
     IncompleteRiskDateError,
     IncompleteRiskItem,
@@ -1904,6 +1905,7 @@ def _price_dates_by_calendar(cur: psycopg.Cursor, instruments: list[dict[str, An
     return out
 
 
+@triggered_by("cycle")
 def run_cycle(
     conn: psycopg.Connection,
     *,
