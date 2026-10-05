@@ -37,4 +37,18 @@ a kod wyjścia skryptu jest kodem wyjścia Pythona; brak `.venv` → komunikat i
 poprzednia wartość). Pakietu `mannaz` nie instalujemy w `.venv`: sesje robocze pracują
 w worktree, a instalacja wiązałaby venv repo głównego z jednym drzewem.
 
-`yfinance` przypięty do 1.7.0 testem `tests/test_b51_yfinance_pin.py` (B-51); zmiana wersji wymaga ponownej weryfikacji obsługi wyjątków w `fetch_ohlc`.
+Zależności: `pip install -r requirements.txt` w `.venv` (Python 3.14). `yfinance` przypięty
+do 1.7.0 w `requirements.txt` i testem `tests/test_b51_yfinance_pin.py` (B-51); zmiana wersji
+wymaga ponownej weryfikacji obsługi wyjątków w `fetch_ohlc`.
+
+## Praca w sesjach Claude Code w chmurze
+
+Sesje na claude.ai/code pracują na tym repo bez danych finansowych. Hook
+`.claude/hooks/session-start.sh` (zarejestrowany w `.claude/settings.json`, działa tylko
+w chmurze, lokalnie nic nie robi) tworzy `.venv` na Pythonie 3.14 przez `uv`, instaluje
+`requirements.txt` i ustawia `PYTHONPATH=src`. Postgresa w chmurze nie ma, więc testy
+bazodanowe (marker `db`) są pomijane, a `python -m pytest` sprawdza tylko testy czyste.
+
+Testy bazodanowe i cykl `run_p3` uruchamia owner lokalnie, na własnej bazie, przed merge
+zmian z sesji chmurowej. Sesja chmurowa pracuje na gałęzi `claude/…` i oddaje pracę jako PR.
+Do sesji chmurowej nie wgrywa się `.env`, eksportów z brokera ani zrzutów bazy.
