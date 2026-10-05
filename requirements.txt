@@ -1,0 +1,17 @@
+# Zaleznosci uruchomieniowe i testowe Mannaz (decyzja 2026-10-05, zastepuje
+# "bez pliku zaleznosci" z B-51). Instalacja: pip install -r requirements.txt
+# Pakietu mannaz nie instalujemy - PYTHONPATH=src (README, scripts/cycle.ps1).
+# Python 3.14 - lokalny .venv i sesje chmurowe (.claude/hooks/session-start.sh).
+
+# przypiety: fetch_ohlc opiera obsluge wyjatkow na raise_errors z 1.7.0;
+# strazniki w tests/test_b51_yfinance_pin.py - zmiana wersji wymaga weryfikacji
+yfinance==1.7.0
+
+psycopg[binary]
+exchange_calendars
+pandas
+requests
+curl_cffi
+
+# testy
+pytest
