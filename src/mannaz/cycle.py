@@ -46,6 +46,8 @@ from mannaz.risk import (
     RiskSummary,
     level1_by_name,
     _default_calendar_facts,
+    _fx_rate_on_or_before,
+    convert_entry_rows_to_quote,
     is_risk_budget_eligible,
     resolve_default_risk_date,
     run_risk,
@@ -399,6 +401,224 @@ def stop_events(
             )
         )
     return events
+
+
+# ---------------------------------------------------------------------------
+# B-52 — dokupienie poniżej stopu (zdarzenie informacyjne; czysta funkcja +
+# odczyt SELECT). Brief CC-B52 rew. 3, D1.
+# ---------------------------------------------------------------------------
+
+# row_type zmieniające ilość pozycji (jak fifo._FIFO_ROW_TYPES); splity nie
+# zmieniają zerowości ilości i są pomijane.
+_QTY_ADD_ROW_TYPES = ("kupno", "bilans_otwarcia", "zamiana_przyjecie")
+_QTY_SUB_ROW_TYPES = ("sprzedaz", "zamiana_wydanie")
+
+
+@dataclass(frozen=True)
+class BuyBelowStopCandidate:
+    """Wejście `buy_below_stop_events` — JEDNA transakcja z okna oceny wraz z
+    kontekstem grupy (rachunek, instrument_id, waluta rozliczenia)."""
+
+    broker_ticker: str
+    rachunek: str
+    instrument_id: int
+    settlement_currency: str
+    quote_currency: str
+    instrument_type: str
+    is_core: bool
+    row_type: str
+    txn_date: date
+    qty: Decimal
+    price_quote: Decimal | None  # cena w walucie notowania (None gdy brak kursu)
+    fx_missing: bool
+    qty_before: Decimal
+    holding_period_start: date | None
+    # (risk_date, stop_effective, stop_source) grupy z risk_date < D
+    prior_evals: tuple[tuple[date, Decimal | None, str | None], ...]
+    stop_d: Decimal | None
+    stop_d_source: str | None
+
+
+@dataclass(frozen=True)
+class BuyBelowStopEvent:
+    broker_ticker: str
+    rachunek: str
+    settlement_currency: str
+    quote_currency: str
+    txn_date: date
+    qty: Decimal
+    price_quote: Decimal | None  # None + fx_missing => "brak kursu FX"
+    fx_missing: bool
+    stop_before: Decimal
+    stop_before_date: date
+    stop_before_source: str | None
+    stop_d: Decimal | None
+    stop_d_source: str | None
+
+
+def quantity_timeline(txns: list[dict[str, Any]]) -> list[tuple[Decimal, date | None]]:
+    """Dla transakcji grupy w kolejności (transaction_date, id) zwraca per
+    transakcja (qty_before, holding_period_start). holding_period_start = data
+    ostatniego przejścia ilości 0 -> != 0 PRZED tą transakcją (None, gdy
+    qty_before == 0). Wiersze o row_type spoza kupna/sprzedaży (np. split) są
+    pomijane w liczeniu ilości."""
+    out: list[tuple[Decimal, date | None]] = []
+    qty = Decimal(0)
+    start: date | None = None
+    for t in txns:
+        out.append((qty, start if qty != 0 else None))
+        rt = t["row_type"]
+        if rt in _QTY_ADD_ROW_TYPES:
+            new = qty + t["qty"]
+        elif rt in _QTY_SUB_ROW_TYPES:
+            new = qty - t["qty"]
+        else:
+            continue
+        if qty == 0 and new != 0:
+            start = t["date"]
+        qty = new
+    return out
+
+
+def buy_below_stop_events(
+    candidates: list[BuyBelowStopCandidate],
+    prev_risk_date: date | None,
+    d: date | None,
+) -> list[BuyBelowStopEvent]:
+    """B-52 D1: kupno zwiększające istniejącą pozycję akcyjną satelity po cenie
+    (waluta notowania) ściśle poniżej stopu efektywnego z ostatniej oceny przed
+    transakcją (w okresie posiadania). Okno dat (prev_risk_date, D]; brak
+    prev_risk_date -> brak zdarzeń. Brak kursu FX -> zdarzenie pokazane bez
+    porównania (cena None). Sortowanie: data, ticker."""
+    if prev_risk_date is None or d is None:
+        return []
+    events: list[BuyBelowStopEvent] = []
+    for c in candidates:
+        if c.row_type != "kupno":
+            continue
+        if not is_risk_budget_eligible(c.instrument_type, c.is_core):
+            continue
+        if c.instrument_type not in ("equity", "etf"):
+            continue
+        if not (prev_risk_date < c.txn_date <= d):
+            continue
+        if c.qty_before == 0 or c.holding_period_start is None:
+            continue
+        prior = [
+            e for e in c.prior_evals
+            if e[0] < c.txn_date and e[0] >= c.holding_period_start
+        ]
+        if not prior:
+            continue
+        ev_date, ev_stop, ev_source = max(prior, key=lambda e: e[0])
+        if ev_stop is None:
+            continue
+        if c.price_quote is None:
+            if not c.fx_missing:
+                continue
+        elif not (c.price_quote < ev_stop):
+            continue
+        events.append(
+            BuyBelowStopEvent(
+                broker_ticker=c.broker_ticker,
+                rachunek=c.rachunek,
+                settlement_currency=c.settlement_currency,
+                quote_currency=c.quote_currency,
+                txn_date=c.txn_date,
+                qty=c.qty,
+                price_quote=c.price_quote,
+                fx_missing=c.fx_missing,
+                stop_before=ev_stop,
+                stop_before_date=ev_date,
+                stop_before_source=ev_source,
+                stop_d=c.stop_d,
+                stop_d_source=c.stop_d_source,
+            )
+        )
+    events.sort(key=lambda e: (e.txn_date, e.broker_ticker))
+    return events
+
+
+def load_buy_below_stop_events(
+    cur: psycopg.Cursor, d: date, prev_risk_date: date | None
+) -> list[BuyBelowStopEvent]:
+    """B-52: odczyt (WYŁĄCZNIE SELECT) i wywołanie `buy_below_stop_events`.
+    Grupy = wiersze `risk_daily` na D; transakcje grupy <= D."""
+    if prev_risk_date is None:
+        return []
+    cur.execute(
+        "SELECT r.rachunek, r.instrument_id, r.settlement_currency, r.quote_currency, "
+        "r.stop_effective, r.stop_source, i.broker_ticker, i.instrument_type, i.is_core "
+        "FROM risk_daily r JOIN instruments i ON i.id = r.instrument_id "
+        "WHERE r.risk_date = %s",
+        (d,),
+    )
+    groups = cur.fetchall()
+
+    def fx_lookup(c: str, dt: date) -> Decimal | None:
+        return _fx_rate_on_or_before(cur, c, dt)[0]
+
+    candidates: list[BuyBelowStopCandidate] = []
+    for rachunek, instrument_id, settle, quote, stop_d, stop_d_src, ticker, itype, is_core in groups:
+        if not is_risk_budget_eligible(itype, is_core) or itype not in ("equity", "etf"):
+            continue
+        cur.execute(
+            "SELECT transaction_date, row_type, qty, price FROM transactions "
+            "WHERE rachunek = %s AND instrument_id = %s AND currency = %s "
+            "AND transaction_date <= %s ORDER BY transaction_date, id",
+            (rachunek, instrument_id, settle, d),
+        )
+        txns = [
+            {"date": td, "row_type": rt, "qty": q, "price": p}
+            for td, rt, q, p in cur.fetchall()
+        ]
+        timeline = quantity_timeline(txns)
+        window = [
+            (idx, t) for idx, t in enumerate(txns)
+            if t["row_type"] == "kupno" and t["price"] is not None
+            and prev_risk_date < t["date"] <= d
+        ]
+        if not window:
+            continue
+        conv = convert_entry_rows_to_quote(
+            [{"date": t["date"], "price": t["price"], "idx": idx} for idx, t in window],
+            settle,
+            quote,
+            fx_lookup,
+        )
+        cur.execute(
+            "SELECT risk_date, stop_effective, stop_source FROM risk_daily "
+            "WHERE rachunek = %s AND instrument_id = %s AND settlement_currency = %s "
+            "AND risk_date < %s ORDER BY risk_date",
+            (rachunek, instrument_id, settle, d),
+        )
+        prior_evals = tuple((rd, se, ss) for rd, se, ss in cur.fetchall())
+        for row in conv:
+            idx = row["idx"]
+            t = txns[idx]
+            qty_before, hstart = timeline[idx]
+            candidates.append(
+                BuyBelowStopCandidate(
+                    broker_ticker=ticker,
+                    rachunek=rachunek,
+                    instrument_id=instrument_id,
+                    settlement_currency=settle,
+                    quote_currency=quote or settle,
+                    instrument_type=itype,
+                    is_core=is_core,
+                    row_type=t["row_type"],
+                    txn_date=t["date"],
+                    qty=t["qty"],
+                    price_quote=row["price"],
+                    fx_missing=bool(row.get("fx_missing", False)),
+                    qty_before=qty_before,
+                    holding_period_start=hstart,
+                    prior_evals=prior_evals,
+                    stop_d=stop_d,
+                    stop_d_source=stop_d_src,
+                )
+            )
+    return buy_below_stop_events(candidates, prev_risk_date, d)
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1164,8 @@ class ReportState:
     # wszystkich pozycji pod stopem; patrz `stop_events`.
     stop_events: list[StopEvent] = field(default_factory=list)
     prev_risk_date: date | None = None
+    # B-52: dokupienia poniżej stopu (informacja; nie wpływa na kod wyjścia).
+    buy_below_stop_events: list[BuyBelowStopEvent] = field(default_factory=list)
 
     # Zlecenia stop (M62)
     stop_order_rows: list[StopOrderRow] = field(default_factory=list)
@@ -1155,6 +1377,39 @@ def _render_stop_section(state: ReportState) -> list[str]:
             f"{_fmt_date(e.price_date_used)} | "
             f"{format_money(e.close_d, e.currency)} | {format_money(e.stop_effective, e.currency)} | "
             f"{e.stop_source} | {e.price_source_symbol or 'brak'} |"
+        )
+    return lines
+
+
+def _render_buy_below_stop_section(state: ReportState) -> list[str]:
+    lines = ["## Dokupienia poniżej stopu (B-52)"]
+    if STAGE_RISK in state.stage_not_executed:
+        lines.append(f"nie wykonano (cykl zatrzymany na etapie {STAGE_LABELS[STAGE_RISK]})")
+        return lines
+    lines.append(
+        "Kupno zwiększające pozycję akcyjną satelity po cenie (w walucie notowania) "
+        "poniżej stopu efektywnego z ostatniej oceny przed transakcją: "
+        f"D={_fmt_date(state.d)}, poprzednia ocena={_fmt_date(state.prev_risk_date)}; "
+        "kontrakty poza zakresem sygnału (stop na bazie)."
+    )
+    if not state.buy_below_stop_events:
+        lines.append("brak")
+        return lines
+    lines.append(
+        "| ticker | rachunek | waluta rozliczenia | data | ilość | cena (waluta notowania) | "
+        "stop przed (data oceny, źródło) | stop na D (źródło) |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for e in state.buy_below_stop_events:
+        price = "brak kursu FX" if e.price_quote is None else format_money(e.price_quote, e.quote_currency)
+        stop_before = (
+            f"{format_money(e.stop_before, e.quote_currency)} "
+            f"({_fmt_date(e.stop_before_date)}, {e.stop_before_source or 'brak'})"
+        )
+        stop_d = f"{format_money(e.stop_d, e.quote_currency)} ({e.stop_d_source or 'brak'})"
+        lines.append(
+            f"| {e.broker_ticker} | {account_label(e.rachunek)} | {e.settlement_currency} | "
+            f"{_fmt_date(e.txn_date)} | {format_number(e.qty)} | {price} | {stop_before} | {stop_d} |"
         )
     return lines
 
@@ -1404,6 +1659,8 @@ def render_report(state: ReportState) -> str:
     lines.extend(_render_data_failure_section(state))
     lines.append("")
     lines.extend(_render_stop_section(state))
+    lines.append("")
+    lines.extend(_render_buy_below_stop_section(state))
     lines.append("")
     lines.extend(_render_stop_orders_section(state))
     lines.append("")
@@ -1973,6 +2230,8 @@ def run_cycle(
             for row in risk_summary.rows
         ]
         state.stop_events = stop_events(stop_event_rows, prev_risk_state)
+        with conn.cursor() as cur:
+            state.buy_below_stop_events = load_buy_below_stop_events(cur, d, prev_date)
 
         # M62 (§3): WYŁĄCZNIE otwarte pozycje satelity (brief: "każda otwarta
         # pozycja satelity z risk_daily na D"). "poziom na bazie" (kontrakty)

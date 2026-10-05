@@ -44,6 +44,13 @@ i pierwsza data w `risk_daily` sprzed tej zmiany). D < RATCHET_INIT_DATE
 (system jeszcze nie działał) -> zapadka zaczyna się w D (jeden dzień, brak
 zapadki) — patrz `resolve_ratchet_start`. Stop na D zależy WYŁĄCZNIE od cen
 ≤ D i transakcji ≤ D, zero zależności od `risk_daily`.
+B-52 (brief CC-B52): zapadka stopu efektywnego. Dotąd 2N liczony z BIEŻĄCEJ
+ważonej ceny wejścia spadał po dokupieniu poniżej ceny wejścia (albo sprzedaży
+FIFO zmieniającej cenę), a z nim stop efektywny — wbrew §19.1 "nigdy
+przesuwany w dół". `stop_2n_held` bierze max (long) / min (short) z 2N dla
+stanu po każdej transakcji w bieżącym okresie posiadania (od
+RATCHET_START) i z bieżącego 2N; kolumna `stop_2n` zostaje BIEŻĄCYM 2N,
+`stop_source='two_n_held'` oznacza wygraną zapadki 2N (sql/014).
 Stary wariant ("zapadka od pierwszego pozostałego lotu") jest ZACHOWANY jako
 kolumna informacyjna `chandelier_from_entry` (+ `below_chandelier_from_entry`)
 — NIE wchodzi do `stop_effective`.
@@ -300,18 +307,78 @@ def two_n_stop(entry_price: Decimal | None, atr20_at_last_entry: Decimal | None,
 
 
 def stop_effective(
-    stop_2n: Decimal | None, stop_chandelier: Decimal | None, is_short: bool
+    stop_2n: Decimal | None,
+    stop_chandelier: Decimal | None,
+    is_short: bool,
+    stop_2n_held: Decimal | None = None,
 ) -> tuple[Decimal | None, str | None]:
-    """max(stop_2n, stop_chandelier) [long] / min(...) [short]; `stop_source`
-    wskazuje, który wygrał ('two_n' wygrywa remisy, bo listowany pierwszy —
-    Python max()/min() zwraca pierwszy napotkany ekstremum przy równości)."""
-    candidates: list[tuple[Decimal, str]] = [
-        (v, src) for v, src in ((stop_2n, "two_n"), (stop_chandelier, "chandelier")) if v is not None
-    ]
+    """max(stop_2n, stop_2n_held, stop_chandelier) [long] / min(...) [short];
+    `stop_source` wskazuje, który wygrał ('two_n' wygrywa remisy, bo listowany
+    pierwszy — Python max()/min() zwraca pierwszy napotkany ekstremum przy
+    równości). B-52 (brief CC-B52): `stop_2n_held` (2N z zapadką w bieżącym
+    okresie posiadania, patrz `stop_2n_held`) jest kandydatem ('two_n_held')
+    tylko gdy nie None i (`stop_2n` None albo `stop_2n_held` ŚCIŚLE lepszy: >
+    dla long, < dla short). Wywołanie 3-argumentowe zachowuje dotychczasowe
+    zachowanie."""
+    listed: list[tuple[Decimal | None, str]] = [(stop_2n, "two_n")]
+    if stop_2n_held is not None and (
+        stop_2n is None or (stop_2n_held < stop_2n if is_short else stop_2n_held > stop_2n)
+    ):
+        listed.append((stop_2n_held, "two_n_held"))
+    listed.append((stop_chandelier, "chandelier"))
+    candidates: list[tuple[Decimal, str]] = [(v, src) for v, src in listed if v is not None]
     if not candidates:
         return None, None
     chosen = min(candidates, key=lambda t: t[0]) if is_short else max(candidates, key=lambda t: t[0])
     return chosen
+
+
+def stop_2n_held(
+    txn_rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    dates: list[date],
+    atr20: list[Decimal | None],
+    ratchet_start_date: date,
+    as_of: date,
+    layer_factor_d: Decimal,
+    is_short: bool,
+    allow_short: bool,
+    stop_2n_d: Decimal | None,
+) -> Decimal | None:
+    """B-52 (brief CC-B52): 2N z zapadką w bieżącym okresie posiadania (§19.1
+    "STOP LOSS ... nigdy przesuwany w dół"). max (long) / min (short) z 2N
+    liczonego dla stanu pozycji po KAŻDEJ transakcji w oknie
+    [`ratchet_start_date`, `as_of`] oraz bieżącego `stop_2n_d`. Punkty =
+    {ratchet_start_date} ∪ {daty transakcji w (ratchet_start_date, as_of]} bez
+    NAJPÓŹNIEJSZEJ daty transakcji (stan po niej == stan bieżący, reprezentowany
+    dokładnie przez `stop_2n_d`). Brak transakcji w (ratchet_start_date, as_of]
+    -> `stop_2n_d` bez zmian. Dla punktu p: FIFO na rows/events z data <= p,
+    cena wejścia przeliczona do split_adj czynnikiem
+    `layer_factor_after(events, p) * layer_factor_d`, ATR20 z indeksu
+    `last_remaining_date` stanu w p. Punkt bez ceny/ATR jest pomijany.
+    Zwraca None gdy brak jakiejkolwiek wartości."""
+    window_dates = sorted({r["date"] for r in txn_rows if ratchet_start_date < r["date"] <= as_of})
+    if not window_dates:
+        return stop_2n_d
+    points = [ratchet_start_date] + window_dates[:-1]
+    values: list[Decimal] = []
+    if stop_2n_d is not None:
+        values.append(stop_2n_d)
+    for p in points:
+        rows_p = [r for r in txn_rows if r["date"] <= p]
+        events_p = [e for e in events if e["date"] <= p]
+        ew = compute_weighted_entry_price(rows_p, events_p, allow_short)
+        if ew.entry_price is None or ew.last_remaining_date is None:
+            continue
+        entry_adj = ew.entry_price / (layer_factor_after(events, p) * layer_factor_d)
+        idx = _index_on_or_before(dates, ew.last_remaining_date)
+        atr = atr20[idx] if idx is not None else None
+        v = two_n_stop(entry_adj, atr, is_short)
+        if v is not None:
+            values.append(v)
+    if not values:
+        return None
+    return min(values) if is_short else max(values)
 
 
 # ---------------------------------------------------------------------------
@@ -1645,7 +1712,12 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 ratchet_start_idx = d_idx
 
             stop_chandelier = ratchet_extreme(chand_series, ratchet_start_idx, d_idx, is_short)
-            stop_eff, stop_source = stop_effective(stop_2n, stop_chandelier, is_short)
+            # B-52 (brief CC-B52): zapadka 2N w bieżącym okresie posiadania.
+            held_2n = stop_2n_held(
+                txn_rows, events, dates, atr20, ratchet_start_date, as_of,
+                layer_factor, is_short, allow_short, stop_2n,
+            )
+            stop_eff, stop_source = stop_effective(stop_2n, stop_chandelier, is_short, held_2n)
 
             # --- chandelier_from_entry: STARY wariant (zapadka od pierwszego
             # pozostałego lotu) — zachowany jako kolumna informacyjna, NIE
