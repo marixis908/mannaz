@@ -66,12 +66,17 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass, field
+import functools
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
+import exchange_calendars as xcals
+import pandas as pd
 import psycopg
 import yfinance as yf
+
+from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
 
 DEFAULT_START = date(2023, 10, 1)
 LOG_RETURN_THRESHOLD = Decimal(4)
@@ -264,6 +269,7 @@ class SymbolPricesResult:
     adjustment_convention: str = "yahoo_split_adjusted"
     note: str = ""
     revisions: int = 0  # B-05 (Y3) — wiersze z wpisem `provider_revision`
+    rows_unclosed_session: int = 0  # B-48 (T46) — świece sesji niezamkniętej pominięte
 
 
 @dataclass
@@ -279,6 +285,10 @@ class PricesSummary:
     # B-05 (Y3) — rewizje dostawcy w tym przebiegu: liczba wierszy z wpisem
     # `provider_revision` (per instrument: `SymbolPricesResult.revisions`).
     revisions_total: int = 0
+    # B-48 (T46): świece sesji niezamkniętej pominięte w tym przebiegu
+    # (suma wierszy i liczba instrumentów z >0 pominiętych).
+    rows_unclosed_session_total: int = 0
+    instruments_unclosed_session: int = 0
 
 
 # B-05 (Y3): kolumny OHLC split_adj wchodzące do porównania rewizji dostawcy
@@ -306,11 +316,57 @@ def _format_revision_detail(stored: dict[str, Decimal | None], row: "OhlcRow") -
     return "; ".join(parts) if parts else None
 
 
+# B-48 (T46): świeca sesji niezamkniętej nie wchodzi do bazy.
+SESSION_CLOSE_GRACE = timedelta(minutes=30)
+
+
+@functools.lru_cache(maxsize=None)
+def _get_calendar(calendar_code: str):
+    """Kalendarz `exchange_calendars` cache'owany per kod (domyślny zakres
+    biblioteki: ok. 20 lat wstecz do roku w przód)."""
+    return xcals.get_calendar(calendar_code)
+
+
+def _session_close_utc(calendar_code: str, price_date: date) -> datetime | None:
+    """Zamknięcie sesji `price_date` w UTC wg kalendarza `calendar_code` albo
+    None, gdy `price_date` nie jest sesją tego kalendarza lub wypada poza
+    jego zakresem (wstrzykiwalne w testach przez monkeypatch)."""
+    try:
+        cal = _get_calendar(calendar_code)
+        ts = pd.Timestamp(price_date)
+        if ts < cal.first_session or ts > cal.last_session or not cal.is_session(ts):
+            return None
+        return cal.closes.loc[ts].to_pydatetime()
+    except Exception:  # noqa: BLE001 — nieznany kod / poza zakresem -> fallback jak dla None
+        return None
+
+
+def session_closed(calendar_code: str | None, price_date: date, now_utc: datetime) -> bool:
+    """B-48 (T46): czy świeca sesji `price_date` jest sesją zamkniętą.
+
+    - `calendar_code` podany i `price_date` jest sesją: True <=> `now_utc >=
+      zamknięcie sesji (UTC) + SESSION_CLOSE_GRACE` (30 min).
+    - `calendar_code` None: True <=> `price_date < now_utc.date()`.
+    - Przypadek brzegowy niewymieniony w T46: `price_date` nie jest sesją
+      kalendarza (albo poza jego zakresem / nieznany kod) -> reguła jak dla
+      None (`price_date < now_utc.date()`).
+
+    `now_utc` musi być tz-aware (inaczej ValueError)."""
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("now_utc musi byc tz-aware (UTC)")
+    now_utc = now_utc.astimezone(timezone.utc)
+    if calendar_code is not None:
+        close = _session_close_utc(calendar_code, price_date)
+        if close is not None:
+            return now_utc >= close + SESSION_CLOSE_GRACE
+    return price_date < now_utc.date()
+
+
 def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -> list[dict[str, Any]]:
     if instrument_ids:
         cur.execute(
             """
-            SELECT id, yahoo_symbol, currency FROM instruments
+            SELECT id, yahoo_symbol, currency, exchange FROM instruments
             WHERE id = ANY(%s) AND yahoo_symbol IS NOT NULL
             ORDER BY id
             """,
@@ -319,7 +375,7 @@ def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -
     else:
         cur.execute(
             """
-            SELECT i.id, i.yahoo_symbol, i.currency FROM instruments i
+            SELECT i.id, i.yahoo_symbol, i.currency, i.exchange FROM instruments i
             WHERE i.yahoo_symbol IS NOT NULL
               AND (i.is_core OR EXISTS (
                   SELECT 1 FROM positions_fifo p WHERE p.instrument_id = i.id
@@ -332,7 +388,7 @@ def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -
             ORDER BY i.id
             """
         )
-    cols = ("id", "yahoo_symbol", "currency")
+    cols = ("id", "yahoo_symbol", "currency", "exchange")
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
@@ -395,6 +451,7 @@ def run_prices_fetch(
     start: date = DEFAULT_START,
     end: date | None = None,
     commit: bool = True,
+    now: datetime | None = None,
 ) -> PricesSummary:
     """Pobiera i zapisuje `prices_daily` dla instrumentów z wypełnionym
     `yahoo_symbol` (P3.1). `instrument_ids=None` -> WSZYSTKIE zmapowane
@@ -419,6 +476,8 @@ def run_prices_fetch(
         end = date.today()
 
     run_started_at = datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
     summary = PricesSummary()
 
     with conn.cursor() as cur:
@@ -448,6 +507,18 @@ def run_prices_fetch(
             rows = fetch_ohlc(symbol, start, end)
             result.rows_fetched = len(rows)
 
+            # B-48 (T46): świeca sesji niezamkniętej (przed zamknięciem + 30 min)
+            # nie wchodzi do bazy — odfiltrowanie PRZED outlierami, I2, rewizjami
+            # i zapisem; bez wpisu w ingest_errors i bez wpływu na status.
+            calendar_code = EXCHANGE_TO_CALENDAR_CODE.get(inst.get("exchange"))
+            closed_rows = [r for r in rows if session_closed(calendar_code, r.price_date, now)]
+            result.rows_unclosed_session = len(rows) - len(closed_rows)
+            if result.rows_unclosed_session:
+                summary.rows_unclosed_session_total += result.rows_unclosed_session
+                summary.instruments_unclosed_session += 1
+            provider_returned_rows = bool(rows)
+            rows = closed_rows
+
             closes_for_t8 = [(r.price_date, r.close_split_adj) for r in rows]
             result.log_return_outliers = detect_log_return_outliers(closes_for_t8)
 
@@ -455,7 +526,7 @@ def run_prices_fetch(
             valid_rows, rejected_rows = split_valid_and_rejected(rows)
             result.rows_rejected = len(rejected_rows)
 
-            if not rows:
+            if not provider_returned_rows:
                 # I3 [S]: brak jakiejkolwiek odpowiedzi -> jeden wpis
                 # 'empty_response', zero prób zapisu.
                 _log_ingest_error(
@@ -469,7 +540,7 @@ def run_prices_fetch(
                 )
                 result.status = "empty_response"
                 summary.instruments_empty_response += 1
-            elif not valid_rows:
+            elif rows and not valid_rows:
                 # I3 [S]: WSZYSTKIE wiersze odrzucone w I2 traktujemy jak
                 # pustą odpowiedź — JEDEN wpis 'empty_response' z liczbą
                 # odrzuconych w treści, zamiast N wpisów 'row_missing_price'

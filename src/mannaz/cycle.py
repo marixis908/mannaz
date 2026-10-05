@@ -963,6 +963,10 @@ class ReportState:
     # HEARTBEAT
     heartbeat_covered: int = 0
     heartbeat_total: int = 0
+    # B-48 (T46): świece sesji niezamkniętej pominięte przez etap C5 (0, gdy
+    # etap cen nie wykonał się albo stub nie zwrócił PricesSummary).
+    unclosed_session_rows: int = 0
+    unclosed_session_instruments: int = 0
     files_processed: list[ProcessedFileReportRow] = field(default_factory=list)
     files_skipped: list[ProcessedFileReportRow] = field(default_factory=list)
 
@@ -1325,6 +1329,11 @@ def _render_position_changes_section(state: ReportState) -> list[str]:
 def _render_heartbeat_section(state: ReportState) -> list[str]:
     lines = ["## 🟢 HEARTBEAT"]
     lines.append(f"- pokrycie ceną na D: {state.heartbeat_covered}/{state.heartbeat_total}")
+    # B-48: linia zawsze obecna (jak "pokrycie ceną na D"), 0 gdy etap cen nie wykonał się.
+    lines.append(
+        f"- świece niezamkniętej sesji pominięte: {state.unclosed_session_rows} "
+        f"(instrumentów: {state.unclosed_session_instruments})"
+    )
     lines.append("- pliki przetworzone:")
     if state.files_processed:
         for f in state.files_processed:
@@ -1792,7 +1801,12 @@ def run_cycle(
 
         # --- C5: ceny i FX ----------------------------------------------------
         try:
-            fetch_prices(conn)
+            prices_summary = fetch_prices(conn)
+            # B-48: defensywnie — stuby testowe mogą zwracać None / inny obiekt.
+            state.unclosed_session_rows = int(getattr(prices_summary, "rows_unclosed_session_total", 0) or 0)
+            state.unclosed_session_instruments = int(
+                getattr(prices_summary, "instruments_unclosed_session", 0) or 0
+            )
         except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (brief C5/C8)
             state.import_failures.append(f"błąd etapu ceny/FX: {type(exc).__name__}: {exc}")
             state.stage_not_executed.add(STAGE_RISK)
