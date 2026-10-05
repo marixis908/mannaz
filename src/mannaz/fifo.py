@@ -5,9 +5,10 @@ Zdarzenia korporacyjne (tabela corporate_events) są stosowane PRZED FIFO, w
 kolejności chronologicznej razem z transakcjami: gdy `ratio` zdarzenia jest
 znane, wszystkie loty otwarte przed `event_date` są przeskalowane
 (qty *= ratio, koszt_jednostkowy /= ratio) w momencie napotkania zdarzenia w
-skanie chronologicznym. Zdarzenia korporacyjne z `ratio IS NULL` (np.
-`certificate_redemption` / `share_exchange` bez wykrytego realnego
-współczynnika) są pomijane w tym kroku — nie ma czym skalować.
+skanie chronologicznym. Skalują WYŁĄCZNIE zdarzenia `split`/`reverse_split`
+(filtr typu w SQL, brief CC-B24 C2/B-46); inne typy (`share_exchange`,
+`certificate_redemption`) i zdarzenia z `ratio IS NULL` są pomijane w tym
+kroku.
 
 Sprzedaż/kupno większe niż suma przeciwstawnych lotów FIFO jest netowane
 najpierw względem istniejących lotów o przeciwnym znaku (pokrycie krótkiej
@@ -40,7 +41,7 @@ wykup, który z perspektywy `as_of` już domykał pozycję).
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
@@ -50,13 +51,44 @@ import psycopg
 from mannaz.parse_history import compute_futures_expiry
 
 
+@dataclass(frozen=True)
+class Lot:
+    """Pojedynczy lot z końcowego stanu kolejki FIFO (brief CC-B24, C1).
+
+    qty: ilość ze znakiem (dodatnia = długi, ujemna = krótki), po
+    przeskalowaniu splitami. unit_cost: koszt jednostkowy w walucie
+    rozliczenia (amount/qty z transakcji otwierającej, po przeskalowaniu
+    splitami — dokładnie wartość z kolejki). entry_date: data transakcji
+    otwierającej lot (nie zmienia się przy splicie). unknown_cost: True
+    TYLKO dla lotu z nadwyżki sprzedaży przy allow_short=False (gałąź
+    `oversell_events`, koszt umowny 0); lot krótki allow_short=True ma
+    unknown_cost=False i realny koszt."""
+
+    qty: Decimal
+    unit_cost: Decimal
+    entry_date: date
+    unknown_cost: bool
+
+
 @dataclass
 class PositionResult:
+    """Wynik FIFO jednej grupy (rachunek, instrument, waluta).
+
+    `lots` (brief CC-B24, C1): końcowy stan kolejki, od najstarszego lota
+    (kolejność deque). Niezmienniki (dla wyniku `compute_position`):
+      sum(l.qty for l in lots) == qty
+      sum(l.qty * l.unit_cost for l in lots if l.qty > 0) == residual_cost
+    Pozostałe pola bez zmian: first/last_entry_date liczone po WSZYSTKICH
+    kupnach w historii (nie tylko po lotach z `lots`). Po domknięciu przez
+    wygaśnięcie kontraktu / wykup certyfikatu (`resolve_position_as_of`)
+    `lots == ()`, a qty/residual_cost zostają jak w `compute_position`."""
+
     qty: Decimal
     residual_cost: Decimal
     first_entry_date: date | None
     last_entry_date: date | None
     oversell_events: int
+    lots: tuple[Lot, ...] = ()
 
 
 def compute_position(
@@ -65,15 +97,18 @@ def compute_position(
     allow_short: bool = False,
 ) -> PositionResult:
     """rows: [{'date': date, 'type': 'kupno'|'sprzedaz', 'qty': Decimal, 'amount': Decimal(>=0)}], nieposortowane.
-    events: [{'date': date, 'ratio': Decimal}] (tylko zdarzenia ze znanym ratio), nieposortowane.
+    events: [{'date': date, 'ratio': Decimal}] (tylko zdarzenia split/reverse_split ze znanym ratio — filtr w SQL, brief CC-B24 C2), nieposortowane.
     allow_short: True dla rachunków, na których świadome krótkie pozycje są
     normalne (KONTRAKTOWY) — wtedy nadwyżka sprzedaży NIE jest liczona jako
-    `oversell_events` i dostaje realny koszt jednostkowy zamiast zera."""
+    `oversell_events` i dostaje realny koszt jednostkowy zamiast zera.
+    Zwraca też `lots` (końcowa kolejka FIFO jako krotka `Lot`, niezmienniki
+    w docstringu `PositionResult`)."""
 
     rows_sorted = sorted(rows, key=lambda r: r["date"])
     events_sorted = sorted(events, key=lambda e: e["date"])
 
-    lots: deque[list] = deque()  # [qty, unit_cost, entry_date] — listy, bo qty/unit_cost mutowalne
+    # [qty, unit_cost, entry_date, unknown_cost] — listy, bo qty/unit_cost mutowalne
+    lots: deque[list] = deque()
     first_entry_date: date | None = None
     last_entry_date: date | None = None
     oversell_events = 0
@@ -111,16 +146,16 @@ def compute_position(
                 remaining = Decimal(0)
 
         if remaining > 0:
-            lots.append([remaining, unit_price, r["date"]])
+            lots.append([remaining, unit_price, r["date"], False])
         elif remaining < 0:
             if allow_short:
                 # świadome otwarcie/powiększenie krótkiej pozycji — znamy cenę sprzedaży
-                lots.append([remaining, unit_price, r["date"]])
+                lots.append([remaining, unit_price, r["date"], False])
             else:
                 oversell_events += 1
                 # brak wcześniejszego lota na pełną ilość -> pozycja ujemna, koszt umowny 0
                 # (nie znamy kosztu historycznego sprzedanych "znikąd" jednostek)
-                lots.append([remaining, Decimal(0), r["date"]])
+                lots.append([remaining, Decimal(0), r["date"], True])
         j += 1
 
     qty_total = sum((lot[0] for lot in lots), Decimal(0))
@@ -132,6 +167,7 @@ def compute_position(
         first_entry_date=first_entry_date,
         last_entry_date=last_entry_date,
         oversell_events=oversell_events,
+        lots=tuple(Lot(qty=lot[0], unit_cost=lot[1], entry_date=lot[2], unknown_cost=lot[3]) for lot in lots),
     )
 
 
@@ -185,9 +221,9 @@ def resolve_position_as_of(
     `transactions.row_type` — mapowanie na 'kupno'/'sprzedaz' odbywa się tu, tak
     samo jak w `run_fifo`/`_entry_transactions`). Wiersze o innym row_type są
     ignorowane (jak w oryginalnym filtrze SQL `row_type IN (...)`).
-    events: [{'date','ratio'}] — zdarzenia korporacyjne ze znanym ratio (jak w
-    `run_fifo`, WSZYSTKIE typy, nie tylko split/reverse_split — tu chodzi o
-    skalowanie lotów FIFO, nie o warstwę cen, patrz `risk.py` S3).
+    events: [{'date','ratio'}] — zdarzenia korporacyjne split/reverse_split ze
+    znanym ratio (filtr typu w SQL `_resolve_position`, brief CC-B24 C2/B-46;
+    ten sam zestaw co `risk.py` `_instrument_layer_events`).
     certificate_redemption_dates: daty zdarzeń `certificate_redemption` dla
     tego instrumentu (dowolna liczba, nieposortowane).
 
@@ -226,6 +262,11 @@ def resolve_position_as_of(
         ):
             effective_qty, expired_closed = Decimal(0), True
 
+    if expired_closed:
+        # brief CC-B24, C1: pozycja domknięta wygaśnięciem/wykupem nie ma
+        # otwartych lotów; qty/residual_cost bez zmian (jak dotąd).
+        pos = replace(pos, lots=())
+
     return pos, effective_qty, expired_closed
 
 
@@ -257,6 +298,7 @@ def _resolve_position(
         """
         SELECT event_date, ratio FROM corporate_events
         WHERE instrument_id = %s AND ratio IS NOT NULL AND event_date <= %s
+          AND event_type IN ('split', 'reverse_split')
         ORDER BY event_date
         """,
         (instrument_id, as_of),
@@ -321,7 +363,8 @@ def positions_as_of(conn_or_cur: psycopg.Connection | psycopg.Cursor, as_of: dat
     jest zawsze stanem "na dziś" — pozycja zamknięta po `as_of` by tam już nie
     istniała, split po `as_of` by już przeskalował ilość). Zwraca listę dictów
     z tymi samymi kluczami co wiersz `positions_fifo`: rachunek, instrument_id,
-    currency, qty, residual_cost, first_entry_date, last_entry_date. Pomija
+    currency, qty, residual_cost, first_entry_date, last_entry_date, plus
+    `lots` (krotka `Lot`, brief CC-B24 C1; nie jest w `positions_fifo`). Pomija
     pozycje domknięte na `as_of` (qty==0 albo domknięte przez wygaśnięcie
     kontraktu/wykup certyfikatu, patrz `resolve_position_as_of`).
     `conn_or_cur`: połączenie LUB istniejący kursor (przydatne w testach
@@ -342,6 +385,7 @@ def positions_as_of(conn_or_cur: psycopg.Connection | psycopg.Cursor, as_of: dat
                     "residual_cost": pos.residual_cost,
                     "first_entry_date": pos.first_entry_date,
                     "last_entry_date": pos.last_entry_date,
+                    "lots": pos.lots,  # brief CC-B24, C1 (nie zapisywane do positions_fifo)
                 }
             )
         return out

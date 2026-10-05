@@ -767,8 +767,8 @@ def compute_weighted_entry_price(
     rows: list[dict[str, Any]], events: list[dict[str, Any]], allow_short: bool
 ) -> WeightedEntryResult:
     """rows: [{'date','type':'kupno'|'sprzedaz','qty':Decimal,'price':Decimal|None}],
-    nieposortowane. events: [{'date','ratio'}], tylko ratio IS NOT NULL (jak w
-    fifo.run_fifo). Algorytm identyczny z `fifo.compute_position` (splity PRZED
+    nieposortowane. events: [{'date','ratio'}], tylko split/reverse_split z
+    ratio IS NOT NULL (jak w fifo._resolve_position, brief CC-B24 C2). Algorytm identyczny z `fifo.compute_position` (splity PRZED
     FIFO, netowanie najpierw względem przeciwnego znaku), ale:
       - koszt lotu = `price` transakcji (nie `amount/qty`),
       - agregacja kosztu obejmuje loty OBU znaków (potrzebne dla wejścia
@@ -854,9 +854,9 @@ def layer_factor_after(events: list[dict[str, Any]], as_of: date) -> Decimal:
     `*_split_adj` (`prices.py`) — iloczyn `ratio` zdarzeń z `event_date > D`.
     events: [{'date','ratio'}] — DOKŁADNIE ten sam zestaw, którego używa
     `prices.reconstruct_raw`/`cumulative_ratio_after` (`corporate_events`,
-    `ratio IS NOT NULL`, `event_type IN ('split', 'reverse_split')` — NIE
-    wszystkie zdarzenia ze znanym ratio jak przy FIFO, gdzie liczy się też
-    `share_exchange`). Kierunek identyczny jak `cumulative_ratio_after`: Yahoo
+    `ratio IS NOT NULL`, `event_type IN ('split', 'reverse_split')` — od
+    brief CC-B24 C2 (B-46) ten sam zestaw co w FIFO i
+    `_instrument_split_events`). Kierunek identyczny jak `cumulative_ratio_after`: Yahoo
     dzieli historyczne ceny przez `ratio` przy każdym kolejnym splicie, więc
     `qty_adj = qty_D * f`, `entry_adj = entry_D / f`."""
     factor = Decimal(1)
@@ -882,9 +882,8 @@ def holding_period_start(rows: list[dict[str, Any]], events: list[dict[str, Any]
 
     rows: [{'date','type':'kupno'|'sprzedaz','qty'}] (te same dane co FIFO —
     `_entry_transactions`/`compute_weighted_entry_price`, pole 'amount'/'price'
-    nieużywane tutaj). events: [{'date','ratio'}] (wszystkie zdarzenia ze
-    znanym ratio, jak w FIFO — nie tylko split/reverse_split, patrz
-    `layer_factor_after` dla kontrastu).
+    nieużywane tutaj). events: [{'date','ratio'}] (zdarzenia split/reverse_split
+    ze znanym ratio, jak w FIFO — filtr typu w SQL, brief CC-B24 C2/B-46).
 
     Algorytm: chronologiczny przebieg zdarzeń+transakcji (identyczna kolejność
     scalania jak `compute_position`), śledzący TYLKO sumę ilości (nie
@@ -1230,6 +1229,7 @@ def _instrument_split_events(cur: psycopg.Cursor, instrument_id: int, as_of: dat
         """
         SELECT event_date, ratio FROM corporate_events
         WHERE instrument_id = %s AND ratio IS NOT NULL AND event_date <= %s
+          AND event_type IN ('split', 'reverse_split')
         ORDER BY event_date
         """,
         (instrument_id, as_of),
@@ -1260,9 +1260,9 @@ def _entry_transactions(
 def _instrument_layer_events(cur: psycopg.Cursor, instrument_id: int) -> list[dict[str, Any]]:
     """S3 (brief CC-S, F3): zdarzenia dla `layer_factor_after` — DOKŁADNIE ten
     sam zestaw, którego używa `prices.reconstruct_raw`/`cumulative_ratio_after`
-    (`ratio IS NOT NULL`, `event_type IN ('split', 'reverse_split')`) — inny
-    (węższy) zestaw niż `_instrument_split_events` (FIFO: wszystkie zdarzenia
-    ze znanym ratio, także `share_exchange`). Bez filtra `as_of` w SQL —
+    (`ratio IS NOT NULL`, `event_type IN ('split', 'reverse_split')`) — od
+    brief CC-B24 C2 (B-46) ten sam zestaw co `_instrument_split_events` i
+    FIFO (`share_exchange` ignorowany wszędzie). Bez filtra `as_of` w SQL —
     `layer_factor_after` sam filtruje `event_date > as_of`, bo tu chodzi
     właśnie o zdarzenia PO D."""
     cur.execute(

@@ -36,3 +36,5 @@ a kod wyjścia skryptu jest kodem wyjścia Pythona; brak `.venv` → komunikat i
 `PYTHONPATH=<repo>\src` jest ustawiany tylko na czas uruchomionego procesu (potem wraca
 poprzednia wartość). Pakietu `mannaz` nie instalujemy w `.venv`: sesje robocze pracują
 w worktree, a instalacja wiązałaby venv repo głównego z jednym drzewem.
+
+`yfinance` przypięty do 1.7.0 testem `tests/test_b51_yfinance_pin.py` (B-51); zmiana wersji wymaga ponownej weryfikacji obsługi wyjątków w `fetch_ohlc`.
