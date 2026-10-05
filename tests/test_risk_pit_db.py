@@ -15,7 +15,7 @@ from mannaz.risk import (
     NON_CASH_ROW_TYPES,
     RATCHET_INIT_DATE,
     IncompleteRiskDateError,
-    _open_positions_as_of,
+    open_positions_as_of,
     is_risk_budget_eligible,
     kontraktowy_account_value,
     resolve_default_risk_date,
@@ -475,7 +475,7 @@ def test_b36_explicit_d_with_incomplete_kontraktowy_raises_default_d_skips_it(db
         assert d is not None, "brak kompletnej daty w bazie testowej"
         with conn.cursor() as cur:
             positions_before = positions_as_of(cur, d)
-            if not any(p["instrument_type"] == "future" for p in _open_positions_as_of(cur, d)):
+            if not any(p["instrument_type"] == "future" for p in open_positions_as_of(cur, d)):
                 pytest.skip("brak otwartych kontraktow na D")
             cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
             count_before = cur.fetchone()[0]

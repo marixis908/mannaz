@@ -1,4 +1,4 @@
-"""Testy `_resolve_position_price_coverage` (brief CC-U, U2/U5) — rdzeń
+"""Testy `resolve_position_price_coverage` (brief CC-U, U2/U5) — rdzeń
 "czy ta pozycja ma komplet na D" dzielony przez `run_risk`/
 `resolve_default_risk_date`. WYŁĄCZNIE dane syntetyczne, bez bazy/sieci —
 `FakeCursor` symuluje odpowiedzi SQL po charakterystycznym fragmencie
@@ -7,7 +7,7 @@ zapytania (mały, ustalony zestaw zapytań tego modułu)."""
 from datetime import date
 from decimal import Decimal
 
-from mannaz.risk import CalendarFacts, IncompleteRiskItem, _resolve_position_price_coverage
+from mannaz.risk import CalendarFacts, IncompleteRiskItem, resolve_position_price_coverage
 
 
 class FakeCursor:
@@ -63,7 +63,7 @@ def test_future_without_base_price_on_open_market_is_incomplete_not_silently_dro
         price_rows=[],  # baza istnieje i ma mnoznik, ale brak JAKIEJKOLWIEK ceny <= D
     )
 
-    coverage, incomplete = _resolve_position_price_coverage(cur, pos, d, _open_gpw_calendar_facts)
+    coverage, incomplete = resolve_position_price_coverage(cur, pos, d, _open_gpw_calendar_facts)
 
     assert coverage is None
     assert incomplete == IncompleteRiskItem("FXYZ26", "XYZ.WA", "GPW", "market_open_no_price")
@@ -86,7 +86,7 @@ def test_future_base_instrument_not_found_is_incomplete():
     }
     cur = FakeCursor(base_instrument_row=None)
 
-    coverage, incomplete = _resolve_position_price_coverage(cur, pos, d, _open_gpw_calendar_facts)
+    coverage, incomplete = resolve_position_price_coverage(cur, pos, d, _open_gpw_calendar_facts)
 
     assert coverage is None
     assert incomplete == IncompleteRiskItem("FABC26", "ABC.WA", None, "base_instrument_not_found")
@@ -102,7 +102,7 @@ def test_future_multiplier_missing_is_incomplete():
     }
     cur = FakeCursor(base_instrument_row=(7, "PLN", "DEF.WA", "GPW"))
 
-    coverage, incomplete = _resolve_position_price_coverage(cur, pos, d, _open_gpw_calendar_facts)
+    coverage, incomplete = resolve_position_price_coverage(cur, pos, d, _open_gpw_calendar_facts)
 
     assert coverage is None
     assert incomplete == IncompleteRiskItem("FDEF26", "DEF.WA", "GPW", "multiplier_missing")

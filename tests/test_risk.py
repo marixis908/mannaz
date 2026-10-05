@@ -532,7 +532,7 @@ def test_resolve_price_on_d_complete_price_result_unchanged_regression():
 # ---------------------------------------------------------------------------
 # kontrakt bez ceny bazy przy otwartym GPW — U5 (4): niekompletne (kontrakty
 # NIE wypadaja po cichu). resolve_price_on_d nie wie nic o kontraktach —
-# scenariusz sprawdza `_resolve_position_price_coverage`, patrz
+# scenariusz sprawdza `resolve_position_price_coverage`, patrz
 # tests/test_price_coverage.py.
 # ---------------------------------------------------------------------------
 

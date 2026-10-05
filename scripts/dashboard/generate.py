@@ -6,8 +6,8 @@ JEDEN samodzielny plik HTML (CSS+JS inline, dane osadzone jako JSON).
 Kontrakt danych — AUTORYTATYWNY, rozstrzyga wątpliwości:
     tmp/dashboard/kontrakt-danych.md (poza gitem, katalog roboczy Mannaz)
 
-Cena na D (kontrakt §3, D2'): WYŁĄCZNIE przez `mannaz.risk._open_positions_as_of`
-+ `mannaz.risk._resolve_position_price_coverage` (reguła T27 — forward-fill
+Cena na D (kontrakt §3, D2'): WYŁĄCZNIE przez `mannaz.risk.open_positions_as_of`
++ `mannaz.risk.resolve_position_price_coverage` (reguła T27 — forward-fill
 maks. 2 sesje, tylko rynek zamknięty, zawsze flaga `stale`; w przeciwnym razie
 `incomplete` z powodem). Stara logika "ostatnia cena ≤ D bez limitu" jest
 USUNIĘTA — pozycja bez kompletu wg T27 zostaje w tabeli (ilość + flaga), ale
@@ -68,9 +68,9 @@ import model  # scripts/dashboard/model.py — czyste funkcje, bez DB
 from mannaz.db import get_connection
 from mannaz.fifo import positions_as_of
 from mannaz.risk import (
-    _kontraktowy_rows,  # kontrakt §2: import i wywołanie wprost, bez zmian w kodzie
-    _open_positions_as_of,
-    _resolve_position_price_coverage,
+    read_kontraktowy_rows,  # kontrakt §2: import i wywołanie wprost, bez zmian w kodzie
+    open_positions_as_of,
+    resolve_position_price_coverage,
     check_kontraktowy_coverage,
     is_risk_budget_eligible,
     kontraktowy_account_value,
@@ -95,7 +95,7 @@ class DashboardStop(Exception):
 # ---------------------------------------------------------------------------
 # Dostęp do bazy — same proste SELECT-y, read-only. Żadnej logiki domenowej
 # tutaj (to zadanie model.py) poza złożeniem surowych wierszy. Cena/FX na D
-# wg T27 pochodzi WYŁĄCZNIE z `mannaz.risk._resolve_position_price_coverage`
+# wg T27 pochodzi WYŁĄCZNIE z `mannaz.risk.resolve_position_price_coverage`
 # (patrz moduł docstring) — tu tylko instrumenty (isin/nazwa) i FX waluty
 # ROZLICZENIA (osobne od FX waluty notowania, którą niesie coverage).
 # ---------------------------------------------------------------------------
@@ -197,7 +197,7 @@ def _resolve_fx(caches: _Caches, currency: str) -> tuple[Decimal | None, date | 
 def _check_currency_stop(caches: _Caches, currency: str) -> None:
     """Efekt uboczny WYŁĄCZNIE: STOP (kontrakt §3) dla waluty pence
     (GBp/GBX) albo bez JAKIEJKOLWIEK pary w `fx_nbp`. Niezależne od
-    kompletności ceny wg T27 — `_resolve_position_price_coverage` traktuje
+    kompletności ceny wg T27 — `resolve_position_price_coverage` traktuje
     brak kursu FX jako `incomplete` (miękko, licznik n/N), a NIE jako STOP;
     to dwa różne pojęcia (kontrakt §3, wiersze "FX" i "waluta nieobsłużona").
     Zwrócona wartość jest ignorowana — realny kurs waluty notowania pochodzi
@@ -214,11 +214,11 @@ def _build_raw_position(
     extra: dict[str, Any] | None,
     d: date,
 ) -> dict[str, Any]:
-    """`pos`: wiersz `_open_positions_as_of` (rachunek/instrument_id/qty/typ/
+    """`pos`: wiersz `open_positions_as_of` (rachunek/instrument_id/qty/typ/
     is_core/base_symbol/multiplier/yahoo_symbol/quote_currency/theme/exchange
     + settlement_currency). `instr_extra`: wiersz `instruments` (isin, name).
     `extra`: wiersz `positions_as_of` dla tego samego (rachunek, instrument_id,
-    currency) — residual_cost/entry daty (`_open_positions_as_of` ich nie
+    currency) — residual_cost/entry daty (`open_positions_as_of` ich nie
     niesie, kontrakt §3 wymaga jawnego join-a z powrotem)."""
     rachunek_label = model.account_label(pos["rachunek"])
     instrument_type = pos["instrument_type"]
@@ -237,7 +237,7 @@ def _build_raw_position(
     _check_currency_stop(caches, quote_currency)
     _check_currency_stop(caches, settlement_currency)
 
-    coverage, incomplete = _resolve_position_price_coverage(cur, pos, d)
+    coverage, incomplete = resolve_position_price_coverage(cur, pos, d)
 
     close_raw: Decimal | None = None
     fx_rate: Decimal | None = None
@@ -250,7 +250,7 @@ def _build_raw_position(
         incomplete_reason = incomplete.reason
     else:
         # Instrument bazowy (FUT) może mieć inną walutę niż sam kontrakt —
-        # znana dopiero TERAZ (po `_resolve_position_price_coverage`).
+        # znana dopiero TERAZ (po `resolve_position_price_coverage`).
         # OGRANICZENIE (patrz raport końcowy): jeśli baza jest pence i
         # dlatego FX bazy jest None, coverage zwróci `incomplete`
         # (fx_rate_missing) zamiast STOP — ten wariant nie jest tu
@@ -431,10 +431,10 @@ def _fetch_risk_rows(cur, d_risk: date) -> list[dict[str, Any]]:
 
 def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any], dict[str, Any]]:
     with conn.cursor() as cur:
-        open_positions = _open_positions_as_of(cur, d)
+        open_positions = open_positions_as_of(cur, d)
         instrument_ids = sorted({p["instrument_id"] for p in open_positions})
         instruments = _fetch_instruments(cur, instrument_ids)
-        # Kontrakt §3: `_open_positions_as_of` nie niesie residual_cost/daty
+        # Kontrakt §3: `open_positions_as_of` nie niesie residual_cost/daty
         # wejścia — join z powrotem do `positions_as_of` po (rachunek,
         # instrument_id, currency).
         extra_rows = positions_as_of(cur, d)
@@ -548,7 +548,7 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
             ks_error = f"brak pomiaru: BW niekompletne wg T27 ({sat_n}/{sat_N} pozycji SAT z cena)"
         else:
             try:
-                kontraktowy_rows = _kontraktowy_rows(cur, d)
+                kontraktowy_rows = read_kontraktowy_rows(cur, d)
                 has_open_futures = len(buckets["FUT"]) > 0
                 max_kontraktowy_date = max((r["transaction_date"] for r in kontraktowy_rows), default=None)
                 check_kontraktowy_coverage(len(kontraktowy_rows), max_kontraktowy_date, has_open_futures, d)
