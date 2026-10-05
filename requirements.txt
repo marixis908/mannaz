@@ -1,5 +1,6 @@
-# Zaleznosci uruchomieniowe i testowe Mannaz (decyzja 2026-10-05, zastepuje
-# "bez pliku zaleznosci" z B-51). Instalacja: pip install -r requirements.txt
+# Zaleznosci bezposrednie Mannaz (decyzja 2026-10-05, zastepuje "bez pliku
+# zaleznosci" z B-51). Pelna lista wersji (B-53): constraints.txt.
+# Instalacja: pip install -r requirements.txt -c constraints.txt
 # Pakietu mannaz nie instalujemy - PYTHONPATH=src (README, scripts/cycle.ps1).
 # Python 3.14 - lokalny .venv i sesje chmurowe (.claude/hooks/session-start.sh).
 

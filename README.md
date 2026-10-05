@@ -37,7 +37,9 @@ a kod wyjścia skryptu jest kodem wyjścia Pythona; brak `.venv` → komunikat i
 poprzednia wartość). Pakietu `mannaz` nie instalujemy w `.venv`: sesje robocze pracują
 w worktree, a instalacja wiązałaby venv repo głównego z jednym drzewem.
 
-Zależności: `pip install -r requirements.txt` w `.venv` (Python 3.14). `yfinance` przypięty
+Zależności: `pip install -r requirements.txt -c constraints.txt` w `.venv` (Python 3.14).
+`requirements.txt` — zależności bezpośrednie; `constraints.txt` — pełna lista wersji
+(`pip freeze` z lokalnego `.venv`, B-53), aktualizowana razem ze zmianą wersji w `.venv`. `yfinance` przypięty
 do 1.7.0 w `requirements.txt` i testem `tests/test_b51_yfinance_pin.py` (B-51); zmiana wersji
 wymaga ponownej weryfikacji obsługi wyjątków w `fetch_ohlc`.
 
