@@ -11,7 +11,10 @@ from mannaz.db import get_connection
 
 @pytest.mark.db
 def test_stop_source_two_n_held_allowed_and_junk_rejected():
-    conn = get_connection()
+    try:
+        conn = get_connection()
+    except Exception as exc:  # brak .env/hasla/serwera -> test pomijamy (marker db)
+        pytest.skip(f"mannaz.db.get_connection() niedostepne: {exc}")
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM instruments LIMIT 1")
