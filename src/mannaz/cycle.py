@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -967,6 +968,9 @@ class ReportState:
     # etap cen nie wykonał się albo stub nie zwrócił PricesSummary).
     unclosed_session_rows: int = 0
     unclosed_session_instruments: int = 0
+    # B-48 (D2 rew. 3): świece ocenione regułą daty zamiast kalendarza.
+    calendar_fallback_rows: int = 0
+    calendar_fallback_instruments: int = 0
     files_processed: list[ProcessedFileReportRow] = field(default_factory=list)
     files_skipped: list[ProcessedFileReportRow] = field(default_factory=list)
 
@@ -982,6 +986,27 @@ def has_data_failures(state: ReportState) -> bool:
         or state.d_resolution_failure is not None
         or any(f.is_data_failure for f in state.freshness_results)
     )
+
+
+def _origin_note(exc: BaseException) -> str:
+    """B-49: miejsce pochodzenia wyjątku bez treści zmiennych:
+    ` (miejsce: mannaz/fx.py:117; ostatnia ramka: requests/adapters.py:682)`.
+    Miejsce = ostatnia ramka w kodzie pakietu `mannaz`, ostatnia ramka = ostatnia
+    ramka tracebacku w ogóle; ścieżki skrócone do `<pakiet>/<plik>`."""
+    try:
+        frames = traceback.extract_tb(exc.__traceback__)
+    except Exception:  # noqa: BLE001 — notatka diagnostyczna nie może przerwać raportu
+        return ""
+    if not frames:
+        return ""
+
+    def short(fs: traceback.FrameSummary) -> str:
+        parts = Path(fs.filename).parts
+        return f"{'/'.join(parts[-2:])}:{fs.lineno}"
+
+    mannaz_frames = [f for f in frames if Path(f.filename).parent.name == "mannaz"]
+    here = short(mannaz_frames[-1]) if mannaz_frames else "brak"
+    return f" (miejsce: {here}; ostatnia ramka: {short(frames[-1])})"
 
 
 def _fmt_date(d: date | None) -> str:
@@ -1333,6 +1358,10 @@ def _render_heartbeat_section(state: ReportState) -> list[str]:
     lines.append(
         f"- świece niezamkniętej sesji pominięte: {state.unclosed_session_rows} "
         f"(instrumentów: {state.unclosed_session_instruments})"
+    )
+    lines.append(
+        f"- świece z regułą daty zamiast kalendarza: {state.calendar_fallback_rows} "
+        f"(instrumentów: {state.calendar_fallback_instruments})"
     )
     lines.append("- pliki przetworzone:")
     if state.files_processed:
@@ -1803,19 +1832,20 @@ def run_cycle(
         try:
             prices_summary = fetch_prices(conn)
             # B-48: defensywnie — stuby testowe mogą zwracać None / inny obiekt.
-            state.unclosed_session_rows = int(getattr(prices_summary, "rows_unclosed_session_total", 0) or 0)
-            state.unclosed_session_instruments = int(
-                getattr(prices_summary, "instruments_unclosed_session", 0) or 0
-            )
+            if isinstance(prices_summary, PricesSummary):
+                state.unclosed_session_rows = prices_summary.rows_unclosed_session_total
+                state.unclosed_session_instruments = prices_summary.instruments_unclosed_session
+                state.calendar_fallback_rows = prices_summary.rows_calendar_fallback_total
+                state.calendar_fallback_instruments = prices_summary.instruments_calendar_fallback
         except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (brief C5/C8)
-            state.import_failures.append(f"błąd etapu ceny/FX: {type(exc).__name__}: {exc}")
+            state.import_failures.append(f"błąd etapu ceny/FX: {type(exc).__name__}: {exc}{_origin_note(exc)}")
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop() from exc
 
         try:
             fx_summary = fetch_fx(conn, NBP_CURRENCIES)
         except Exception as exc:  # noqa: BLE001
-            state.import_failures.append(f"błąd etapu ceny/FX: {type(exc).__name__}: {exc}")
+            state.import_failures.append(f"błąd etapu ceny/FX: {type(exc).__name__}: {exc}{_origin_note(exc)}")
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop() from exc
 

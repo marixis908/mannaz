@@ -632,3 +632,80 @@ def test_b05_cycle_provider_revision_reported_but_not_data_failure(db_conn, tmp_
         assert "col=close_split_adj old=100 new=105" in section.split("price_date = D")[1]
     finally:
         conn.rollback()
+
+
+def _b49_run(tmp_path, conn, monkeypatch, fetch_prices, fetch_fx=None):
+    monkeypatch.setattr("mannaz.cycle.run_fifo", lambda *a, **k: None)
+    monkeypatch.setattr("mannaz.cycle._registration_rows", lambda cur: [])
+    kwargs = _run_cycle_kwargs(
+        tmp_path, conn, resolve_date_fn=lambda conn_, **k: D_B05, fetch_prices=fetch_prices
+    )
+    if fetch_fx is not None:
+        kwargs["fetch_fx"] = fetch_fx
+    return run_cycle(**kwargs)
+
+
+@pytest.mark.db
+def test_b49_cycle_connection_error_from_both_sources_is_data_failure(db_conn, tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    conn = db_conn
+    try:
+        inst_id, _ = _b05_instrument(conn)
+
+        def _ie(c, source, instrument_id, detail):
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ingest_errors (source, instrument_id, price_date, error_type, detail, "
+                    "degraded_state, run_started_at) VALUES (%s, %s, %s, 'connection_error', %s, FALSE, %s)",
+                    (
+                        source,
+                        instrument_id,
+                        D_B05 if instrument_id is None else None,
+                        detail,
+                        datetime.now(timezone.utc),
+                    ),
+                )
+
+        def fetch_prices(c):
+            _ie(c, "yahoo", inst_id, "requests.exceptions.ConnectionError code=10054")
+            return PricesSummary()
+
+        def fetch_fx(c, currencies):
+            _ie(c, "frankfurter", None, "waluta=USD requests.exceptions.Timeout code=brak")
+            return FxSummary()
+
+        result = _b49_run(tmp_path, conn, monkeypatch, fetch_prices, fetch_fx)
+        assert result.exit_code == 2
+        text = result.report_path.read_text(encoding="utf-8")
+        section = text.split("### ingest_errors (ten przebieg)")[1].split("### FX")[0]
+        assert "connection_error: requests.exceptions.ConnectionError code=10054" in section
+        assert (
+            "frankfurter brak data=1990-03-09 connection_error: waluta=USD "
+            "requests.exceptions.Timeout code=brak" in section
+        )
+        assert "DATA FAILURE" in text
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b49_cycle_stage_error_reports_origin_in_mannaz_code(db_conn, tmp_path, monkeypatch):
+    from datetime import datetime
+
+    from mannaz.prices import session_closed
+
+    conn = db_conn
+    try:
+        _b05_instrument(conn)
+
+        def fetch_prices(c):
+            session_closed(None, D_B05, datetime(1990, 3, 10))  # naive -> ValueError z mannaz/prices.py
+
+        result = _b49_run(tmp_path, conn, monkeypatch, fetch_prices)
+        failure = next(f for f in result.state.import_failures if f.startswith("błąd etapu ceny/FX: ValueError"))
+        assert "(miejsce: mannaz/prices.py:" in failure
+        assert "; ostatnia ramka: mannaz/prices.py:" in failure
+        assert "mannaz/prices.py:" in result.report_path.read_text(encoding="utf-8")
+    finally:
+        conn.rollback()

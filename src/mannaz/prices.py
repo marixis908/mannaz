@@ -63,17 +63,22 @@ chcemy cicho pomijać logowania T12)."""
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-import functools
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
+import curl_cffi.requests.exceptions as curl_exceptions
 import exchange_calendars as xcals
+import exchange_calendars.errors as xcals_errors
 import pandas as pd
 import psycopg
+import requests
 import yfinance as yf
 
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
@@ -83,7 +88,7 @@ LOG_RETURN_THRESHOLD = Decimal(4)
 
 CurrencyCheck = Literal["match", "gbp_pence_conversion_needed", "mismatch", "no_data"]
 # I3 (brief CC-I): status agregatu wierszy jednego instrumentu w jednym przebiegu.
-SymbolPricesStatus = Literal["ok", "rows_rejected", "empty_response"]
+SymbolPricesStatus = Literal["ok", "rows_rejected", "empty_response", "connection_error"]
 # I2: kolumny, których pustość/nieskończoność dyskwalifikuje cały wiersz.
 _REQUIRED_PRICE_COLUMNS = ("high_split_adj", "low_split_adj", "close_split_adj")
 
@@ -154,6 +159,67 @@ def fetch_currency(symbol: str) -> str | None:
         return fast.get("currency")
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# B-49 — błędy sieci: jedna ponowna próba, potem wpis `connection_error`
+# ---------------------------------------------------------------------------
+
+# Łapiemy WYŁĄCZNIE te klasy (nigdy gołe Exception ani OSError).
+NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    curl_exceptions.ConnectionError,
+    curl_exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+NETWORK_RETRY_SLEEP_SECONDS = 5
+
+_T = TypeVar("_T")
+
+
+def call_with_network_retry(
+    func: Callable[[], _T],
+    sleep: Callable[[float], None] = time.sleep,
+) -> _T:
+    """Wywołuje `func()`; po błędzie z `NETWORK_ERRORS` czeka
+    `NETWORK_RETRY_SLEEP_SECONDS` i próbuje JEDEN raz ponownie. Druga porażka
+    propaguje wyjątek (łapie go wołający). Inne wyjątki propagują od razu."""
+    try:
+        return func()
+    except NETWORK_ERRORS:
+        sleep(NETWORK_RETRY_SLEEP_SECONDS)
+        return func()
+
+
+def _error_code(exc: BaseException) -> int | None:
+    """Kod błędu bez URL: dla curl_cffi atrybut `code` (jeśli != 0), w
+    przeciwnym razie `errno` pierwszego OSError w łańcuchu `__cause__`/
+    `__context__`/`reason`/`args` (np. 10054), głębokość ograniczona."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and code:
+        return int(code)
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack and len(seen) < 20:
+        cur = stack.pop(0)
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        errno_ = getattr(cur, "errno", None) if isinstance(cur, OSError) else None
+        if isinstance(errno_, int):
+            return errno_
+        nxt: list[Any] = [cur.__cause__, cur.__context__, getattr(cur, "reason", None), *cur.args]
+        stack.extend(x for x in nxt if isinstance(x, BaseException))
+    return None
+
+
+def describe_network_error(exc: BaseException) -> str:
+    """`detail` wpisu `connection_error`: pełna nazwa klasy wyjątku i kod
+    błędu. Celowo BEZ `str(exc)` (może zawierać URL z parametrami), BEZ
+    nagłówków."""
+    cls = type(exc)
+    code = _error_code(exc)
+    return f"{cls.__module__}.{cls.__qualname__} code={code if code is not None else 'brak'}"
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +336,10 @@ class SymbolPricesResult:
     note: str = ""
     revisions: int = 0  # B-05 (Y3) — wiersze z wpisem `provider_revision`
     rows_unclosed_session: int = 0  # B-48 (T46) — świece sesji niezamkniętej pominięte
+    # B-48 (D2 rew. 3): wiersze ocenione regułą daty, bo kalendarza nie dało się
+    # zastosować (nieznany kod / data poza zakresem / data niebędąca sesją).
+    # Instrument bez kalendarza (calendar_code None) NIE liczy się tutaj.
+    rows_calendar_fallback: int = 0
 
 
 @dataclass
@@ -289,6 +359,12 @@ class PricesSummary:
     # (suma wierszy i liczba instrumentów z >0 pominiętych).
     rows_unclosed_session_total: int = 0
     instruments_unclosed_session: int = 0
+    # B-48 (D2 rew. 3): wiersze ocenione regułą daty zamiast kalendarza i liczba
+    # instrumentów z >0 takich wierszy.
+    rows_calendar_fallback_total: int = 0
+    instruments_calendar_fallback: int = 0
+    # B-49: instrumenty, dla których fetch_ohlc padł dwukrotnie na błędzie sieci.
+    instruments_connection_error: int = 0
 
 
 # B-05 (Y3): kolumny OHLC split_adj wchodzące do porównania rewizji dostawcy
@@ -329,16 +405,37 @@ def _get_calendar(calendar_code: str):
 
 def _session_close_utc(calendar_code: str, price_date: date) -> datetime | None:
     """Zamknięcie sesji `price_date` w UTC wg kalendarza `calendar_code` albo
-    None, gdy `price_date` nie jest sesją tego kalendarza lub wypada poza
-    jego zakresem (wstrzykiwalne w testach przez monkeypatch)."""
+    None, gdy kalendarza nie da się zastosować: nieznany kod
+    (`InvalidCalendarName`), `price_date` poza zakresem kalendarza
+    (`DateOutOfBounds`, sprawdzane też jawnie przez first/last_session) albo
+    `price_date` nie jest sesją. Inne wyjątki propagują (wstrzykiwalne w
+    testach przez monkeypatch)."""
     try:
         cal = _get_calendar(calendar_code)
         ts = pd.Timestamp(price_date)
         if ts < cal.first_session or ts > cal.last_session or not cal.is_session(ts):
             return None
         return cal.closes.loc[ts].to_pydatetime()
-    except Exception:  # noqa: BLE001 — nieznany kod / poza zakresem -> fallback jak dla None
+    except (xcals_errors.InvalidCalendarName, xcals_errors.DateOutOfBounds):
         return None
+
+
+def _session_closed_ex(
+    calendar_code: str | None, price_date: date, now_utc: datetime
+) -> tuple[bool, bool]:
+    """(closed, fallback). `fallback` = True tylko gdy `calendar_code` jest
+    podany, a kalendarza nie dało się zastosować (D2 rew. 3) i użyto reguły
+    daty `price_date < now_utc.date()`. `calendar_code` None to reguła
+    podstawowa, nie fallback (fallback=False)."""
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("now_utc musi byc tz-aware (UTC)")
+    now_utc = now_utc.astimezone(timezone.utc)
+    if calendar_code is not None:
+        close = _session_close_utc(calendar_code, price_date)
+        if close is not None:
+            return now_utc >= close + SESSION_CLOSE_GRACE, False
+        return price_date < now_utc.date(), True
+    return price_date < now_utc.date(), False
 
 
 def session_closed(calendar_code: str | None, price_date: date, now_utc: datetime) -> bool:
@@ -347,19 +444,13 @@ def session_closed(calendar_code: str | None, price_date: date, now_utc: datetim
     - `calendar_code` podany i `price_date` jest sesją: True <=> `now_utc >=
       zamknięcie sesji (UTC) + SESSION_CLOSE_GRACE` (30 min).
     - `calendar_code` None: True <=> `price_date < now_utc.date()`.
-    - Przypadek brzegowy niewymieniony w T46: `price_date` nie jest sesją
-      kalendarza (albo poza jego zakresem / nieznany kod) -> reguła jak dla
-      None (`price_date < now_utc.date()`).
+    - Przypadek brzegowy niewymieniony w T46 (D2 rew. 3): `price_date` nie jest
+      sesją kalendarza (albo poza jego zakresem / nieznany kod) -> reguła jak
+      dla None (`price_date < now_utc.date()`); `run_prices_fetch` liczy takie
+      wiersze (`rows_calendar_fallback`), patrz `_session_closed_ex`.
 
     `now_utc` musi być tz-aware (inaczej ValueError)."""
-    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
-        raise ValueError("now_utc musi byc tz-aware (UTC)")
-    now_utc = now_utc.astimezone(timezone.utc)
-    if calendar_code is not None:
-        close = _session_close_utc(calendar_code, price_date)
-        if close is not None:
-            return now_utc >= close + SESSION_CLOSE_GRACE
-    return price_date < now_utc.date()
+    return _session_closed_ex(calendar_code, price_date, now_utc)[0]
 
 
 def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -> list[dict[str, Any]]:
@@ -452,6 +543,7 @@ def run_prices_fetch(
     end: date | None = None,
     commit: bool = True,
     now: datetime | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> PricesSummary:
     """Pobiera i zapisuje `prices_daily` dla instrumentów z wypełnionym
     `yahoo_symbol` (P3.1). `instrument_ids=None` -> WSZYSTKIE zmapowane
@@ -471,7 +563,13 @@ def run_prices_fetch(
     I5: wymaga istnienia tabeli `ingest_errors` (sql/009) — jej brak przerywa
     przebieg PRZED jakimkolwiek zapisem cen (`MissingIngestErrorsTableError`).
 
-    `commit=False` (jak `run_risk`, brief CC-S) — do testów DB z rollbackiem."""
+    `commit=False` (jak `run_risk`, brief CC-S) — do testów DB z rollbackiem.
+
+    B-49: `fetch_ohlc` przy błędzie sieci (`NETWORK_ERRORS`) jest ponawiany raz
+    po `NETWORK_RETRY_SLEEP_SECONDS` (`sleep` wstrzykiwalne); druga porażka =
+    wpis `ingest_errors` (`connection_error`), status instrumentu
+    "connection_error", zero zapisów, przejście do następnego instrumentu.
+    Wyjątek spoza `NETWORK_ERRORS` przerywa etap."""
     if end is None:
         end = date.today()
 
@@ -504,15 +602,39 @@ def run_prices_fetch(
             )
             result.adjustment_convention = adjustment_convention
 
-            rows = fetch_ohlc(symbol, start, end)
+            try:
+                rows = call_with_network_retry(lambda: fetch_ohlc(symbol, start, end), sleep)
+            except NETWORK_ERRORS as exc:
+                _log_ingest_error(
+                    cur,
+                    source="yahoo",
+                    instrument_id=instrument_id,
+                    price_date=None,
+                    error_type="connection_error",
+                    detail=describe_network_error(exc),
+                    run_started_at=run_started_at,
+                )
+                result.status = "connection_error"
+                summary.instruments_connection_error += 1
+                summary.results.append(result)
+                continue
             result.rows_fetched = len(rows)
 
             # B-48 (T46): świeca sesji niezamkniętej (przed zamknięciem + 30 min)
             # nie wchodzi do bazy — odfiltrowanie PRZED outlierami, I2, rewizjami
             # i zapisem; bez wpisu w ingest_errors i bez wpływu na status.
             calendar_code = EXCHANGE_TO_CALENDAR_CODE.get(inst.get("exchange"))
-            closed_rows = [r for r in rows if session_closed(calendar_code, r.price_date, now)]
+            closed_rows: list[OhlcRow] = []
+            for r in rows:
+                is_closed, used_fallback = _session_closed_ex(calendar_code, r.price_date, now)
+                if used_fallback:
+                    result.rows_calendar_fallback += 1
+                if is_closed:
+                    closed_rows.append(r)
             result.rows_unclosed_session = len(rows) - len(closed_rows)
+            if result.rows_calendar_fallback:
+                summary.rows_calendar_fallback_total += result.rows_calendar_fallback
+                summary.instruments_calendar_fallback += 1
             if result.rows_unclosed_session:
                 summary.rows_unclosed_session_total += result.rows_unclosed_session
                 summary.instruments_unclosed_session += 1

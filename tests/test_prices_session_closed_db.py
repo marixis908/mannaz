@@ -135,3 +135,66 @@ def test_b48_all_rows_unclosed_status_ok_zero_writes(db_conn, test_instrument, m
         assert _ingest_error_count(conn, inst) == 0
     finally:
         conn.rollback()
+
+
+@pytest.mark.db
+def test_b48_unknown_calendar_code_date_rule_and_counter(db_conn, test_instrument, monkeypatch):
+    conn = db_conn
+    inst = _inst_with_exchange(conn, test_instrument)
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        monkeypatch.setattr("mannaz.prices.fetch_currency", lambda symbol: inst["currency"])
+        monkeypatch.setattr("mannaz.prices.fetch_ohlc", lambda s, a, b: [_row(D_PREV), _row(D0)])
+        monkeypatch.setattr("mannaz.prices.EXCHANGE_TO_CALENDAR_CODE", {inst["exchange"]: "NIE_MA_TAKIEGO"})
+        now = datetime(1990, 1, 3, 23, 59, tzinfo=timezone.utc)
+        summary = run_prices_fetch(
+            conn, instrument_ids=[inst["id"]], start=D_PREV, end=D0, commit=False, now=now
+        )
+        result = summary.results[0]
+        assert _saved_dates(conn, inst) == {D_PREV}  # reguła daty: D0 nie jest < dzis
+        assert result.rows_unclosed_session == 1 and result.rows_inserted == 1
+        assert result.rows_calendar_fallback == 2  # oba wiersze ocenione fallbackiem
+        assert summary.rows_calendar_fallback_total == 2
+        assert summary.instruments_calendar_fallback == 1
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b48_non_session_date_before_today_saved_and_counted(db_conn, test_instrument, monkeypatch):
+    conn = db_conn
+    inst = _inst_with_exchange(conn, test_instrument)
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        monkeypatch.setattr("mannaz.prices.fetch_currency", lambda symbol: inst["currency"])
+        monkeypatch.setattr("mannaz.prices.fetch_ohlc", lambda s, a, b: [_row(D_PREV)])
+        monkeypatch.setattr("mannaz.prices.EXCHANGE_TO_CALENDAR_CODE", {inst["exchange"]: "XWAR"})
+        # 1990 jest poza zakresem prawdziwego kalendarza XWAR (data niesesyjna dla biblioteki)
+        now = datetime(1990, 1, 10, 12, 0, tzinfo=timezone.utc)
+        summary = run_prices_fetch(
+            conn, instrument_ids=[inst["id"]], start=D_PREV, end=D0, commit=False, now=now
+        )
+        result = summary.results[0]
+        assert _saved_dates(conn, inst) == {D_PREV}
+        assert result.rows_inserted == 1 and result.rows_unclosed_session == 0
+        assert result.rows_calendar_fallback == 1
+        assert summary.rows_calendar_fallback_total == 1 and summary.instruments_calendar_fallback == 1
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b48_no_calendar_is_not_counted_as_fallback(db_conn, test_instrument, monkeypatch):
+    conn = db_conn
+    inst = _inst_with_exchange(conn, test_instrument)
+    try:
+        _clean_synthetic_rows(conn, inst["id"])
+        _setup(monkeypatch, inst, False, [_row(D_PREV), _row(D0)])
+        now = datetime(1990, 1, 3, 23, 59, tzinfo=timezone.utc)
+        summary = run_prices_fetch(
+            conn, instrument_ids=[inst["id"]], start=D_PREV, end=D0, commit=False, now=now
+        )
+        assert summary.results[0].rows_calendar_fallback == 0
+        assert summary.rows_calendar_fallback_total == 0 and summary.instruments_calendar_fallback == 0
+    finally:
+        conn.rollback()

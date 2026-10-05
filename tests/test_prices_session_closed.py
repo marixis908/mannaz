@@ -80,3 +80,18 @@ def test_heartbeat_line_with_counts():
 def test_heartbeat_line_zero_when_stage_not_run():
     lines = _render_heartbeat_section(_state())
     assert "- świece niezamkniętej sesji pominięte: 0 (instrumentów: 0)" in lines
+
+
+def test_heartbeat_calendar_fallback_line_exact():
+    lines = _render_heartbeat_section(_state(calendar_fallback_rows=4, calendar_fallback_instruments=2))
+    assert "- świece z regułą daty zamiast kalendarza: 4 (instrumentów: 2)" in lines
+    assert "- świece z regułą daty zamiast kalendarza: 0 (instrumentów: 0)" in _render_heartbeat_section(_state())
+
+
+def test_session_closed_ex_fallback_flag():
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    assert prices._session_closed_ex("NIE_MA_TAKIEGO", date(2026, 10, 5), now) == (False, True)
+    assert prices._session_closed_ex("XWAR", date(1990, 1, 3), now) == (True, True)  # poza zakresem
+    assert prices._session_closed_ex("XWAR", date(2026, 10, 3), now) == (True, True)  # sobota
+    assert prices._session_closed_ex(None, date(2026, 10, 5), now) == (False, False)  # brak kalendarza != fallback
+    assert prices._session_closed_ex("XWAR", date(2026, 10, 2), now)[1] is False  # sesja: kalendarz zastosowany

@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 
-from mannaz.calendar_check import run_calendar_check
+import psycopg
+
+from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE, run_calendar_check
 from mannaz.corp_actions import run_corp_actions
 from mannaz.cycle import (
     DEFAULT_INCOMING_DIR,
@@ -43,7 +46,7 @@ from mannaz.fx import DEFAULT_START as FX_DEFAULT_START
 from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
 from mannaz.instruments_map import run_instrument_mapping, run_instrument_mapping_from_file
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
-from mannaz.prices import run_prices_fetch
+from mannaz.prices import run_prices_fetch, session_closed
 from mannaz.risk import run_risk
 from mannaz.satellite import run_satellite
 
@@ -285,6 +288,121 @@ def cmd_corp_actions(args: argparse.Namespace) -> None:
         )
 
 
+@dataclass
+class UnclosedRow:
+    instrument_id: int
+    yahoo_symbol: str
+    price_date: date
+    fetched_at: datetime
+    calendar_code: str | None
+
+
+@dataclass
+class PruneUnclosedResult:
+    rows: list[UnclosedRow] = field(default_factory=list)
+    deleted: int = 0
+    dry_run: bool = True
+
+
+class PruneCountMismatchError(RuntimeError):
+    """B-48 (C3): liczba usuniętych wierszy różna od oczekiwanej — transakcja
+    wycofana, nic nie usunięto."""
+
+
+def find_unclosed_rows(
+    conn: psycopg.Connection, instrument_ids: list[int] | None = None
+) -> list[UnclosedRow]:
+    """B-48 (T46, C3): wiersze `prices_daily` (source='yahoo') zapisane przed
+    zamknięciem swojej sesji: `not session_closed(kalendarz, price_date,
+    fetched_at)` — ta sama funkcja co filtr importera, czyli kryterium census
+    P3b (`fetched_at < zamknięcie + 30 min`; bez kalendarza i gdy kalendarza
+    nie da się zastosować: `fetched_at::date <= price_date`). Upsert ustawia
+    `fetched_at = now()` przy każdym zapisie, więc wiersz poprawiony po
+    zamknięciu sesji tu nie wraca. Tylko SELECT."""
+    sql = """
+        SELECT p.instrument_id, i.yahoo_symbol, i.exchange, p.price_date, p.fetched_at
+        FROM prices_daily p JOIN instruments i ON i.id = p.instrument_id
+        WHERE p.source = 'yahoo'
+    """
+    params: tuple = ()
+    if instrument_ids is not None:
+        sql += " AND p.instrument_id = ANY(%s)"
+        params = (instrument_ids,)
+    sql += " ORDER BY p.instrument_id, p.price_date"
+    out: list[UnclosedRow] = []
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        for iid, ysym, exch, pdate, fetched_at in cur.fetchall():
+            code = EXCHANGE_TO_CALENDAR_CODE.get(exch) if exch else None
+            if not session_closed(code, pdate, fetched_at):
+                out.append(UnclosedRow(iid, ysym, pdate, fetched_at, code))
+    return out
+
+
+def run_prune_unclosed(
+    conn: psycopg.Connection,
+    dry_run: bool = True,
+    expect: int | None = None,
+    instrument_ids: list[int] | None = None,
+    commit: bool = True,
+) -> PruneUnclosedResult:
+    """B-48 (C3): jednorazowe (i na przyszłe przerwane przebiegi) usunięcie
+    wierszy z `find_unclosed_rows`. `dry_run` — tylko lista, zero zapisu.
+    Zapis: DELETE po kluczu naturalnym (instrument_id, price_date, source) w
+    JEDNEJ transakcji; gdy liczba usuniętych != liczba kandydatów albo !=
+    `expect` (liczba z dry-run) — rollback i `PruneCountMismatchError`.
+    `ingest_errors` nie jest ruszane (ślad audytu)."""
+    result = PruneUnclosedResult(dry_run=dry_run)
+    result.rows = find_unclosed_rows(conn, instrument_ids)
+    if dry_run:
+        return result  # tylko SELECT; CLI zamyka połączenie bez commit
+    if expect is not None and expect != len(result.rows):
+        conn.rollback()
+        raise PruneCountMismatchError(
+            f"kandydatow {len(result.rows)} != oczekiwane (dry-run) {expect} — nic nie usunieto"
+        )
+    deleted = 0
+    with conn.cursor() as cur:
+        for r in result.rows:
+            cur.execute(
+                "DELETE FROM prices_daily WHERE instrument_id = %s AND price_date = %s AND source = 'yahoo'",
+                (r.instrument_id, r.price_date),
+            )
+            deleted += cur.rowcount
+    if deleted != len(result.rows):
+        conn.rollback()
+        raise PruneCountMismatchError(
+            f"usunieto {deleted} != kandydatow {len(result.rows)} — rollback, nic nie usunieto"
+        )
+    result.deleted = deleted
+    if commit:
+        conn.commit()
+    return result
+
+
+def cmd_prune_unclosed(args: argparse.Namespace) -> None:
+    """B-48 (C3): `prune-unclosed [--dry-run] [--expect N]`. Wydruk: symbol,
+    data, fetched_at, kalendarz — bez numerów rachunków. Zapis wymaga
+    `--expect` (liczba kandydatów z dry-run)."""
+    if not args.dry_run and args.expect is None:
+        print("prune-unclosed bez --dry-run wymaga --expect N (liczba z dry-run)")
+        sys.exit(2)
+    conn = get_connection()
+    try:
+        result = run_prune_unclosed(conn, dry_run=bool(args.dry_run), expect=args.expect)
+    finally:
+        conn.close()
+    print(f"tryb: {'dry-run (bez zapisu)' if result.dry_run else 'zapis'}")
+    print(f"kandydaci: {len(result.rows)}")
+    for r in result.rows:
+        print(
+            f"  {r.instrument_id}\t{r.yahoo_symbol}\t{r.price_date}\t"
+            f"{r.fetched_at.isoformat()}\t{r.calendar_code or 'BRAK'}"
+        )
+    if not result.dry_run:
+        print(f"usuniete: {result.deleted}")
+
+
 def cmd_cycle(args: argparse.Namespace) -> None:
     conn = get_connection()
     try:
@@ -376,6 +494,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_corp.add_argument("--dry-run", action="store_true",
                         help="B-45: ta sama klasyfikacja (zapisane/znane/date_drift), zero zapisu")
     p_corp.set_defaults(func=cmd_corp_actions)
+
+    p_prune = sub.add_parser(
+        "prune-unclosed",
+        help="B-48 (T46) — usuniecie wierszy prices_daily zapisanych przed zamknieciem sesji",
+    )
+    p_prune.add_argument("--dry-run", action="store_true", help="tylko lista kandydatow, zero zapisu")
+    p_prune.add_argument(
+        "--expect", type=int, default=None,
+        help="liczba kandydatow z dry-run; rozjazd = rollback, nic nie usuniete"
+    )
+    p_prune.set_defaults(func=cmd_prune_unclosed)
 
     p_cycle = sub.add_parser(
         "cycle", help="C2-C7 — cykl tygodniowy: import -> FIFO -> bramka rejestracji -> ceny/FX -> ryzyko -> raport"

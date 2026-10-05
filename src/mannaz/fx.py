@@ -18,14 +18,23 @@ from __future__ import annotations
 
 import hashlib
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import median
 from typing import Any
 
 import psycopg
 import requests
+
+from mannaz.prices import (
+    NETWORK_ERRORS,
+    _ensure_ingest_errors_table,
+    _log_ingest_error,
+    call_with_network_retry,
+    describe_network_error,
+)
 
 NBP_CURRENCIES: tuple[str, ...] = ("USD", "EUR", "CAD", "CHF", "GBP", "HKD", "JPY", "SEK", "DKK")
 NBP_CHUNK_DAYS = 93  # limit NBP API na jedno zapytanie zakresowe
@@ -196,13 +205,27 @@ def run_fx_fetch(
     currencies: tuple[str, ...] = NBP_CURRENCIES,
     start: date = DEFAULT_START,
     end: date | None = None,
+    commit: bool = True,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> FxSummary:
+    """NBP tabela A -> `fx_nbp` + kontrola Frankfurter (P3.3).
+
+    B-49: wywołanie `fetch_frankfurter_rate` przy błędzie sieci
+    (`NETWORK_ERRORS`) jest ponawiane raz po 5 s (`sleep` wstrzykiwalne). Druga
+    porażka = wpis `ingest_errors` (source='frankfurter', instrument_id NULL,
+    price_date = data próbki, `connection_error`); próbki Frankfurter dla tej
+    waluty są przerwane, a CZĘŚCIOWA próbka odrzucona (mediana z kilku sesji
+    byłaby wprowadzająca w błąd) — kontrola dostaje n=0 i notatkę; kursy NBP są
+    zapisane, etap idzie do następnej waluty. Wyjątek spoza `NETWORK_ERRORS`
+    przerywa etap. `commit=False` — do testów DB z rollbackiem."""
     if end is None:
         end = date.today()
 
+    run_started_at = datetime.now(timezone.utc)
     summary = FxSummary()
 
     with conn.cursor() as cur:
+        _ensure_ingest_errors_table(cur)
         for currency in currencies:
             result = FxCurrencyResult(currency=currency)
             try:
@@ -231,11 +254,35 @@ def run_fx_fetch(
 
             sample_dates = [d for d, _ in nbp_rates[-FRANKFURTER_CONTROL_SESSIONS:]]
             frankfurter_rates: list[tuple[date, Decimal]] = []
+            frankfurter_failed = False
             for d in sample_dates:
-                rate = fetch_frankfurter_rate(currency, d)
+                try:
+                    rate = call_with_network_retry(
+                        lambda: fetch_frankfurter_rate(currency, d), sleep
+                    )
+                except NETWORK_ERRORS as exc:
+                    _log_ingest_error(
+                        cur,
+                        source="frankfurter",
+                        instrument_id=None,
+                        price_date=d,
+                        error_type="connection_error",
+                        detail=f"waluta={currency} " + describe_network_error(exc),
+                        run_started_at=run_started_at,
+                    )
+                    frankfurter_failed = True
+                    break
                 if rate is not None:
                     frankfurter_rates.append((d, rate))
-            result.control = compute_fx_control(nbp_rates, frankfurter_rates, currency)
+            if frankfurter_failed:
+                result.control = FxControlResult(
+                    currency=currency,
+                    n_sessions_compared=0,
+                    median_abs_pct_diff=None,
+                    note="Frankfurter niedostepny (connection_error), kontrola pominieta",
+                )
+            else:
+                result.control = compute_fx_control(nbp_rates, frankfurter_rates, currency)
 
             run_key_source = f"fx_nbp:{currency}:{start.isoformat()}:{end.isoformat()}"
             run_key = hashlib.sha256(run_key_source.encode("utf-8")).hexdigest()
@@ -250,6 +297,7 @@ def run_fx_fetch(
 
             summary.results.append(result)
 
-        conn.commit()
+        if commit:
+            conn.commit()
 
     return summary
