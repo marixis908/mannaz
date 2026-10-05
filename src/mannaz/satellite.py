@@ -798,7 +798,7 @@ class Inputs:
     axis: list[date]
     compute_days: list[date]  # os + daty migawek (bramka M78)
     tx_rows: list[TxRow]  # wiersze trzech rachunkow satelity <= d_to, sort. po dacie
-    kontraktowy_rows: list[dict[str, Any]]  # `risk._kontraktowy_rows` (<= d_to)
+    kontraktowy_rows: list[dict[str, Any]]  # `risk.read_kontraktowy_rows` (<= d_to)
     instruments: dict[int, InstrumentInfo]
     prices: dict[int, tuple[list[date], list[float]]]  # close_split_adj, sort. po dacie
     layer_events: dict[int, list[dict[str, Any]]]  # {'date','ratio'} (split/reverse_split)
@@ -909,7 +909,7 @@ def load_inputs(
 ) -> Inputs:
     """Ladowanie hurtowe, WYLACZNIE SELECT: transakcje trzech rachunkow,
     instrumenty, ceny (close_split_adj), zdarzenia warstwy (split/reverse_split),
-    FX (fx_nbp) i wiersze KONTRAKTOWY (`risk._kontraktowy_rows`) — raz; pozycje
+    FX (fx_nbp) i wiersze KONTRAKTOWY (`risk.read_kontraktowy_rows`) — raz; pozycje
     per dzien przez `fifo.positions_as_of` z cache po dniach bez zmian
     (transakcje z instrumentem lub zdarzenia korporacyjne w (poprzedni, D]).
     `symbol_map`: instrumenty bez cen w prices_daily dostaja ceny z
@@ -953,7 +953,7 @@ def load_inputs(
         for d, rach, c, rt, amt, iid, q, p, core, itype in cur.fetchall()
     ]
 
-    kontraktowy_rows = _risk._kontraktowy_rows(cur, d_to)
+    kontraktowy_rows = _risk.read_kontraktowy_rows(cur, d_to)
 
     cur.execute(
         "SELECT instrument_id, price_date, close_split_adj FROM prices_daily "

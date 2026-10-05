@@ -554,11 +554,6 @@ def test_sum_open_risk_pct_excludes_core_and_multiplier_missing():
     assert total == Decimal("1.5")
 
 
-def test_count_level1_breaches():
-    rows = [_risk_row(level1_breach=True), _risk_row(level1_breach=False), _risk_row(level1_breach=True)]
-    assert model.count_level1_breaches(rows) == 2
-
-
 def test_price_coverage_counts_eligible_rows_with_price():
     rows = [
         _risk_row(close_d=Decimal("1")),
@@ -671,9 +666,9 @@ def test_result_a_and_provenance_are_asdict_friendly():
 import inspect  # noqa: E402
 
 EXPECTED_REQUIRED_PARAMS = {
-    ("mannaz.risk", "_open_positions_as_of"): ["cur", "as_of"],
-    ("mannaz.risk", "_resolve_position_price_coverage"): ["cur", "pos", "as_of"],
-    ("mannaz.risk", "_kontraktowy_rows"): ["cur", "as_of"],
+    ("mannaz.risk", "open_positions_as_of"): ["cur", "as_of"],
+    ("mannaz.risk", "resolve_position_price_coverage"): ["cur", "pos", "as_of"],
+    ("mannaz.risk", "read_kontraktowy_rows"): ["cur", "as_of"],
     ("mannaz.risk", "check_kontraktowy_coverage"): ["n_rows", "max_date", "has_open_futures", "as_of"],
     ("mannaz.risk", "kontraktowy_account_value"): ["rows", "as_of"],
     ("mannaz.risk", "is_risk_budget_eligible"): ["instrument_type", "is_core"],

@@ -35,6 +35,7 @@ from mannaz.prices import (
     call_with_network_retry,
     describe_network_error,
 )
+from mannaz.provenance import code_sha, current_trigger
 
 NBP_CURRENCIES: tuple[str, ...] = ("USD", "EUR", "CAD", "CHF", "GBP", "HKD", "JPY", "SEK", "DKK")
 NBP_CHUNK_DAYS = 93  # limit NBP API na jedno zapytanie zakresowe
@@ -288,11 +289,11 @@ def run_fx_fetch(
             run_key = hashlib.sha256(run_key_source.encode("utf-8")).hexdigest()
             cur.execute(
                 """
-                INSERT INTO source_runs (source, row_count, sha256_input)
-                VALUES (%s, %s, %s)
+                INSERT INTO source_runs (source, row_count, sha256_input, triggered_by, code_sha)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (source, sha256_input) DO NOTHING
                 """,
-                (f"nbp:{currency}", inserted, run_key),
+                (f"nbp:{currency}", inserted, run_key, current_trigger(), code_sha()),
             )
 
             summary.results.append(result)

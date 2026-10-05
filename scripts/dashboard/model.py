@@ -511,10 +511,6 @@ def sum_open_risk_pct(rows: list[dict[str, Any]], is_eligible) -> Decimal:
     return total
 
 
-def count_level1_breaches(rows: list[dict[str, Any]]) -> int:
-    return sum(1 for r in rows if r.get("level1_breach"))
-
-
 def _level1_names(rows: list[dict[str, Any]], is_eligible):
     from mannaz.risk import level1_by_name  # jedna definicja, jak is_risk_budget_eligible
 

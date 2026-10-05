@@ -31,6 +31,7 @@ from mannaz.parse_history import (
     classify_instrument_type,
     parse_source_file,
 )
+from mannaz.provenance import code_sha, current_trigger
 
 
 @dataclass
@@ -308,11 +309,11 @@ def import_parsed_files(
 
             cur.execute(
                 """
-                INSERT INTO source_runs (source, row_count, sha256_input)
-                VALUES (%s, %s, %s)
+                INSERT INTO source_runs (source, row_count, sha256_input, triggered_by, code_sha)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (source, sha256_input) DO NOTHING
                 """,
-                (pf.path.name, pf.row_count, pf.sha256),
+                (pf.path.name, pf.row_count, pf.sha256, current_trigger(), code_sha()),
             )
 
             summary.per_file.append(file_result)

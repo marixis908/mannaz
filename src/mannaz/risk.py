@@ -110,7 +110,7 @@ Brief CC-U (B-19), U2-U5 (T27 dokumentu projektowego — forward-fill max 1-2
 dni, wyłącznie rynek faktycznie zamknięty, zawsze z flagą stale): pozycja bez
 policzalnej ceny na D NIGDY nie wypada po cichu z kapitału ani z ryzyka
 (decyzja nadzorcy 2026-09-27). `run_risk` najpierw sprawdza WSZYSTKIE pozycje
-z `positions_as_of(D)` (przez `_resolve_position_price_coverage`, rdzeń
+z `positions_as_of(D)` (przez `resolve_position_price_coverage`, rdzeń
 dzielony z `resolve_default_risk_date`) — jeśli którakolwiek jest
 niekompletna (brak instrumentu bazowego, nieobsługiwany typ, cena na D wg
 reguły T27 się nie rozstrzyga, brak FX, brak mnożnika kontraktu, albo
@@ -142,6 +142,7 @@ import psycopg
 
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
 from mannaz.fifo import KONTRAKTOWY_PREFIX, positions_as_of
+from mannaz.provenance import code_sha
 
 # ---------------------------------------------------------------------------
 # Stałe (§19 dokumentu projektowego + brief P4.1/P4.2)
@@ -616,6 +617,35 @@ def level1_by_name(items, labels: dict | None = None) -> list[Level1Name]:
     return out
 
 
+def level1_names_for_summary(summary: "RiskSummary", labels: dict | None = None) -> list[Level1Name]:
+    """Poziom 1 per nazwa dla wierszy `run_risk` — jedno mapowanie wierszy na
+    `level1_by_name` dla raportu cyklu i CLI `run_p3 risk` (B-34)."""
+    return level1_by_name(
+        [
+            (
+                r.name_key,
+                is_risk_budget_eligible(r.instrument_type, r.is_core),
+                r.broker_ticker,
+                r.settlement_currency,
+                r.risk_pct_satellite_capital,
+                r.name_risk_pct,
+                r.level1_breach,
+            )
+            for r in summary.rows
+        ],
+        labels,
+    )
+
+
+def level1_name_labels(cur: psycopg.Cursor, summary: "RiskSummary") -> dict[int, str]:
+    """Etykiety nazw poziomu 1: `broker_ticker` instrumentu bazowego (`name_key`)."""
+    name_ids = sorted({r.name_key for r in summary.rows if r.name_key is not None})
+    if not name_ids:
+        return {}
+    cur.execute("SELECT id, broker_ticker FROM instruments WHERE id = ANY(%s)", (name_ids,))
+    return {i: t for i, t in cur.fetchall()}
+
+
 @dataclass
 class RiskBudgetAggregateResult:
     satellite_risk_total: Decimal
@@ -763,7 +793,7 @@ def kontraktowy_account_value(rows: list[dict[str, Any]], as_of: date) -> Decima
 def check_kontraktowy_coverage(n_rows: int, max_date: date | None, has_open_futures: bool, as_of: date) -> None:
     """Kontrola pokrycia historii KONTRAKTOWY do D (brief CC-R (b)) — nigdy
     cichego zera. `n_rows`/`max_date` liczone na wierszach z
-    transaction_date <= as_of (patrz `_kontraktowy_rows`). RuntimeError gdy:
+    transaction_date <= as_of (patrz `read_kontraktowy_rows`). RuntimeError gdy:
     brak historii KONTRAKTOWY do D w ogóle, albo (przy otwartych kontraktach)
     historia nie sięga D — broker księguje rozliczenie każdej sesji, więc brak
     wiersza na D przy otwartych pozycjach oznacza niekompletne dane."""
@@ -1103,7 +1133,7 @@ def _default_calendar_facts(calendar_code: str | None, as_of: date) -> CalendarF
 # Domyślne D (brief CC-U, U3) — najpóźniejsza data <= dziś, dla której reguła
 # T27 (U2) daje komplet dla WSZYSTKICH pozycji z `positions_as_of` tej daty
 # (zero przypadków 'incomplete' — stopy NIE są sprawdzane, patrz
-# `_resolve_position_price_coverage`). Zastępuje starą `resolve_default_date`
+# `resolve_position_price_coverage`). Zastępuje starą `resolve_default_date`
 # (brief P4.1 — "any_null" per satelitę), USUNIĘTĄ: nowa reguła sprawdza
 # WSZYSTKIE pozycje (nie tylko satelitę) przez ten sam rdzeń co `run_risk`.
 # ---------------------------------------------------------------------------
@@ -1203,7 +1233,7 @@ class RiskSummary:
     stale_tickers: list[str] = field(default_factory=list)
 
 
-def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
+def open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
     """S2/S3 (brief CC-S, F1 fix): pozycje na dzień D przez `fifo.positions_as_of`
     (FIFO liczone punktowo na D, bez look-ahead) — zamiast czytania bieżącego
     stanu `positions_fifo`. Atrybuty instrumentu JOIN z `instruments`, te same
@@ -1245,7 +1275,7 @@ def _open_positions_as_of(cur: psycopg.Cursor, as_of: date) -> list[dict[str, An
                 # exchange (brief CC-U, U2): gieldy INSTRUMENTU WYCENY — dla
                 # equity/etf to ta pozycja, dla future doklejane osobno z
                 # instrumentu bazowego (_base_instrument), patrz
-                # `_resolve_position_price_coverage`.
+                # `resolve_position_price_coverage`.
                 "exchange": exchange,
             }
         )
@@ -1344,7 +1374,7 @@ def _instrument_layer_events(cur: psycopg.Cursor, instrument_id: int) -> list[di
     return [{"date": d, "ratio": r} for d, r in cur.fetchall()]
 
 
-def _kontraktowy_rows(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
+def read_kontraktowy_rows(cur: psycopg.Cursor, as_of: date) -> list[dict[str, Any]]:
     """Wszystkie wiersze `transactions` rachunku KONTRAKTOWY do dnia D
     włącznie (`transaction_date <= as_of`), z `instruments.multiplier`
     doklejonym LEFT JOIN (NULL -> błąd w `kontraktowy_account_value`;
@@ -1421,7 +1451,7 @@ class IncompleteRiskDateError(RuntimeError):
 
 @dataclass
 class PositionPriceCoverage:
-    """Wynik `_resolve_position_price_coverage` dla pozycji KOMPLETNEJ —
+    """Wynik `resolve_position_price_coverage` dla pozycji KOMPLETNEJ —
     wystarcza do policzenia ATR/stopów/ryzyka w `run_risk` bez ponownego
     odpytywania instrumentu/ceny/FX."""
 
@@ -1438,7 +1468,7 @@ class PositionPriceCoverage:
     fx_rate_date: date | None
 
 
-def _resolve_position_price_coverage(
+def resolve_position_price_coverage(
     cur: psycopg.Cursor,
     pos: dict[str, Any],
     as_of: date,
@@ -1518,7 +1548,7 @@ def resolve_default_risk_date(
 ) -> date | None:
     """U3 (brief CC-U): najpóźniejsza data `<= dziś`, dla której reguła T27
     (U2) daje komplet dla WSZYSTKICH pozycji z `positions_as_of` tej daty
-    (stopy NIE są sprawdzane — `_resolve_position_price_coverage` pomija
+    (stopy NIE są sprawdzane — `resolve_position_price_coverage` pomija
     ATR/Chandelier, U3 ma być tani). Kandydaci: `max_candidates`
     najpóźniejszych dat z `prices_daily` (malejąco, ograniczone rozsądnie);
     zatrzymuje się na pierwszej kompletnej (kandydaci już malejący, więc to
@@ -1545,17 +1575,17 @@ def resolve_default_risk_date(
 
         completeness: list[tuple[date, bool]] = []
         for d in candidates:
-            positions = _open_positions_as_of(cur, d)
+            positions = open_positions_as_of(cur, d)
             complete = True
             for pos in positions:
-                _, incomplete = _resolve_position_price_coverage(cur, pos, d, calendar_facts_fn)
+                _, incomplete = resolve_position_price_coverage(cur, pos, d, calendar_facts_fn)
                 if incomplete is not None:
                     complete = False
                     break
             if complete:
                 # B-36 (M77): ta sama reguła co bramka w `run_risk` — jedno
                 # wywołanie `check_kontraktowy_coverage`, bez kopii warunku.
-                kontraktowy_rows = _kontraktowy_rows(cur, d)
+                kontraktowy_rows = read_kontraktowy_rows(cur, d)
                 has_open_futures = any(p["instrument_type"] == "future" for p in positions)
                 max_kontraktowy_date = max((r["transaction_date"] for r in kontraktowy_rows), default=None)
                 try:
@@ -1583,7 +1613,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
     summary = RiskSummary(risk_date=as_of)
 
     with conn.cursor() as cur:
-        positions = _open_positions_as_of(cur, as_of)
+        positions = open_positions_as_of(cur, as_of)
         instrument_theme_by_id: dict[int, str] = {
             p["instrument_id"]: p["theme"] for p in positions if p["theme"] is not None
         }
@@ -1611,7 +1641,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
             # WSZYSTKIE dotychczasowe ścieżki cichego wypadnięcia teraz trafiają
             # do incomplete_items (zbieramy WSZYSTKIE pozycje, nie przerywamy
             # na pierwszej niekompletnej — patrz sprawdzenie po tej pętli). ---
-            coverage, incomplete = _resolve_position_price_coverage(cur, pos, as_of)
+            coverage, incomplete = resolve_position_price_coverage(cur, pos, as_of)
             if incomplete is not None:
                 incomplete_items.append(incomplete)
                 continue
@@ -1826,7 +1856,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         # nominału futures + gotówka AKCYJNY/ZAGRANICZNY + wartość rachunku
         # KONTRAKTOWY, §19.4). Kontrola pokrycia KONTRAKTOWY zostaje jako
         # bramka — nigdy cichego zera. Rozkład tylko informacyjny, z NavResult. ---
-        kontraktowy_rows = _kontraktowy_rows(cur, as_of)
+        kontraktowy_rows = read_kontraktowy_rows(cur, as_of)
         has_open_futures = any(p["instrument_type"] == "future" for p in positions)
         max_kontraktowy_date = max((r["transaction_date"] for r in kontraktowy_rows), default=None)
         check_kontraktowy_coverage(len(kontraktowy_rows), max_kontraktowy_date, has_open_futures, as_of)
@@ -2030,7 +2060,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             risk_pct_satellite_capital, level1_breach,
             regime, warning, multiplier_missing, price_is_stale, price_date_used,
             name_key, name_risk_pct,
-            note, computed_at
+            note, computed_at, code_sha
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s,
@@ -2041,7 +2071,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s,
-            %s, %s
+            %s, %s, %s
         )
         """,
         (
@@ -2054,6 +2084,6 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             row.risk_pct_satellite_capital, row.level1_breach,
             row.regime, row.warning, row.multiplier_missing, row.price_is_stale, row.price_date_used,
             row.name_key, row.name_risk_pct,
-            row.note, computed_at,
+            row.note, computed_at, code_sha(),
         ),
     )

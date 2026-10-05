@@ -38,11 +38,11 @@ class _Conn:
 
 
 def _setup(monkeypatch, instrument_type, kontraktowy_max):
-    monkeypatch.setattr(risk, "_open_positions_as_of", lambda cur, d: [{"instrument_type": instrument_type}])
-    monkeypatch.setattr(risk, "_resolve_position_price_coverage", lambda cur, pos, d, fn: (object(), None))
+    monkeypatch.setattr(risk, "open_positions_as_of", lambda cur, d: [{"instrument_type": instrument_type}])
+    monkeypatch.setattr(risk, "resolve_position_price_coverage", lambda cur, pos, d, fn: (object(), None))
     monkeypatch.setattr(
         risk,
-        "_kontraktowy_rows",
+        "read_kontraktowy_rows",
         lambda cur, d: [{"transaction_date": min(kontraktowy_max, d)}],  # rozliczenie sięga tylko do kontraktowy_max
     )
 
