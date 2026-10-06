@@ -8,6 +8,7 @@ oznacza STOP i raport. Nie zmieniaj globalnego D:\codex\AGENTS.md.
 - Pracuj tylko w worktree wskazanym w pakiecie; cwd = worktree.
 - Galaz codex/<slug>. Commit tylko na tej galezi i w tym worktree (D1).
 - Push tylko tej galezi, za zgoda ownera na pojedyncza komende (D2).
+  Komenda: git push origin codex/<slug>, bez -u (zmienia .git/config).
   Repo publiczne: push jest publikacja. Bez main, force-push, usuwania galezi
   zdalnych, merge i PR. Merge do main robi CC po recenzji.
 - D5: tylko kod i testy czyste. Bez dostepu do data/, _incoming/, out/,
@@ -17,7 +18,8 @@ oznacza STOP i raport. Nie zmieniaj globalnego D:\codex\AGENTS.md.
   PYTHONPATH=<worktree>\src tylko na czas procesu, potem przywroc poprzednia
   wartosc. Bez pip install i zmian zaleznosci.
 - D11: trailer commita: Co-authored-by: Codex <noreply@openai.com>.
-- Z7: odmowa narzedzia lub sandboxa = STOP i zgloszenie, bez ponawiania.
+- Z7: kazda odmowa poza regula packed-refs.lock ponizej = STOP i zgloszenie,
+  bez ponawiania, chyba ze pakiet jawnie przewiduje inny wyjatek.
 - Nie recenzuj wlasnej pracy: wynik recenzuje CC.
 - Raport obowiazkowy: docs/codex/_szablon-raportu.md.
   Pakiet: tmp/codex/<slug>.md; raport: tmp/codex/<slug>-raport.md.
@@ -38,7 +40,8 @@ oznacza STOP i raport. Nie zmieniaj globalnego D:\codex\AGENTS.md.
 ## Warunki STOP
 
 Plik poza lista dozwolona, potrzeba danych lub bazy, zmiana zaleznosci,
-odmowa narzedzia, konflikt z regulami repo: STOP i raport do ownera.
+odmowa inna niz zaakceptowana regula packed-refs.lock, konflikt z regulami repo:
+STOP i raport do ownera.
 Nie rozszerzaj sam zakresu ani uprawnien.
 
 ## Pliki tymczasowe testow
@@ -49,9 +52,10 @@ nieczytelne poza nim. Testy czyste uruchamiaj z
 Ustaw PYTHONDONTWRITEBYTECODE=1 i PYTHONPATH=<worktree>\src tylko dla procesu.
 codex-task-close.ps1 -Usun usuwa pytest-temp przed git worktree remove;
 blad usuwania musi byc jawnie zgloszony, nie moze byc cicho pominiety.
-Wyjatki od STOP po odmowie wymagaja jawnego zapisu w pakiecie. W tym wdrozeniu
-ZG2 obejmuje zaplanowane kontrole ujemne D-K1/D-K2 oraz odmowy odczytu/usuniecia
-plikow sandboxa w tmp/codex/. Zapisz surowy wynik, nie ponawiaj; inne odmowy = STOP.
+Wyjatki od STOP poza stala regula packed-refs.lock wymagaja jawnego zapisu
+w pakiecie. ZG2 moze obejmowac zaplanowane kontrole ujemne oraz odmowy
+odczytu/usuniecia plikow sandboxa w tmp/codex/, jezeli pakiet je przewiduje.
+Zapisz surowy wynik, nie ponawiaj; kazda inna odmowa = STOP.
 
 ## Auto-gc i maintenance
 
@@ -60,5 +64,9 @@ GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*. Funkcja codex-mannaz
 zapisuje poprzednie wartosci i przywraca je w finally, bez zmian git config.
 Nie udostepniaj korzenia .git ani packed-refs.lock.
 Owner/CC okresowo wykonuja git gc / git pack-refs poza sandboxem.
-Odmowa packed-refs.lock w tym wdrozeniu to wynik pomiaru na mocy ZG2;
-inne nieplanowane odmowy nadal oznaczaja STOP bez ponawiania.
+Stala regula: odmowa packed-refs.lock przy commicie z kodem 0 nie jest STOP,
+jezeli git log -1 --oneline pokazuje nowy commit. Zapisz odmowe i wynik
+w raporcie zadania. Kazda inna odmowa = STOP, bez ponawiania.
+Blad wystepuje podczas aktualizacji ref, przed podsumowaniem commita.
+Auto-gc wykluczone pomiarem gc.auto=0 i maintenance.auto=false widocznymi
+dla Git; przyczyna packed-refs.lock pozostaje niewyjasniona.

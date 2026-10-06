@@ -44,8 +44,11 @@ try {
     }
     $before = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
     $current = Get-CodexBaseline -Repo $repo
+    & git -C $repo merge-base --is-ancestor $before.main main
+    $mainExit = $LASTEXITCODE
+    if ($mainExit -ne 0 -and $mainExit -ne 1) { throw 'Nie mozna sprawdzic historii main.' }
     $checks = [ordered]@{
-        main = ($before.main -ceq $current.main)
+        main = ($mainExit -eq 0)
         config = ($before.configSha256 -ceq $current.configSha256)
         hooks = ((ConvertTo-Json -InputObject @($before.hooks) -Depth 5 -Compress) -ceq
                  (ConvertTo-Json -InputObject @($current.hooks) -Depth 5 -Compress))
@@ -54,6 +57,11 @@ try {
     foreach ($key in $checks.Keys) {
         if ($checks[$key]) { Write-Output ($key + ': ZGODNE') }
         else { Write-Output ($key + ': ROZJAZD'); $drift = $true }
+    }
+    if ($checks.main) {
+        Write-Output 'main: nowe commity do przejrzenia:'
+        & git -C $repo log --oneline ($before.main + '..main')
+        if ($LASTEXITCODE -ne 0) { throw 'Nie mozna odczytac nowych commitow main.' }
     }
     if ($drift) { throw 'Baseline ROZJAZD: nie wolno scalac bez wyjasnienia.' }
     & git -C $repo log ('main..' + $branch) --oneline

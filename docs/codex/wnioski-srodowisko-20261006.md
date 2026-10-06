@@ -750,3 +750,156 @@ Bez merge, PR i force-push. Worktree wdrozeniowy pozostaje.
   "prefixUnchanged": true
 }
 ```
+
+## Poprawki po recenzji CC
+
+Zakres: close, AGENTS.md, szablon zadania i ten dopisek.
+Main: baseline.main ma byc przodkiem main; przy ZGODNE lista nowych commitow
+do przejrzenia. Config i hooks bez zmiany semantyki.
+Push tylko git push origin codex/<slug>, bez -u zmieniajacego .git/config.
+Stala regula packed-refs.lock: commit exit 0 plus nowy commit pokazany
+przez git log -1 --oneline; odmowa do raportu, nie STOP. Inna odmowa STOP.
+Blad wystepuje podczas aktualizacji ref przed podsumowaniem; auto-gc
+wykluczone pomiarem, przyczyna niewyjasniona.
+
+Predykcje przed pomiarami: parsery PS 5.1/7 bez bledow, ASCII bez odchylen;
+main za baseline -> ZGODNE i lista, reset main na przodka baseline -> ROZJAZD.
+Test na syntetycznym repo tmp/codex/test-close, bez danych finansowych.
+Instrument: kopia skryptu z JEDYNA zmiana stalego root worktree na katalog
+syntetyczny; odtworzenie root daje identyczna tresc z produkcyjnym skryptem.
+Nie uzyto -Usun; tylko kontrole historii i baseline.
+Surowe komendy i wyniki:
+```text
+scripts\codex-task-close.ps1 nonASCII=0
+AGENTS.md nonASCII=0
+docs\codex\_szablon-zadania.md nonASCII=0
+D:\tools\pwsh7\pwsh.exe Parser.ParseFile D:\codex\worktrees\mannaz\srodowisko-20261006\scripts\codex-task-close.ps1
+parseErrors=0
+
+parserExit=0
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe Parser.ParseFile D:\codex\worktrees\mannaz\srodowisko-20261006\scripts\codex-task-close.ps1
+parseErrors=0
+
+parserExit=0
+harnessOnlyRootChanged=True
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close init -b main
+Initialized empty Git repository in D:/codex/worktrees/mannaz/srodowisko-20261006/tmp/codex/test-close/.git/
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close add -- fixture.txt
+warning: in the working copy of 'fixture.txt', LF will be replaced by CRLF the next time Git touches it
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close -c user.name=Synthetic Control -c user.email=noreply@openai.com commit -m ancestor
+[main (root-commit) 8086865] ancestor
+ 1 file changed, 1 insertion(+)
+ create mode 100644 fixture.txt
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close add -- fixture.txt
+warning: in the working copy of 'fixture.txt', LF will be replaced by CRLF the next time Git touches it
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close -c user.name=Synthetic Control -c user.email=noreply@openai.com commit -m baseline
+[main f6377ba] baseline
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close branch codex/synthetic
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close add -- fixture.txt
+warning: in the working copy of 'fixture.txt', LF will be replaced by CRLF the next time Git touches it
+
+gitExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close -c user.name=Synthetic Control -c user.email=noreply@openai.com commit -m main-after-baseline
+[main e93726d] main-after-baseline
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+gitExit=0
+DODATNIA: D:\tools\pwsh7\pwsh.exe -NoProfile -File D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close\scripts\codex-task-close.ps1 -Slug synthetic
+main: ZGODNE
+config: ZGODNE
+hooks: ZGODNE
+main: nowe commity do przejrzenia:
+e93726d main-after-baseline
+Bez -Usun: nic nie usunieto.
+
+positiveCloseExit=0
+DODATNIA: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close\scripts\codex-task-close.ps1 -Slug synthetic
+main: ZGODNE
+config: ZGODNE
+hooks: ZGODNE
+main: nowe commity do przejrzenia:
+e93726d main-after-baseline
+Bez -Usun: nic nie usunieto.
+
+positiveCloseExit=0
+git -C D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close reset --hard 80868651a22d453f47ab1c29ddab03bbd338a7c9
+HEAD is now at 8086865 ancestor
+
+gitExit=0
+UJEMNA: D:\tools\pwsh7\pwsh.exe -NoProfile -File D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close\scripts\codex-task-close.ps1 -Slug synthetic
+main: ROZJAZD
+config: ZGODNE
+hooks: ZGODNE
+Write-Error: Baseline ROZJAZD: nie wolno scalac bez wyjasnienia.
+
+negativeCloseExit=1
+UJEMNA: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -File D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close\scripts\codex-task-close.ps1 -Slug synthetic
+main: ROZJAZD
+config: ZGODNE
+hooks: ZGODNE
+D:\codex\worktrees\mannaz\srodowisko-20261006\tmp\codex\test-close\scripts\codex-task-close.ps1 : Baseline ROZJAZD: nie
+ wolno scalac bez wyjasnienia.
+    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
+    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,codex-task-close.ps1
+ 
+
+negativeCloseExit=1
+
+```
+Usuniete linie: zbior unikalnych tresci, sortowanie PowerShell, UTF-8 bez BOM, LF po kazdej linii. SHA256:
+3FB5FF1BEABBEE96B85AA8554EC1EC600713C3083BB7427F7D480C80C4DC7AE1
+```text
+        main = ($before.main -ceq $current.main)
+- Z7: odmowa narzedzia lub sandboxa = STOP i zgloszenie, bez ponawiania.
+inne nieplanowane odmowy nadal oznaczaja STOP bez ponawiania.
+odmowa narzedzia, konflikt z regulami repo: STOP i raport do ownera.
+odmowa narzedzia/sandboxa (bez ponawiania); konflikt z regulami repo;
+Odmowa packed-refs.lock w tym wdrozeniu to wynik pomiaru na mocy ZG2;
+plikow sandboxa w tmp/codex/. Zapisz surowy wynik, nie ponawiaj; inne odmowy = STOP.
+Wyjatki od STOP po odmowie wymagaja jawnego zapisu w pakiecie. W tym wdrozeniu
+ZG2 obejmuje zaplanowane kontrole ujemne D-K1/D-K2 oraz odmowy odczytu/usuniecia
+```
+
+### Commit poprawek - zastosowanie stalej reguly packed-refs.lock
+
+Jeden nowy commit na codex/srodowisko-20261006 z trailerem D11.
+Uruchomienie przez codex-mannaz srodowisko-20261006; tylko w procesie
+testowym wrapper codex kieruje do exec --ephemeral, zachowujac wszystkie
+argumenty i zmienne oryginalnej funkcji. $PROFILE bez edycji w tej rundzie.
+Surowy wynik commita i git log -1 --oneline ponizej potwierdzaja nowy commit.
+Packed-refs.lock przy kodzie 0 nie jest STOP; inne odmowy pozostaja STOP.
+Ten wynik zapisuje finalny amend NIEPUSHOWANEGO commita, wiec SHA kontrolnego
+commita jest przejsciowy; finalne SHA w statusie. Historia ma jeden nowy commit.
+Kontrole rundy: dwa parsery i cztery uruchomienia close = 6/6; ASCII dodatkowo.
+Raport tylko dopisany, potwierdzone diff --numstat: 122 dodane, 0 usunietych
+linii przed tym dopiskiem (warstwa diff Git, normalizacja EOL zgodnie z Git).
+Push za osobna zgoda: git push origin codex/srodowisko-20261006, bez -u.
+
+```text
+"D:\\tools\\pwsh7\\pwsh.exe" -Command 'git commit --file tmp/codex/review-message.txt'
+error: Unable to create 'C:/Users/MariuszBrysik/projects/Mannaz/.git/packed-refs.lock': Permission denied
+[codex/srodowisko-20261006 e1442ba] Poprawki po recenzji CC: baseline main i reguly Codexa
+ 4 files changed, 149 insertions(+), 9 deletions(-)
+
+exit=0
+```
+
+```text
+"D:\\tools\\pwsh7\\pwsh.exe" -Command 'git log -1 --oneline'
+e1442ba Poprawki po recenzji CC: baseline main i reguly Codexa
+
+exit=0
+```

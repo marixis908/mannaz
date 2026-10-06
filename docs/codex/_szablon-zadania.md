@@ -43,7 +43,8 @@ Przed pomiarem mogacym dac zero wykonaj dodatnia kontrolke tego samego typu.
 ## Warunki STOP
 
 Plik spoza listy dozwolonej; potrzeba danych/bazy; zmiana zaleznosci;
-odmowa narzedzia/sandboxa (bez ponawiania); konflikt z regulami repo;
+odmowa narzedzia/sandboxa poza stala regula packed-refs.lock z AGENTS.md
+(bez ponawiania); konflikt z regulami repo;
 przekroczenie limitu czasu. Zglos ownerowi, nie rozszerzaj zakresu.
 
 ## Limit czasu
@@ -54,6 +55,7 @@ przekroczenie limitu czasu. Zglos ownerowi, nie rozszerzaj zakresu.
 
 Commit tylko na codex/<slug>. Trailer z D11.
 Push domyslnie NIE; wymaga zgody ownera na pojedyncza komende.
+Komenda: git push origin codex/<slug>, bez -u (zmienia .git/config).
 Bez main, merge, PR, force-push i usuwania galezi zdalnych.
 
 ## Format raportu
