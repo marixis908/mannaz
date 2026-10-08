@@ -25,6 +25,30 @@ oznacza STOP i raport. Nie zmieniaj globalnego D:\codex\AGENTS.md.
   Pakiet: tmp/codex/<slug>.md; raport: tmp/codex/<slug>-raport.md.
 - Polski w dokumentach roboczych; pliki dla agentow i skrypty ASCII.
 
+## Recenzja - tylko na jawne zlecenie
+
+Domyslnie Codex w Mannaz wykonuje zadania (tryb niezalezny wyzej).
+Recenzje robi tylko, gdy pakiet ja jawnie zleca i podaje delte (commit lub
+galaz) oraz pytanie. CC zleca recenzje tylko, gdy wynik moze zmienic kod lub
+decyzje: zmiana w src/, sql/, scripts/ lub tests/ przed merge do main albo
+brief przed wykonaniem. Bez recenzji: docs/backlog.md, dzienniki, raporty
+i dokumenty bez zmiany zachowania kodu (decyzje.md, 2026-10-08).
+
+- Tylko odczyt kodu: bez zmian plikow poza raportem recenzji i pytest-temp,
+  bez commitow i push. Wolno testy czyste (D5).
+- Nigdy wlasnej galezi codex/<slug> (zasada "Nie recenzuj wlasnej pracy").
+- MAJOR tylko z realna sciezka: wejscie -> plik:linia -> skutek, gdzie skutek
+  to bledny kapital, ryzyko lub stop bez DATA FAILURE, pozycja wypadajaca po
+  cichu (decyzje.md, 2026-09-27) albo naruszenie R1-R9.
+- Inny skutek albo brak sciezki: najwyzej MINOR, bez sciezki z "[bez sciezki]".
+- Kazde znalezisko niesie minimalna poprawke; bez poprawki nie zglaszaj.
+- Bez nowych warstw, testow i przypiec bez MAJOR, ktory usuwaja.
+- Nie zglaszaj pozycji z docs/backlog.md, chyba ze zmiana pogarsza skutek.
+- Brak MAJOR jest poprawnym wynikiem. MINOR najwyzej 5; styl pomijaj.
+- Druga runda tylko po poprawce MAJOR i tylko na tej poprawce.
+- Raport: tmp/codex/<slug>-recenzja.md: ZAKRES, MAJOR, MINOR, GRANICA
+  (sprawdzone / zalozone / niesprawdzone), WERDYKT approve/odrzucenie.
+
 ## Reguly projektu - identyfikatory i zrodla
 
 - R1: README.md; docs/decyzje.md, 2026-09-25, dane poza gitem; zakaz git add -f.
