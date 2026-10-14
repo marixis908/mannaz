@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.16 · 2026-10-14**
+**Rewizja 4.17 · 2026-10-14**
 
 ---
 
@@ -40,7 +40,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.13 | 2026-10-04 | §9.6: konwencja „raw” w yfinance (`*_split_adj` = stan u dostawcy w chwili pobrania, `*_raw` ze zdarzeń w `corporate_events`, detektor z ilorazu, ryzyko w warstwie `*_split_adj`); M67: rewizja dostawcy — definicja, zapis do `ingest_errors` (`provider_revision`), sekcje raportu cyklu, bez zatrzymania cyklu (B-05, brief CC-B05) |
 | 4.14 | 2026-10-05 | §4.1 T46: świeca dzienna zapisywana dopiero po zamknięciu sesji jej giełdy + 30 min; bez kalendarza i gdy kalendarza nie da się zastosować — reguła daty; świeca sesji niezamkniętej nie jest błędem danych (B-48, brief CC-B48) |
 | 4.15 | 2026-10-05 | §19.3: zapadka „nigdy w dół” z §19.1 obejmuje stop efektywny w okresie posiadania (najwyższy 2N od początku zapadki), sygnał „Dokupienia poniżej stopu” w raporcie cyklu, kontrakty poza zakresem sygnału (B-52, wariant A, brief CC-B52 rew. 3) |
-| **4.16** | **2026-10-14** | **M85 doprecyzowanie: jedna wycena z NAV, tożsamość dzienna bez korekty, składnik transakcje dnia, koszty przy emitencie, gotówka i KONTRAKTOWY w atrybucji (decyzja ownera 2026-10-14, brief CC-B38A)** |
+| 4.16 | 2026-10-14 | M85 doprecyzowanie: jedna wycena z NAV, tożsamość dzienna bez korekty, składnik transakcje dnia, koszty przy emitencie, gotówka i KONTRAKTOWY w atrybucji (decyzja ownera 2026-10-14, brief CC-B38A) |
+| **4.17** | **2026-10-14** | **T42 = 2026-09-30; M81 progi w `prices_daily` (instrument `is_benchmark`, cena = TR dla ETF akumulujących); M89 rejestr zdarzeń i naruszeń tylko do dopisywania (trigger), raport: nowe / zapisane / nieodtworzone; §8 dwie tabele i kolumna `is_benchmark` (decyzje ownera 2026-10-14, brief CC-B38B)** |
 
 ### 0.3 Oznaczenia
 
@@ -443,7 +444,7 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 
 | Tabela | Ziarno | Kluczowe pola | Zapis |
 |---|---|---|---|
-| `instruments` | instrument | ticker_local, isin, exchange (MIC), **currency**, archetype, base_ccy_reporting, first_listed | ręczny |
+| `instruments` | instrument | ticker_local, isin, exchange (MIC), **currency**, archetype, base_ccy_reporting, first_listed, **is_benchmark** (instrument progu M81, rew. 4.17) | ręczny |
 | `positions` | instrument × data | qty, **cost_basis z historii transakcji**, target_weight, weight_band, conviction_floor, thesis_id | ręczny/import |
 | `transactions` | zdarzenie | data, instrument, qty, cena, prowizja, **kurs FX z datą i typem fixingu** | ręczny/import |
 | `prices_daily` | instrument × data × źródło | open/high/low/close w dwóch warstwach (`*_raw`, `*_split_adj`), volume, **currency**, **adjustment_convention**, source, fetched_at | upsert (odświeżanie okna, M67) |
@@ -457,6 +458,8 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 | `thesis` | instrument | teza, 2–3 **kryteria falsyfikacji**, horyzont, benchmark zastępczy, data zapisu | ręczny |
 | `decisions` | zdarzenie | propozycja systemu, decyzja właściciela, **predykcja i pewność przed**, uzasadnienie, wynik po horyzoncie | ręczny |
 | `ingest_errors` | zdarzenie | źródło, instrument, typ błędu, treść, czy zdegradował stan | append |
+| `satellite_mandate_events` | rejestr × składnik × data × poziom | registry (1, 2), component (abs / rel_sp500 / rel_spyi), event_date, level (ostrzezenie / alert), dd_current, limit_value, data_status, first_seen_run_at, code_sha (M89, rew. 4.17) | append |
+| `satellite_mandate_violations` | rejestr × składnik × koniec okna | registry, component, window_start, window_end, max_dd, limit_value, data_status, first_seen_run_at, code_sha (M89, rew. 4.17) | append |
 | `run_log` | przebieg | started_at, duration_sec, host, code_version, pokrycie (n_ok/n_total), werdykt | append |
 
 ### 8.3 Indeksy i ograniczenia
@@ -465,6 +468,7 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 - `fundamentals`: unikalny `(instrument_id, period_end, filed_at, taxonomy)`
 - `fx_rates`: unikalny `(pair, date, fixing_id)`
 - `derived_metrics`: unikalny `(instrument_id, date, metric, code_version)`
+- `satellite_mandate_events`: unikalny `(registry, component, event_date, level)`; `satellite_mandate_violations`: unikalny `(registry, component, window_end)`; na obu trigger `BEFORE UPDATE OR DELETE` z `RAISE EXCEPTION` (rew. 4.17)
 - Trigger `BEFORE UPDATE OR DELETE` z `RAISE EXCEPTION` na wszystkich tabelach append-only
 - Migracje przez Alembic, nigdy ręcznie
 
@@ -1137,7 +1141,7 @@ Klasyfikacja operacji względem granicy satelity:
 1. **S&P 500 total return** — akumulujący UCITS ETF iShares Core S&P 500, ISIN `IE00B5BMR087`; kontrolka drugiego źródła: indeks S&P 500 Total Return (brutto). Oczekiwana różnica to mały, systematyczny ujemny dryf ETF (TER, podatek u źródła na poziomie funduszu); skok jest błędem danych.
 2. **SPYI** — SPDR MSCI ACWI IMI UCITS ETF (Acc), ISIN `IE00B3YLTY66`; wyłącznie SPYI, nie miks rdzenia (O-49).
 
-Oba progi przeliczane na PLN po kursie NBP A z dnia D (M1) i pobierane z tego samego miejsca notowania, wybranego pomiarem kompletności historii. Identyfikacja łańcuchem ISIN → MIC → waluta → symbol dostawcy → kontrolka ceny i zdarzeń korporacyjnych. Ticker bez sufiksu nie jest identyfikatorem: `SPYI` w USA to inny ETF (NEOS).
+Oba progi przeliczane na PLN po kursie NBP A z dnia D (M1) i pobierane z tego samego miejsca notowania, wybranego pomiarem kompletności historii. Identyfikacja łańcuchem ISIN → MIC → waluta → symbol dostawcy → kontrolka ceny i zdarzeń korporacyjnych. Ticker bez sufiksu nie jest identyfikatorem: `SPYI` w USA to inny ETF (NEOS). Ceny obu progów cykl zapisuje w `prices_daily` (S&P 500 jako instrument z `is_benchmark`, SPYI jako instrument rdzenia), a satelita czyta je tą samą ścieżką ceny co pozycje (`close_split_adj`, warstwa `*_split_adj` ciągła po splitach, T27; czynnik warstwy przelicza ilość pozycji, nie cenę progu); dla ETF akumulujących ta cena jest total return, bo fundusz nie wypłaca dystrybucji (rew. 4.17).
 
 Benchmark diagnostyczny: model ekspozycji zbudowany z benchmarków zastępczych M57, z kontraktami ze znakiem i nominałem. Wynik względem niego to „reszta względem modelu ekspozycji”, nie „selekcja”.
 
@@ -1204,13 +1208,15 @@ Limity rozstrzygają o statusie mandatu, nie zatrzymują straty; stratę ogranic
 - Ostrzeżenie przy przejściu przez 75% limitu, alert przy przejściu przez 100% (T44). Ostrzeżenie nie blokuje eskalacji do alertu. Po komunikacie danego poziomu jego ponawianie jest wstrzymane do zejścia obsunięcia bieżącego poniżej 50% limitu; stan naruszenia pozostaje widoczny w raporcie. Nowe naruszenie innego składnika zawsze generuje alert.
 - Zmiana L_max, L_rel lub T44 obowiązuje od daty decyzji, z uzasadnieniem w dzienniku decyzji; nie zmienia historycznych statusów. Zmierzona beta satelity sama w sobie nie jest podstawą podniesienia limitu.
 
+**Zapis (rew. 4.17).** Etap satelity w cyklu (po etapie ryzyka, na D cyklu) przelicza zdarzenia alertów i naruszenia z pełnej serii dla rejestru 1 i 2 i dopisuje je do `satellite_mandate_events` i `satellite_mandate_violations` (`INSERT … ON CONFLICT DO NOTHING`); UPDATE i DELETE odrzuca w bazie trigger. Wiersz zapisany raz zostaje, także gdy przeliczenie po rewizji danych go nie odtwarza. Raport cyklu rozróżnia zdarzenia nowe w przebiegu, zapisane wcześniej (licznik) i zapisane, nieodtworzone w bieżącym przeliczeniu (lista); pierwszy przebieg oznacza zasilenie początkowe liczbą zdarzeń i naruszeń. Zapis następuje także przy danych niezweryfikowanych, ze statusem danych w wierszu. Naruszenia zapisuje się dla okien kończących się w tygodniach ISO zakończonych przed tygodniem D; tydzień D raport pokazuje jako bieżący, a zapis następuje w kolejnym cyklu. Zdarzenia alertów zapisuje się wszystkie.
+
 **T39.** Tolerancja uzgodnienia M78: ≤ 0,01% wartości rachunku na datę migawki. [S]
 
 **T40.** Remis w M83: |ΔW| ≤ 0,5% × `V_a`. [S] Do kalibracji po pierwszym pomiarze rejestru 1.
 
 **T41.** L_max = 35% — maksymalne dopuszczalne obsunięcie indeksu TWR satelity (decyzja ownera 2026-10-02); kwota w PLN wobec NAV z dnia zapisu wyłącznie informacyjnie. Wartość jest tolerancją ownera, nie wynikiem kalibracji. Kontekst scenariuszowy [S]: przy obsunięciu S&P 500 TR w PLN o 22,29% (2025-01-17 → 2025-04-09, pomiar CC-OS) satelita o becie β traci w przybliżeniu β·D; limit 35% odpowiada spadkowi rynku o 26,9% przy β = 1,3 i o 23,3% przy β = 1,5. Heat (§19.2) i L_max są niezależnymi ograniczeniami.
 
-**T42.** Data startu rejestru 2 — wpisywana po pierwszym pełnym cyklu tygodniowym po rewizji 4.8.
+**T42.** Data startu rejestru 2 — wpisywana po pierwszym pełnym cyklu tygodniowym po rewizji 4.8. **Wpisana: 2026-09-30 (cykl uruchomiony 2026-10-04 11:56, raport cykl-2026-09-30_1156.md).**
 
 **T43.** L_rel = 20% — maksymalne dopuszczalne obsunięcie indeksu względnego `Q_j` (M88), osobno wobec S&P 500 i SPYI (decyzja ownera 2026-10-02). Kontekst scenariuszowy [S]: obsunięcie względne z samej bety wynosi `(β−1)·D/(1−D)` — 8,6% przy β = 1,3 i 14,4% przy β = 1,5 dla D = 22,29%; między samymi progami w oknie pomiaru CC-OS: 8,39% (S&P 500 / SPYI) i 7,40% (SPYI / S&P 500).
 
