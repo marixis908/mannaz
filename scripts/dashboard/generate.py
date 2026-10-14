@@ -688,7 +688,7 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
                 "attrs_without_history_note": "atrybuty instrumentów (np. theme) są BIEŻĄCE, bez historii (B-20)",
             },
             "static_notes": {
-                "wynik_b": "wymaga lotów FIFO z datą i ceną wejścia (fifo.positions_as_of zwraca tylko agregat)",
+                "wynik_b": "loty FIFO dostępne w `PositionResult.lots`; wynik B w dashboardzie nie wdrożony",
                 "broker_pl": "migawka brokera: czeka na ownera (B-16)",
                 "value": "VALUE: §16.1 (archetyp + peer/reverse DCF) — silnik stanów niezbudowany",
                 "quality": "QUALITY: §16.2 — silnik stanów niezbudowany",

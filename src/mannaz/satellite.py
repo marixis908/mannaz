@@ -24,7 +24,7 @@ import csv
 import json
 import math
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
@@ -179,6 +179,22 @@ class PositionInput:
     quote_fx: float | None  # kurs waluty notowania -> PLN
     settle_fx: float | None  # kurs waluty rozliczenia -> PLN
     is_core: bool = False
+    instrument_id: int | None = None  # B-38a: klucz skladnikow atrybucji
+    quote_currency: str | None = None
+
+
+@dataclass
+class PositionValue:
+    """B-38a (H1): skladniki wyceny pozycji satelity zwrocone przez `nav_for_day`
+    (ta sama wycena co NAV; atrybucja nie wycenia drugi raz)."""
+
+    value_pln: float
+    price: float  # cena Valuer z pence
+    quote_fx: float  # kurs waluty notowania -> PLN
+    quote_currency: str | None
+    status: str  # ok | stale | model
+    ticker: str
+    instrument_id: int | None
 
 
 @dataclass
@@ -199,6 +215,9 @@ class NavResult:
     rates: dict[str, float] = field(default_factory=dict)  # waluta -> kurs PLN uzyty w dniu
     model_value_pln: float = 0.0  # T45: czesc NAV z wyceny modelowej (pozycje satelity)
     model_tickers: list[str] = field(default_factory=list)
+    # B-38a: skladniki per pozycja satelity: (grupa, instrument_id|ticker, waluta rozliczenia) -> PositionValue
+    position_values: dict[tuple[str, Any, str], PositionValue] = field(default_factory=dict)
+    kontraktowy_pln: float | None = None  # wartosc KONTRAKTOWY uzyta w NAV (gdy uzyta)
 
     @property
     def model_share(self) -> float | None:
@@ -281,6 +300,8 @@ def nav_for_day(
     partial = 0.0
     model_pln = 0.0
     model_tickers: list[str] = []
+    pos_values: dict[tuple[str, Any, str], PositionValue] = {}
+    kon_used: float | None = None
 
     for p in positions:
         key = (account_group(p.rachunek), p.currency)
@@ -305,6 +326,14 @@ def nav_for_day(
             model_pln += value_pln
             model_tickers.append(p.ticker)
         by_pln[key] = by_pln.get(key, 0.0) + value_pln
+        pv_key = (key[0], p.instrument_id if p.instrument_id is not None else p.ticker, p.currency)
+        prev_pv = pos_values.get(pv_key)
+        if prev_pv is None:
+            pos_values[pv_key] = PositionValue(
+                value_pln, p.price, p.quote_fx, p.quote_currency, p.price_status, p.ticker, p.instrument_id
+            )
+        else:
+            prev_pv.value_pln += value_pln
         if native is not None:
             by_native[key] = by_native.get(key, 0.0) + native
             pos_native[key] = pos_native.get(key, 0.0) + native
@@ -330,6 +359,7 @@ def nav_for_day(
         by_pln[key] = by_pln.get(key, 0.0) + kontraktowy_pln
         by_native[key] = by_native.get(key, 0.0) + kontraktowy_pln
         cash_native[key] = cash_native.get(key, 0.0) + kontraktowy_pln
+        kon_used = kontraktowy_pln
         partial += kontraktowy_pln
 
     complete = not missing
@@ -349,6 +379,8 @@ def nav_for_day(
         rates=rates,
         model_value_pln=model_pln,
         model_tickers=sorted(model_tickers),
+        position_values=pos_values,
+        kontraktowy_pln=kon_used,
     )
 
 
@@ -1177,6 +1209,8 @@ class Valuer:
             quote_fx=fx_on(self.inp.fx, qcur, d),
             settle_fx=fx_on(self.inp.fx, pos["currency"], d),
             is_core=info.is_core,
+            instrument_id=iid,
+            quote_currency=qcur,
         )
 
     def noncash_value(self, row: TxRow) -> float | None:
@@ -1555,6 +1589,641 @@ def analyze_series(
 
 
 # ---------------------------------------------------------------------------
+# (B3) Atrybucja M85 (B-38a) — czysta, na gotowych NavResult/Inputs
+# ---------------------------------------------------------------------------
+
+ATTRIB_DAILY_TOL = 0.01  # decyzja 4: |roznica dzienna| > 0,01 PLN -> naruszenie
+ATTRIB_CUM_TOL = 1.00  # decyzja 4: |roznica skumulowana| > 1,00 PLN -> naruszenie
+ATTRIB_FEE_ROW_TYPES = ("oplata_rachunek", "oplata_prowadzenie_rachunku", "oplata_przechowanie")
+ATTRIB_CROSS = (("by_account", "account"), ("by_emitent", "emitent"), ("by_currency", "currency"))
+ATTRIB_POSITIONAL_KINDS = ("pozycja", "kontrakt")
+ATTRIB_CONVENTIONS = (
+    "PLN; wycena = NAV (nav_for_day/Valuer); FX = NBP A <= D; wiersze w walucie rozliczenia po NBP A "
+    "z daty wiersza; lokalny zawiera transakcje_dnia"
+)
+
+
+class _DayIncomplete(Exception):
+    """Brak skladnika dnia (kurs, cena) — atrybucja dnia = None."""
+
+
+@dataclass
+class AttribLine:
+    """Atomowa linia atrybucji jednego dnia (PLN). `total` = lokalny + fx;
+    `lokalny` zawiera `transakcje_dnia`."""
+
+    kind: str  # pozycja | kontrakt | gotowka | oplaty | koszty_nieprzypisane | przelew | kontraktowy_nierozbite
+    account: str  # grupa rachunku
+    emitent: str  # etykieta
+    emitent_key: Any
+    currency: str
+    total: float = 0.0
+    lokalny: float = 0.0
+    fx: float = 0.0
+    transakcje_dnia: float = 0.0
+    model: bool = False
+    n_rows: int = 0
+    instrument: str | None = None
+    kontrakt_bez_bazy: bool = False  # A1: future bez base_symbol / bez bazy w instrumentach
+
+
+def build_yahoo_map(instruments: dict[int, InstrumentInfo]) -> dict[str, int]:
+    """yahoo_symbol -> id instrumentu (pierwszy id w kolejnosci rosnacej przy duplikatach)."""
+    out: dict[str, int] = {}
+    for iid in sorted(instruments):
+        ys = instruments[iid].yahoo_symbol
+        if ys and ys not in out:
+            out[ys] = iid
+    return out
+
+
+def emitent_key_for(
+    iid: int, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]
+) -> tuple[Any, str]:
+    """(klucz, etykieta) emitenta wg reguly name_key z risk §19.2: equity/etf —
+    wlasny id; future — id instrumentu o yahoo_symbol == base_symbol kontraktu;
+    brak bazy -> wlasny id i etykieta = ticker serii (flaga: `is_future_no_base`)."""
+    info = instruments.get(iid)
+    if info is None:
+        return iid, f"instrument {iid}"
+    if info.instrument_type == "future":
+        base_id = yahoo_map.get(info.base_symbol) if info.base_symbol else None
+        if base_id is None or base_id not in instruments:
+            return iid, info.ticker
+        return base_id, instruments[base_id].ticker
+    return iid, info.ticker
+
+
+def is_future_no_base(iid: Any, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]) -> bool:
+    """A1: future bez base_symbol albo z baza nieznaleziona w instrumentach."""
+    info = instruments.get(iid) if isinstance(iid, int) else None
+    if info is None or info.instrument_type != "future":
+        return False
+    base_id = yahoo_map.get(info.base_symbol) if info.base_symbol else None
+    return base_id is None or base_id not in instruments
+
+
+def _emitent_of(key_id: Any, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]) -> tuple[Any, str]:
+    if isinstance(key_id, int):
+        return emitent_key_for(key_id, instruments, yahoo_map)
+    return key_id, str(key_id)
+
+
+def _acc(d: dict[Any, list[float]], key: Any, val: float, n: int = 0) -> None:
+    cell = d.setdefault(key, [0.0, 0])
+    cell[0] += val
+    cell[1] += n
+
+
+def attribute_day(
+    nav_p: NavResult,
+    nav_d: NavResult,
+    rows: Sequence[TxRow],
+    kon_rows: Sequence[dict[str, Any]],
+    fx_fn: FxFn,
+    noncash_value: NonCashValueFn,
+    instruments: dict[int, InstrumentInfo],
+    yahoo_map: dict[str, int],
+) -> list[AttribLine] | None:
+    """Atomowe linie atrybucji dnia d wzgledem p (czysta). `rows`: wiersze
+    transakcji z (p, d]; `kon_rows`: wiersze KONTRAKTOWY z (p, d]. Linie liczone
+    niezaleznie z pozycji/gotowki/wierszy; tozsamosc to kontrola, nie plug.
+    None, gdy NAV(p)/NAV(d) = None, brak kursu/ceny albo nieznany row_type."""
+    if nav_p.value is None or nav_d.value is None:
+        return None
+    try:
+        return _attribute_day(nav_p, nav_d, rows, kon_rows, fx_fn, noncash_value, instruments, yahoo_map)
+    except (_DayIncomplete, ValueError):  # UnknownRowTypeError jest ValueError
+        return None
+
+
+def _attribute_day(
+    nav_p: NavResult,
+    nav_d: NavResult,
+    rows: Sequence[TxRow],
+    kon_rows: Sequence[dict[str, Any]],
+    fx_fn: FxFn,
+    noncash_value: NonCashValueFn,
+    instruments: dict[int, InstrumentInfo],
+    yahoo_map: dict[str, int],
+) -> list[AttribLine]:
+    non_cash_types = _risk.NON_CASH_ROW_TYPES
+    pos_flow: dict[tuple[str, Any, str], float] = {}
+    pos_hit: set[tuple[str, Any, str]] = set()
+    cash_rows: dict[tuple[str, str], float] = {}
+    other: dict[tuple[str, str, str], list[float]] = {}
+
+    for r in rows:
+        grp = account_group(r.rachunek)
+        cls = classify(r.row_type, r.is_core)
+        if grp == KONTRAKTOWY_GROUP:
+            continue  # KONTRAKTOWY idzie przez `kon_rows`
+        non_cash = r.row_type in non_cash_types
+        x = 1.0
+        if not non_cash:
+            rate = fx_fn(r.currency, r.date)
+            if rate is None:
+                raise _DayIncomplete(f"brak FX {r.currency}")
+            x = rate
+            cash_rows[(grp, r.currency)] = cash_rows.get((grp, r.currency), 0.0) + r.amount * x
+        if cls == "zewnetrzny":
+            if r.row_type == "bilans_otwarcia" and not r.is_core and r.instrument_type != "future":
+                v = noncash_value(r)
+                if v is None or r.instrument_id is None:
+                    raise _DayIncomplete("bilans_otwarcia bez wartosci")
+                k = (grp, r.instrument_id, r.currency)
+                pos_flow[k] = pos_flow.get(k, 0.0) - v
+                pos_hit.add(k)
+            continue  # przeplyw zewnetrzny siedzi w F
+        val = 0.0 if non_cash else r.amount * x
+        if r.row_type == "przelew_wewnetrzny":
+            _acc(other, ("przelew", grp, r.currency), val)
+        elif r.row_type in ATTRIB_FEE_ROW_TYPES:
+            _acc(other, ("oplaty", grp, r.currency), val)
+        elif r.instrument_id is not None:
+            k = (grp, r.instrument_id, r.currency)
+            pos_flow[k] = pos_flow.get(k, 0.0) + val
+            pos_hit.add(k)
+        else:  # koszty bez instrumentu i wszystko niepokryte — nigdy po cichu
+            _acc(other, ("koszty_nieprzypisane", grp, r.currency), val, 1)
+
+    lines: list[AttribLine] = []
+
+    # --- pozycje ---
+    keys = set(nav_p.position_values) | set(nav_d.position_values) | pos_hit
+    for k in sorted(keys, key=lambda t: (t[0], str(t[1]), t[2])):
+        grp, kid, scur = k
+        pv_p = nav_p.position_values.get(k)
+        pv_d = nav_d.position_values.get(k)
+        v_p = pv_p.value_pln if pv_p else 0.0
+        v_d = pv_d.value_pln if pv_d else 0.0
+        w = v_d - v_p + pos_flow.get(k, 0.0)
+        c_lok = c_fx = 0.0
+        if pv_p is not None and pv_d is not None and pv_p.price and pv_p.quote_fx:
+            r_l = pv_d.price / pv_p.price - 1.0
+            r_fx = pv_d.quote_fx / pv_p.quote_fx - 1.0
+            c_lok = v_p * (r_l + 0.5 * r_l * r_fx)
+            c_fx = v_p * (r_fx + 0.5 * r_l * r_fx)
+        td = w - c_lok - c_fx
+        ekey, elabel = _emitent_of(kid, instruments, yahoo_map)
+        info = instruments.get(kid) if isinstance(kid, int) else None
+        pv = pv_d or pv_p
+        qcur = (pv.quote_currency if pv else None) or (info.quote_currency if info else None) or scur
+        ticker = pv.ticker if pv else (info.ticker if info else str(kid))
+        lines.append(AttribLine(
+            kind="pozycja", account=grp, emitent=elabel, emitent_key=ekey, currency=qcur,
+            total=w, lokalny=c_lok + td, fx=c_fx, transakcje_dnia=td,
+            model=bool((pv_p and pv_p.status == "model") or (pv_d and pv_d.status == "model")),
+            instrument=ticker, kontrakt_bez_bazy=is_future_no_base(kid, instruments, yahoo_map),
+        ))
+
+    # --- gotowka AKCYJNY/ZAGRANICZNY ---
+    cash_keys = {k for k in set(nav_p.cash_native) | set(nav_d.cash_native) if k[0] != KONTRAKTOWY_GROUP}
+    for g, c in sorted(cash_keys):
+        s_p = nav_p.cash_native.get((g, c), 0.0)
+        s_d = nav_d.cash_native.get((g, c), 0.0)
+        if c == "PLN":
+            x_p = x_d = 1.0
+        else:
+            x_p, x_d = nav_p.rates.get(c), nav_d.rates.get(c)
+            if (s_p != 0 and (x_p is None or x_d is None)) or (s_d != 0 and x_d is None):
+                raise _DayIncomplete(f"brak kursu {c}")
+        c_fx = s_p * (x_d - x_p) if s_p != 0 else 0.0
+        val_p = s_p * x_p if s_p != 0 else 0.0
+        val_d = s_d * x_d if s_d != 0 else 0.0
+        rest = val_d - val_p - c_fx - cash_rows.get((g, c), 0.0)
+        lines.append(AttribLine(
+            kind="gotowka", account=g, emitent=f"gotowka {g}/{c}", emitent_key=f"gotowka {g}/{c}",
+            currency=c, total=c_fx + rest, lokalny=rest, fx=c_fx, transakcje_dnia=0.0,
+        ))
+
+    # --- przelewy, oplaty, koszty nieprzypisane (satelita) ---
+    labels = {"przelew": "przelewy wewnetrzne"}
+    for (kind, g, c), (val, n) in sorted(other.items()):
+        label = labels.get(kind) or (f"oplaty {g}" if kind == "oplaty" else f"koszty nieprzypisane {g}")
+        lines.append(AttribLine(
+            kind=kind, account=g, emitent=label, emitent_key=label, currency=c,
+            total=val, lokalny=val, n_rows=int(n),
+        ))
+
+    # --- KONTRAKTOWY ---
+    if kon_rows:
+        by_ticker = {i.ticker: iid for iid, i in sorted(instruments.items(), reverse=True)}
+        kon_przelew = 0.0
+        kon_nierozbite = 0.0
+        kon_n_nierozbite = 0
+        kon_contract: dict[int, float] = {}
+        has_przelew = False
+        for row in kon_rows:
+            cls = classify(row["row_type"])
+            if cls == "zewnetrzny":
+                continue
+            c = float(_risk.kontraktowy_account_value([row], row["transaction_date"]))
+            if row["row_type"] == "przelew_wewnetrzny":
+                kon_przelew += c
+                has_przelew = True
+            else:
+                iid = by_ticker.get(row.get("broker_ticker")) if row.get("broker_ticker") else None
+                if iid is None:
+                    kon_nierozbite += c
+                    kon_n_nierozbite += 1
+                else:
+                    kon_contract[iid] = kon_contract.get(iid, 0.0) + c
+        if has_przelew:
+            lines.append(AttribLine(
+                kind="przelew", account=KONTRAKTOWY_GROUP, emitent="przelewy wewnetrzne",
+                emitent_key="przelewy wewnetrzne", currency="PLN", total=kon_przelew, lokalny=kon_przelew,
+            ))
+        for iid in sorted(kon_contract):
+            ekey, elabel = emitent_key_for(iid, instruments, yahoo_map)
+            val = kon_contract[iid]
+            lines.append(AttribLine(
+                kind="kontrakt", account=KONTRAKTOWY_GROUP, emitent=elabel, emitent_key=ekey, currency="PLN",
+                total=val, lokalny=val, instrument=instruments[iid].ticker,
+                kontrakt_bez_bazy=is_future_no_base(iid, instruments, yahoo_map),
+            ))
+        if kon_n_nierozbite:
+            lines.append(AttribLine(
+                kind="kontraktowy_nierozbite", account=KONTRAKTOWY_GROUP, emitent="KONTRAKTOWY (nierozbite)",
+                emitent_key="KONTRAKTOWY (nierozbite)", currency="PLN", total=kon_nierozbite,
+                lokalny=kon_nierozbite, n_rows=kon_n_nierozbite,
+            ))
+    return lines
+
+
+def identity_diff(
+    lines: Sequence[AttribLine] | None, nav_p_value: float | None, nav_d_value: float | None, flow: float | None
+) -> float | None:
+    """Kontrola tozsamosci dnia (bez pluga): sum(total linii) - (NAV(d) - NAV(p) - F).
+    None, gdy brak linii albo NAV/F niedostepne."""
+    if lines is None or nav_p_value is None or nav_d_value is None or flow is None:
+        return None
+    return sum(ln.total for ln in lines) - (nav_d_value - nav_p_value - flow)
+
+
+def _empty_cell() -> dict[str, Any]:
+    return {"total": 0.0, "lokalny": 0.0, "fx": 0.0, "transakcje_dnia": 0.0,
+            "model": False, "n_rows": 0, "positional": False, "bez_bazy": False}
+
+
+def _merge_cells(acc: dict[str, dict[str, Any]], agg: dict[str, dict[str, Any]]) -> None:
+    for k, v in agg.items():
+        a = acc.setdefault(k, _empty_cell())
+        for f in ("total", "lokalny", "fx", "transakcje_dnia", "n_rows"):
+            a[f] += v[f]
+        a["model"] = a["model"] or v["model"]
+        a["positional"] = a["positional"] or v["positional"]
+        a["bez_bazy"] = a["bez_bazy"] or v["bez_bazy"]
+
+
+def aggregate_lines(lines: Sequence[AttribLine], key: str) -> dict[str, dict[str, Any]]:
+    """Przekroj: suma linii po `key` in {account, emitent, currency}."""
+    if key not in ("account", "emitent", "currency"):
+        raise ValueError(key)
+    out: dict[str, dict[str, Any]] = {}
+    for ln in lines:
+        a = out.setdefault(getattr(ln, key), _empty_cell())
+        a["total"] += ln.total
+        a["lokalny"] += ln.lokalny
+        a["fx"] += ln.fx
+        a["transakcje_dnia"] += ln.transakcje_dnia
+        a["model"] = a["model"] or ln.model
+        a["n_rows"] += ln.n_rows
+        a["positional"] = a["positional"] or ln.kind in ATTRIB_POSITIONAL_KINDS
+        a["bez_bazy"] = a["bez_bazy"] or ln.kontrakt_bez_bazy
+    return out
+
+
+def kontraktowy_ext_int(kon_rows: Sequence[dict[str, Any]]) -> float:
+    """A2: suma wkladow wierszy KONTRAKTOWY klasy 'zewnetrzny' oraz przelew_wewnetrzny
+    (te nie sa w liniach kontraktowych), wg `risk.kontraktowy_account_value`."""
+    tot = 0.0
+    for row in kon_rows:
+        if classify(row["row_type"]) == "zewnetrzny" or row["row_type"] == "przelew_wewnetrzny":
+            tot += float(_risk.kontraktowy_account_value([row], row["transaction_date"]))
+    return tot
+
+
+def _line_nonzero(ln: AttribLine) -> bool:
+    return bool(ln.total or ln.lokalny or ln.fx or ln.transakcje_dnia)
+
+
+def _cross_rows(
+    cells: dict[str, dict[str, Any]], held_labels: set[str] | None = None
+) -> list[dict[str, Any]]:
+    rows = []
+    for k, v in cells.items():
+        row = {"key": k, "total": v["total"], "lokalny": v["lokalny"], "fx": v["fx"],
+               "transakcje_dnia": v["transakcje_dnia"], "model": v["model"], "n_rows": v["n_rows"]}
+        if held_labels is not None:
+            row["closed"] = bool(v["positional"] and k not in held_labels)
+            row["kontrakt_bez_bazy"] = bool(v["bez_bazy"])
+        rows.append(row)
+    rows.sort(key=lambda r: (-r["total"], r["key"]))
+    return rows
+
+
+def compute_attribution(
+    inp: Inputs,
+    daily: DailyResult,
+    axis: Sequence[date],
+    windows: dict[str, Any],
+    calendar_facts_fn: Callable[[str | None, date], Any] = _risk._default_calendar_facts,
+) -> dict[str, Any]:
+    """Atrybucja M85 na osi (czysta przy gotowych Inputs/DailyResult): linie
+    dzienne z tych samych okien wierszy (poprzedni dzien osi, D] co F, agregacja
+    do okien i przekrojow, kontrola tozsamosci (nie rzuca wyjatku — naruszenia
+    w `identity.*.violations`). Zwraca {'attribution': ..., 'attribution_daily': ...}."""
+    valuer = Valuer(inp, calendar_facts_fn)
+    yahoo_map = build_yahoo_map(inp.instruments)
+    fx_fn: FxFn = lambda c, d: fx_on(inp.fx, c, d)  # noqa: E731
+    rows = inp.tx_rows
+    row_dates = [r.date for r in rows]
+    kon = sorted(inp.kontraktowy_rows, key=lambda r: r["transaction_date"])
+    kon_dates = [r["transaction_date"] for r in kon]
+
+    day_lines: dict[date, list[AttribLine] | None] = {}
+    day_expected: dict[date, float | None] = {}
+    day_cells: dict[date, dict[str, dict[str, dict[str, Any]]]] = {}
+    diffs: dict[str, dict[date, float]] = {name: {} for name, _ in ATTRIB_CROSS}
+    kdiffs: dict[date, float] = {}
+    daily_out: list[dict[str, Any]] = []
+    n_none = 0
+    for i in range(1, len(axis)):
+        p, d = axis[i - 1], axis[i]
+        nav_p, nav_d = daily.navs[p], daily.navs[d]
+        f = daily.flows[d]
+        expected = (nav_d.value - nav_p.value - f) if (
+            nav_d.value is not None and nav_p.value is not None and f is not None) else None
+        lines: list[AttribLine] | None = None
+        if expected is not None:
+            lo, hi = bisect.bisect_right(row_dates, p), bisect.bisect_right(row_dates, d)
+            klo, khi = bisect.bisect_right(kon_dates, p), bisect.bisect_right(kon_dates, d)
+            lines = attribute_day(nav_p, nav_d, rows[lo:hi], kon[klo:khi], fx_fn, valuer.noncash_value,
+                                  inp.instruments, yahoo_map)
+        day_lines[d] = lines
+        day_expected[d] = expected
+        if lines is None:
+            n_none += 1
+            daily_out.append({"date": d.isoformat(), "nav_change_minus_flow": expected, "kontraktowy_diff": None, "lines": None})
+            continue
+        kon_diff: float | None = None
+        try:
+            k_lines = sum(ln.total for ln in lines if ln.account == KONTRAKTOWY_GROUP and ln.kind != "przelew")
+            k_exp = ((nav_d.kontraktowy_pln or 0.0) - (nav_p.kontraktowy_pln or 0.0)
+                     - kontraktowy_ext_int(kon[klo:khi]))
+            kon_diff = k_lines - k_exp
+            kdiffs[d] = kon_diff
+        except ValueError:
+            kon_diff = None
+        cells = {name: aggregate_lines(lines, key) for name, key in ATTRIB_CROSS}
+        day_cells[d] = cells
+        for name, _ in ATTRIB_CROSS:
+            diffs[name][d] = sum(v["total"] for v in cells[name].values()) - expected
+        daily_out.append({
+            "date": d.isoformat(),
+            "nav_change_minus_flow": expected,
+            "kontraktowy_diff": kon_diff,
+            "lines": [asdict(ln) for ln in lines if _line_nonzero(ln)],
+        })
+
+    identity: dict[str, Any] = {}
+    n_days = max(len(axis) - 1, 0)
+    for name, _ in ATTRIB_CROSS:
+        ds = diffs[name]
+        cum = 0.0
+        cum_max = 0.0
+        cum_first: date | None = None
+        for d in sorted(ds):
+            cum += ds[d]
+            cum_max = max(cum_max, abs(cum))
+            if cum_first is None and abs(cum) > ATTRIB_CUM_TOL:
+                cum_first = d
+        identity[name] = {
+            "max_abs_daily_diff": max((abs(v) for v in ds.values()), default=0.0),
+            "sum_daily_diff": sum(ds.values()),
+            "max_abs_cumulative_diff": cum_max,
+            "cumulative_violation_first_day": cum_first.isoformat() if cum_first else None,
+            "n_days": n_days,
+            "n_days_none": n_none,
+            "violations": [d.isoformat() for d in sorted(ds) if abs(ds[d]) > ATTRIB_DAILY_TOL],
+        }
+
+    identity["kontraktowy"] = {
+        "max_abs_daily_diff": max((abs(v) for v in kdiffs.values()), default=0.0),
+        "sum_daily_diff": sum(kdiffs.values()),
+        "n_days": len(kdiffs),
+        "violations": [d.isoformat() for d in sorted(kdiffs) if abs(kdiffs[d]) > ATTRIB_DAILY_TOL],
+    }
+
+    axis_idx = {d: i for i, d in enumerate(axis)}
+    win_out: dict[str, Any] = {}
+    for wname, w in windows.items():
+        a, t = axis_idx[date.fromisoformat(w["from"])], axis_idx[date.fromisoformat(w["to"])]
+        days = [axis[j] for j in range(a + 1, t + 1)]
+        acc: dict[str, dict[str, dict[str, Any]]] = {name: {} for name, _ in ATTRIB_CROSS}
+        none_days = [d for d in days if day_lines.get(d) is None]
+        bez_bazy: dict[Any, float] = {}
+        for d in days:
+            for ln in day_lines.get(d) or []:
+                if ln.kontrakt_bez_bazy and _line_nonzero(ln):
+                    bez_bazy[ln.emitent_key] = bez_bazy.get(ln.emitent_key, 0.0) + ln.total
+        for d in days:
+            if d in day_cells:
+                for name, _ in ATTRIB_CROSS:
+                    _merge_cells(acc[name], day_cells[d][name])
+        complete = not none_days
+        nav_a, nav_t = daily.navs[axis[a]].value, daily.navs[axis[t]].value
+        flows_w = [daily.flows[d] for d in days]
+        nav_change = (nav_t - nav_a - sum(flows_w)) if (
+            nav_a is not None and nav_t is not None and all(x is not None for x in flows_w)) else None
+        sum_lines = sum(v["total"] for v in acc["by_account"].values())
+        control: dict[str, Any] = {
+            "complete": complete,
+            "sum_lines": sum_lines,
+            "nav_change_minus_flows": nav_change,
+            "diff": (sum_lines - nav_change) if (complete and nav_change is not None) else None,
+            "n_days": len(days),
+            "n_days_none": len(none_days),
+            "cross": {},
+            "kontraktowy": {
+                "max_abs_daily_diff": max((abs(kdiffs[d]) for d in days if d in kdiffs), default=0.0),
+                "sum_daily_diff": sum(kdiffs[d] for d in days if d in kdiffs),
+            },
+        }
+        for name, _ in ATTRIB_CROSS:
+            wd = [diffs[name][d] for d in days if d in diffs[name]]
+            control["cross"][name] = {
+                "max_abs_daily_diff": max((abs(v) for v in wd), default=0.0),
+                "sum_daily_diff": sum(wd),
+            }
+        held = _held_emitents(daily.navs[axis[t]], inp.positions_by_day.get(axis[t], []), inp.instruments, yahoo_map)
+        win_out[wname] = {
+            "from": w["from"], "to": w["to"], "complete": complete, "control": control,
+            "kontrakty_bez_bazy": {"n_series": len(bez_bazy), "total_pln": sum(bez_bazy.values())},
+            "by_account": _cross_rows(acc["by_account"]),
+            "by_emitent": _cross_rows(acc["by_emitent"], held),
+            "by_currency": _cross_rows(acc["by_currency"]),
+        }
+    attribution = {"conventions": ATTRIB_CONVENTIONS, "identity": identity, "windows": win_out}
+    return {"attribution": attribution, "attribution_daily": daily_out}
+
+
+def _held_emitents(
+    nav: NavResult, positions: Sequence[dict[str, Any]], instruments: dict[int, InstrumentInfo],
+    yahoo_map: dict[str, int],
+) -> set[str]:
+    """Etykiety emitentow trzymanych na dzien NAV: pozycje z NAV + otwarte kontrakty."""
+    held: set[str] = set()
+    for (_, kid, _), _pv in nav.position_values.items():
+        held.add(_emitent_of(kid, instruments, yahoo_map)[1])
+    for pos in positions:
+        info = instruments.get(pos["instrument_id"])
+        if info is not None and info.instrument_type == "future" and pos.get("qty"):
+            held.add(emitent_key_for(pos["instrument_id"], instruments, yahoo_map)[1])
+    return held
+
+
+# ---------------------------------------------------------------------------
+# (B4) Ryzyko portfela M86 (B-38a) — jeden dzien T; loader tylko SELECT
+# ---------------------------------------------------------------------------
+
+M86_COLUMNS = (
+    "risk_date", "rachunek", "instrument_id", "settlement_currency", "qty", "close_d", "fx_rate", "risk_pln",
+    "risk_pct_satellite_capital", "name_key", "position_kind", "broker_ticker", "instrument_type", "is_core",
+    "multiplier", "theme",
+)
+
+
+def load_risk_snapshot(cur: Any, t: date) -> list[dict[str, Any]]:
+    """risk_daily z ostatniego risk_date <= t (tylko SELECT). `rachunek` jest od
+    razu sprowadzany do grupy (`account`); numer rachunku nie opuszcza funkcji."""
+    cur.execute(
+        "SELECT r.risk_date, r.rachunek, r.instrument_id, r.settlement_currency, r.qty, r.close_d, "
+        "r.fx_rate, r.risk_pln, r.risk_pct_satellite_capital, r.name_key, r.position_kind, "
+        "i.broker_ticker, i.instrument_type, i.is_core, i.multiplier, i.theme "
+        "FROM risk_daily r JOIN instruments i ON i.id = r.instrument_id "
+        "WHERE r.risk_date = (SELECT max(risk_date) FROM risk_daily WHERE risk_date <= %s)",
+        (t,),
+    )
+    out: list[dict[str, Any]] = []
+    for row in cur.fetchall():
+        rec = dict(zip(M86_COLUMNS, row))
+        rec["account"] = account_group(rec.pop("rachunek"))
+        out.append(rec)
+    return out
+
+
+def _share(x: float | None, nav: float | None) -> float | None:
+    return None if x is None or nav is None or nav <= 0 else x / nav
+
+
+def m86_snapshot(
+    rows: Sequence[dict[str, Any]],
+    nav_t: NavResult,
+    t: date,
+    instruments: dict[int, InstrumentInfo],
+    yahoo_map: dict[str, int],
+) -> dict[str, Any]:
+    """M86 na dzien T z gotowych wierszy risk_daily i NAV(T) (czysta, bez serii)."""
+    nav_val = nav_t.value
+    risk_date = rows[0]["risk_date"] if rows else None
+    elig = [r for r in rows if _risk.is_risk_budget_eligible(r["instrument_type"], bool(r["is_core"]))]
+    incomplete = sorted(r["broker_ticker"] for r in elig
+                        if r["risk_pct_satellite_capital"] is None or r["risk_pln"] is None)
+    heat_pct = None if incomplete else sum(float(r["risk_pct_satellite_capital"]) for r in elig)
+    heat_pln = None if incomplete else sum(float(r["risk_pln"]) for r in elig)
+    lim3 = float(_risk.LEVEL3_PCT)
+    heat = {
+        "heat_pct": heat_pct, "heat_pln": heat_pln, "limit_pct": lim3,
+        "breach": None if heat_pct is None else heat_pct > lim3,
+        "n_eligible": len(elig), "incomplete": incomplete,
+    }
+    lim2 = float(_risk.LEVEL2_PCT)
+    themes: dict[str, dict[str, Any]] = {}
+    no_theme: list[str] = []
+    for r in elig:
+        if not r["theme"]:
+            no_theme.append(r["broker_ticker"])
+            continue
+        th = themes.setdefault(r["theme"], {"pct": 0.0, "tickers": [], "incomplete": False})
+        if r["risk_pct_satellite_capital"] is None:
+            th["incomplete"] = True
+        else:
+            th["pct"] += float(r["risk_pct_satellite_capital"])
+        th["tickers"].append(r["broker_ticker"])
+    level2 = [
+        {"theme": k, "pct": v["pct"], "limit_pct": lim2, "breach": v["pct"] > lim2,
+         "incomplete": v["incomplete"], "tickers": sorted(v["tickers"])}
+        for k, v in sorted(themes.items())
+    ]
+    # kontrakty
+    nominal_missing: list[str] = []
+    nominals: list[float] = []
+    for r in rows:
+        if r["instrument_type"] != "future":
+            continue
+        if r["multiplier"] is None or r["qty"] is None or r["close_d"] is None or r["fx_rate"] is None:
+            nominal_missing.append(r["broker_ticker"])
+            continue
+        sign = -1.0 if r["position_kind"] == "short" else 1.0
+        nominals.append(sign * abs(float(r["qty"])) * float(r["close_d"]) * float(r["multiplier"]) * float(r["fx_rate"]))
+    if nominal_missing:
+        gross = net = None
+    else:
+        gross, net = sum(abs(x) for x in nominals), sum(nominals)
+    futures = {
+        "n": len(nominals) + len(nominal_missing), "nominal_gross_pln": gross, "nominal_net_pln": net,
+        "gross_share_nav": _share(gross, nav_val), "net_share_nav": _share(net, nav_val),
+        "missing_multiplier": sorted(nominal_missing),
+    }
+    # koncentracja z NAV(T)
+    by_em: dict[str, float] = {}
+    for (_, kid, _), pv in nav_t.position_values.items():
+        lab = _emitent_of(kid, instruments, yahoo_map)[1]
+        by_em[lab] = by_em.get(lab, 0.0) + pv.value_pln
+    total_long = sum(by_em.values())
+    weights = {k: v / total_long for k, v in by_em.items()} if total_long > 0 else {}
+    top5 = sorted(by_em.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    cash_pln = 0.0
+    cash_missing: list[str] = []
+    for (g, c), s in nav_t.cash_native.items():
+        if g == KONTRAKTOWY_GROUP:
+            continue
+        rate = nav_t.rates.get(c)
+        if rate is None:
+            if s != 0:
+                cash_missing.append(f"{g}/{c}")
+            continue
+        cash_pln += s * rate
+    concentration = {
+        "hhi": sum(w * w for w in weights.values()) if weights else None,
+        "top5": [{"emitent": k, "value_pln": v, "weight": weights.get(k)} for k, v in top5],
+        "n_emitents": len(by_em),
+        "long_equity_pln": total_long,
+        "cash_pln": cash_pln, "cash_share_nav": _share(cash_pln, nav_val), "cash_missing": sorted(cash_missing),
+        "kontraktowy_pln": nav_t.kontraktowy_pln, "kontraktowy_share_nav": _share(nav_t.kontraktowy_pln, nav_val),
+        "futures_net_share_nav": futures["net_share_nav"],
+    }
+    return {
+        "risk_date": risk_date.isoformat() if risk_date else None,
+        "T": t.isoformat(),
+        "dates_differ": risk_date is not None and risk_date != t,
+        "nav_t": nav_val,
+        "n_rows": len(rows),
+        "heat": heat,
+        "level2": level2,
+        "level2_no_theme": sorted(no_theme),
+        "futures": futures,
+        "kontraktowy_free_vs_deposit": {
+            "status": "brak pomiaru",
+            "reason": "wymagany depozyt KONTRAKTOWY nie jest zapisany w bazie (P4)",
+        },
+        "concentration": concentration,
+    }
+
+
+# ---------------------------------------------------------------------------
 # (C) run_satellite
 # ---------------------------------------------------------------------------
 
@@ -1643,6 +2312,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                      + (" — WYNIK WRAZLIWY NA WYCENE MODELOWA" if m.get("sensitive_to_model") else ""))
         v = win["verdict"]
         L.append(f"- werdykt wyniku: {v['label']} (znaki: {v['signs']}; dane zweryfikowane: {v['data_verified']})")
+    _render_attribution(L, report.get("attribution"))
     L.append("")
     L.append("## Alerty (obsuniecie biezace od S)")
     for comp, a in report.get("alerts", {}).items():
@@ -1650,7 +2320,90 @@ def render_markdown(report: dict[str, Any]) -> str:
         L.append(f"- {comp}: stan {a['state']}, obsuniecie biezace {_pct(a['current_drawdown'])} (limit {a['limit'] * 100:.0f}%); {ev}")
     L.append("")
     L.append(f"## Rejestr naruszen (okna 24 m., konce tygodni): {len(report.get('violation_registry', []))} okien z przekroczeniem")
+    _render_m86(L, report.get("m86"))
     return "\n".join(L) + "\n"
+
+
+def _attr_table(L: list[str], title: str, rows: Sequence[dict[str, Any]], with_flags: bool = False) -> None:
+    L.append(f"{title}")
+    L.append("")
+    L.append("| klucz | total | lokalny | fx | transakcje_dnia |" + (" flagi |" if with_flags else ""))
+    L.append("|---|---:|---:|---:|---:|" + ("---|" if with_flags else ""))
+    for r in rows:
+        flags = []
+        if r.get("model"):
+            flags.append("model")
+        if r.get("closed"):
+            flags.append("zamknieta")
+        if r.get("kontrakt_bez_bazy"):
+            flags.append("kontrakt_bez_bazy")
+        if r.get("n_rows"):
+            flags.append(f"n={r['n_rows']}")
+        L.append(f"| {r['key']} | {_num(r['total'])} | {_num(r['lokalny'])} | {_num(r['fx'])} | "
+                 f"{_num(r['transakcje_dnia'])} |" + (f" {', '.join(flags) or '-'} |" if with_flags else ""))
+    L.append("")
+
+
+def _render_attribution(L: list[str], att: dict[str, Any] | None) -> None:
+    if not att:
+        return
+    for name, w in att.get("windows", {}).items():
+        c = w["control"]
+        L.append("")
+        L.append(f"## Atrybucja M85 - okno {name}: {w['from']} .. {w['to']}")
+        L.append("")
+        L.append(f"- kompletne: {w['complete']} (dni None: {c['n_days_none']} z {c['n_days']}); {att.get('conventions', '')}")
+        max_d = max((v["max_abs_daily_diff"] for v in c["cross"].values()), default=None)
+        L.append(f"- suma linii = {_num(c['sum_lines'])} PLN; zmiana NAV minus przeplywy = {_num(c['nav_change_minus_flows'])} PLN; "
+                 f"roznica = {_num(c['diff'], 4)} PLN; max |roznica dzienna| = {_num(max_d, 4)} PLN; "
+                 f"kontrola KONTRAKTOWY max |roznica dzienna| = {_num(c['kontraktowy']['max_abs_daily_diff'], 4)} PLN; "
+                 f"kontrakty bez bazy: {w['kontrakty_bez_bazy']['n_series']} serii, {_num(w['kontrakty_bez_bazy']['total_pln'])} PLN")
+        L.append("")
+        em = w["by_emitent"]
+        _attr_table(L, "TOP10 emitentow (total):", em[:10], with_flags=True)
+        bottom = sorted(em, key=lambda r: (r["total"], r["key"]))[:10]
+        _attr_table(L, "BOTTOM10 emitentow (total):", bottom, with_flags=True)
+        _attr_table(L, "Wg rachunku:", w["by_account"])
+        _attr_table(L, "Wg waluty:", w["by_currency"])
+    ident = att.get("identity") or {}
+    viol = {k: v["violations"] for k, v in ident.items() if v.get("violations")}
+    if viol:
+        L.append("")
+        L.append("- UWAGA tozsamosc atrybucji: naruszenia dzienne w przekrojach "
+                 + "; ".join(f"{k}: {len(v)} dni (pierwszy {v[0]})" for k, v in viol.items()))
+
+
+def _render_m86(L: list[str], m: dict[str, Any] | None) -> None:
+    if not m:
+        return
+    L.append("")
+    L.append(f"## Ryzyko portfela M86 (dzien T = {m['T']})")
+    if m["dates_differ"]:
+        L.append(f"- UWAGA: risk_daily z dnia {m['risk_date']} != T {m['T']}")
+    else:
+        L.append(f"- risk_daily: {m['risk_date']}")
+    h = m["heat"]
+    L.append(f"- heat (poziom 3): {_num(h['heat_pct'])}% kapitalu satelity (limit {h['limit_pct']:.0f}%), "
+             f"{_num(h['heat_pln'])} PLN; naruszenie: {h['breach']}; pozycji: {h['n_eligible']}"
+             + (f"; niekompletne: {', '.join(h['incomplete'])}" if h["incomplete"] else ""))
+    for th in m["level2"]:
+        L.append(f"  - motyw {th['theme']}: {_num(th['pct'])}% (limit {th['limit_pct']:.0f}%), naruszenie: {th['breach']}; "
+                 f"{', '.join(th['tickers'])}")
+    if m["level2_no_theme"]:
+        L.append(f"  - bez motywu: {', '.join(m['level2_no_theme'])}")
+    f = m["futures"]
+    L.append(f"- kontrakty ({f['n']}): nominal brutto {_num(f['nominal_gross_pln'])} PLN ({_pct(f['gross_share_nav'])} NAV), "
+             f"netto {_num(f['nominal_net_pln'])} PLN ({_pct(f['net_share_nav'])} NAV)"
+             + (f"; brak mnoznika: {', '.join(f['missing_multiplier'])}" if f["missing_multiplier"] else ""))
+    fd = m["kontraktowy_free_vs_deposit"]
+    L.append(f"- wolne srodki vs depozyt KONTRAKTOWY: {fd['status']} ({fd['reason']})")
+    k = m["concentration"]
+    L.append(f"- koncentracja: HHI = {_num(k['hhi'], 4)}; emitentow: {k['n_emitents']}; akcje/ETF long = {_num(k['long_equity_pln'])} PLN")
+    for e in k["top5"]:
+        L.append(f"  - {e['emitent']}: {_num(e['value_pln'])} PLN ({_pct(e['weight'])})")
+    L.append(f"- gotowka AKCYJNY/ZAGRANICZNY: {_num(k['cash_pln'])} PLN ({_pct(k['cash_share_nav'])} NAV); "
+             f"KONTRAKTOWY: {_num(k['kontraktowy_pln'])} PLN ({_pct(k['kontraktowy_share_nav'])} NAV); "
+             f"netto kontrakty: {_pct(k['futures_net_share_nav'])} NAV")
 
 
 def run_satellite(
@@ -1789,7 +2542,16 @@ def run_satellite(
                 "Q_spyi": analysis["Q"].get("spyi", [None] * len(axis))[i],
             }
         )
+    # B-38a: atrybucja M85 (z tych samych NavResult/F co powyzej) i ryzyko M86 (SELECT risk_daily)
+    att = compute_attribution(inp, daily, axis, analysis["windows"])
+    report["attribution"] = att["attribution"]
+    if axis:
+        with conn.cursor() as cur:
+            risk_rows = load_risk_snapshot(cur, axis[-1])
+        report["m86"] = m86_snapshot(risk_rows, daily.navs[axis[-1]], axis[-1], inp.instruments,
+                                     build_yahoo_map(inp.instruments))
     payload = dict(report)
+    payload["attribution_daily"] = att["attribution_daily"]
     payload["series"] = series
     (out / "satellite.json").write_text(json.dumps(_clean(payload), ensure_ascii=False, indent=1), encoding="utf-8")
     (out / "satellite.md").write_text(render_markdown(report), encoding="utf-8")
