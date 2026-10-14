@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.15 · 2026-10-05**
+**Rewizja 4.16 · 2026-10-14**
 
 ---
 
@@ -39,7 +39,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.12 | 2026-10-04 | §19.4: kapitał satelity w budżetach ryzyka = NAV satelity z §21.6 (M78), z gotówką; NAV niepełny → brak przebiegu ryzyka dla D (B-17); §19 M77: domyślne D kompletne w cenach i w rozliczeniu KONTRAKTOWY (B-36), detektor zdarzeń korporacyjnych etapem cyklu z bramką DATA REVIEW (B-29); §14.1 pytanie 7: hosting, IaaS i rejestracja domen nie są oprogramowaniem (decyzje ownera 2026-10-04, brief CC-W2) |
 | 4.13 | 2026-10-04 | §9.6: konwencja „raw” w yfinance (`*_split_adj` = stan u dostawcy w chwili pobrania, `*_raw` ze zdarzeń w `corporate_events`, detektor z ilorazu, ryzyko w warstwie `*_split_adj`); M67: rewizja dostawcy — definicja, zapis do `ingest_errors` (`provider_revision`), sekcje raportu cyklu, bez zatrzymania cyklu (B-05, brief CC-B05) |
 | 4.14 | 2026-10-05 | §4.1 T46: świeca dzienna zapisywana dopiero po zamknięciu sesji jej giełdy + 30 min; bez kalendarza i gdy kalendarza nie da się zastosować — reguła daty; świeca sesji niezamkniętej nie jest błędem danych (B-48, brief CC-B48) |
-| **4.15** | **2026-10-05** | **§19.3: zapadka „nigdy w dół” z §19.1 obejmuje stop efektywny w okresie posiadania (najwyższy 2N od początku zapadki), sygnał „Dokupienia poniżej stopu” w raporcie cyklu, kontrakty poza zakresem sygnału (B-52, wariant A, brief CC-B52 rew. 3)** |
+| 4.15 | 2026-10-05 | §19.3: zapadka „nigdy w dół” z §19.1 obejmuje stop efektywny w okresie posiadania (najwyższy 2N od początku zapadki), sygnał „Dokupienia poniżej stopu” w raporcie cyklu, kontrakty poza zakresem sygnału (B-52, wariant A, brief CC-B52 rew. 3) |
+| **4.16** | **2026-10-14** | **M85 doprecyzowanie: jedna wycena z NAV, tożsamość dzienna bez korekty, składnik transakcje dnia, koszty przy emitencie, gotówka i KONTRAKTOWY w atrybucji (decyzja ownera 2026-10-14, brief CC-B38A)** |
 
 ### 0.3 Oznaczenia
 
@@ -1170,6 +1171,8 @@ c_lokalny = r_L + ½·r_L·r_FX        c_FX = r_FX + ½·r_L·r_FX
 ```
 
 Atrybucja obejmuje wszystkie pozycje utrzymywane w okresie, łącznie z zamkniętymi, agregowane per emitent (nazwa = emitent, §19.2). Koszty wchodzą raz. Przekroje rachunek, emitent i waluta osobno uzgadniają się do zmiany NAV po przepływach; między sobą się ich nie sumuje. M85 doprecyzowuje T24.
+
+**Doprecyzowanie (rew. 4.16).** Atrybucja używa dokładnie tych samych wartości pozycji, gotówki, kursów i wartości rachunku KONTRAKTOWY co NAV z M78; druga wycena jest niedopuszczalna. Dla każdego dnia osi d z poprzednim dniem osi p suma linii atrybucji równa się NAV(d) − NAV(p) − F(d); linii „reszta” nie ma, a dzień z brakującym NAV albo przepływem nie ma atrybucji i oznacza okno jako niepełne. Pozycja to (rachunek, instrument, waluta rozliczenia); jej wynik dnia to zmiana wartości w PLN plus kwoty jej wierszy z (p, d] w walucie rozliczenia po NBP A z daty wiersza — ta sama konwersja co w przepływie F. Instrumenty rdzenia są poza atrybucją, ich wiersze są przepływem zewnętrznym. Rozkład lokalny/FX liczy się na stanie z p: zwrot lokalny z ceny w walucie notowania, zwrot walutowy z kursu NBP A tej waluty (dla PLN zero). Reszta wyniku pozycji po obu składnikach — transakcje w dniu, dochody, koszty, wycena modelowa w dniu zmiany odcinka — to składnik „transakcje dnia”, raportowany osobno i doliczany do części lokalnej; pozycja otwarta w dniu d ma cały wynik w tym składniku. Prowizje transakcyjne, prowizje za wygaśnięcie i podatek od dywidendy wchodzą do wyniku emitenta, gdy wiersz da się przypisać do instrumentu; wynik emitenta jest netto. Opłaty rachunku i przechowania tworzą linię „opłaty” rachunku; koszt bez instrumentu i bez jednoznacznego dopasowania tworzy linię „koszty nieprzypisane” rachunku z liczbą wierszy. Gotówka rachunków AKCYJNY i ZAGRANICZNY per waluta ma składnik walutowy saldo(p) × kurs(p) × zwrot kursu; pozostała zmiana salda po odjęciu wierszy pozycji, przepływów zewnętrznych i przelewów wewnętrznych tworzy lokalną linię „gotówka”. Wynik rachunku KONTRAKTOWY to zmiana jego wartości minus przepływy zewnętrzne i przelewy wewnętrzne tego rachunku, w całości lokalny; rozbicie per kontrakt na emitenta bazowego (`name_key`, §19.2) tylko wtedy, gdy wiersze rachunku identyfikują kontrakt, w przeciwnym razie jedna linia „KONTRAKTOWY (nierozbite)”. Przekrój rachunek pokazuje przelewy wewnętrzne po obu stronach; w sumie się znoszą. Przekrój emitent grupuje po `name_key` (ta sama reguła co §19.2), z liniami opłat, gotówki i kosztów nieprzypisanych jako osobnymi pozycjami. Przekrój waluta grupuje po walucie notowania pozycji, gotówkę po walucie salda.
 
 **M86. Ryzyko portfela w raporcie.**
 
