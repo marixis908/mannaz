@@ -29,6 +29,7 @@ from mannaz.cycle import run_cycle
 from mannaz.fx import FxSummary
 from mannaz.prices import PricesSummary
 from mannaz.risk import RiskSummary
+from _satstub import satellite_stub
 
 _PROCESSED_HISTORY_FILES_DDL = """
 CREATE TABLE IF NOT EXISTS processed_history_files (
@@ -122,6 +123,7 @@ def _run_cycle_kwargs(tmp_path: Path, conn, **overrides):
         risk_fn=_stub_risk_fn(),
         check_ignored=lambda p: True,
         detect_corp_events_fn=lambda conn: CorpEventsClassification(),  # B-29: zero sieci w testach
+        satellite_fn=satellite_stub,  # B-38B: prawdziwy etap satelity trwa ok. 200 s i pisze do tabel M89
     )
     kwargs.update(overrides)
     return kwargs

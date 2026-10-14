@@ -40,6 +40,7 @@ from mannaz.import_history import (
 from mannaz.parse_history import ParsedFile, parse_source_file
 from mannaz.prices import PricesSummary, run_prices_fetch
 from mannaz.provenance import triggered_by
+from mannaz.satellite import SatelliteStageResult, persistence_summary_line, run_satellite_stage
 from mannaz.risk import (
     IncompleteRiskDateError,
     IncompleteRiskItem,
@@ -883,6 +884,7 @@ STAGE_FIFO = "fifo"
 STAGE_REGISTRATION = "rejestracja"
 STAGE_PRICES_FX = "ceny_fx"
 STAGE_RISK = "ryzyko"
+STAGE_SATELLITE = "satelita"
 
 STAGE_LABELS = {
     STAGE_IMPORT: "import",
@@ -891,6 +893,7 @@ STAGE_LABELS = {
     STAGE_REGISTRATION: "bramka rejestracji",
     STAGE_PRICES_FX: "ceny/FX",
     STAGE_RISK: "ryzyko",
+    STAGE_SATELLITE: "satelita (§21.6)",
 }
 
 
@@ -1166,6 +1169,11 @@ class ReportState:
     # przeliczenie D wobec zapisu poprzedniego.
     provider_revisions: list[ProviderRevision] = field(default_factory=list)
     risk_recompute: RiskRecomputeDiff | None = None
+
+    # Satelita (§21.6, B-38B): wynik etapu po ryzyku (`satellite.SatelliteStageResult`);
+    # None = etap nie wykonany (stop wcześniej albo błąd etapu — wtedy `satellite_error`).
+    satellite: SatelliteStageResult | None = None
+    satellite_error: bool = False
 
     # Zmiany pozycji
     position_changes: list[PositionChange] = field(default_factory=list)
@@ -1630,6 +1638,93 @@ def _render_heartbeat_section(state: ReportState) -> list[str]:
     return lines
 
 
+def _sat_pct(x: float | None) -> str:
+    return "n/d" if x is None else f"{x * 100:.2f}%"
+
+
+def _sat_num(x: float | None, nd: int = 2) -> str:
+    return "n/d" if x is None else f"{x:,.{nd}f}"
+
+
+def _render_satellite_registry(
+    lines: list[str],
+    title: str,
+    alerts: dict[str, Any],
+    windows: dict[str, Any],
+    verdict_note: str | None,
+    pers: dict[str, Any] | None,
+) -> None:
+    lines.append(f"### {title}")
+    if verdict_note:
+        lines.append(f"- werdykt M83: {verdict_note}")
+    for name, win in windows.items():
+        dws = "; ".join(
+            f"{b['label']}: {_sat_num(b['delta_w_pln'])} PLN" + (" [niewykonalny]" if b["infeasible"] else "")
+            for b in win["bench"].values()
+        )
+        m = win["mandate"]
+        comps = ", ".join(f"{k} {_sat_pct(v)}" for k, v in m["components"].items())
+        lines.append(
+            f"- okno {name} ({win['from']}..{win['to']}, kompletne: {win['complete']}): "
+            f"TWR {_sat_pct(win['twr'])}; dW {dws}"
+        )
+        lines.append(
+            f"  - mandat (M88): {m['status']}; naruszenia: {', '.join(m['violations']) or '-'}; "
+            f"obsuniecie maks. {comps}"
+        )
+        if verdict_note is None:
+            lines.append(f"  - werdykt wyniku: {win['verdict']['label']}")
+    if alerts:
+        lines.append(
+            "- stan alertu (M89), obsuniecie biezace / limit: "
+            + "; ".join(
+                f"{comp}: {a['state']}, {_sat_pct(a['current_drawdown'])} / {a['limit'] * 100:.0f}%"
+                for comp, a in alerts.items()
+            )
+        )
+    if pers is not None and not pers.get("absent"):
+        lines.append(f"- rejestr trwały: {persistence_summary_line(pers)}")
+
+
+def _render_satellite_section(state: ReportState) -> list[str]:
+    lines = ["## Satelita (§21.6)"]
+    sat = state.satellite
+    if sat is None:
+        if state.satellite_error:
+            lines.append("nie wykonano (błąd etapu satelity — patrz DATA FAILURE)")
+        else:
+            lines.append("nie wykonano (cykl zatrzymany przed etapem satelity)")
+        return lines
+    rep = sat.report
+    lines.append(
+        f"- zakres: {rep['d_from']}..{rep['d_to']}; NAV(D) = {_sat_num(rep.get('nav_d_pln'))} PLN; "
+        f"zapis do tabel M89: {'tak' if sat.written else 'nie (na sucho)'}"
+    )
+    lines.append(f"- status danych: {'zweryfikowane' if rep['data_verified'] else 'niezweryfikowane'}")
+    for reason in rep["data_unverified_reasons"]:
+        lines.append(f"  - {reason}")
+    lines.append("")
+    _render_satellite_registry(
+        lines, f"Rejestr 1 (od S = {rep['S']})", rep.get("alerts", {}), rep["windows"], None,
+        sat.persistence.get(1),
+    )
+    lines.append("")
+    r2 = rep["registry2"]
+    if r2["status"] != "liczony":
+        lines.append(f"### Rejestr 2 (od T42 = {r2['T42']})")
+        lines.append(f"- {r2['status']}: rejestr 2 nieobecny")
+    else:
+        _render_satellite_registry(
+            lines, f"Rejestr 2 (od T42 = {r2['T42']})", r2["alerts"], r2["windows"], r2["verdict_label"],
+            sat.persistence.get(2),
+        )
+        for reason in r2["data_unverified_reasons"]:
+            lines.append(f"  - {reason}")
+    lines.append("")
+    lines.append(f"- raport satelity (atrybucja M85, M86, zamiany): {sat.md_path if sat.md_path else 'nie zapisano'}")
+    return lines
+
+
 FOOTER = "Raport nie zawiera rekomendacji inwestycyjnych — tylko stany i poziomy wg §19."
 
 
@@ -1659,6 +1754,8 @@ def render_report(state: ReportState) -> str:
     lines.extend(_render_provider_revisions_section(state))
     lines.append("")
     lines.extend(_render_risk_recompute_section(state))
+    lines.append("")
+    lines.extend(_render_satellite_section(state))
     lines.append("")
     lines.extend(_render_position_changes_section(state))
     lines.append("")
@@ -1922,12 +2019,14 @@ def run_cycle(
     sessions_fn: SessionsFn = _default_sessions_fn,
     check_ignored: Callable[[Path], bool] = _default_check_ignored,
     detect_corp_events_fn: Callable[[psycopg.Connection], CorpEventsClassification] = detect_new_corporate_events,
+    satellite_fn: Callable[..., SatelliteStageResult] = run_satellite_stage,
 ) -> CycleResult:
     """Brief CC-C, C2–C8: orkiestracja jednego przebiegu cyklu tygodniowego.
     Etapy w kolejności: import -> detektor zdarzeń korporacyjnych (B-29, bramka
     DATA REVIEW, bez zapisu) -> FIFO -> bramka rejestracji -> ceny/FX ->
-    ryzyko -> raport. Wyjątek złapany per etap zamienia się w DATA FAILURE
-    (raport powstaje zawsze)."""
+    ryzyko -> satelita (B-38B: ocena §21.6 + rejestr trwały M89) -> raport.
+    Wyjątek złapany per etap zamienia się w DATA FAILURE (raport powstaje
+    zawsze)."""
     run_started_at = datetime.now(timezone.utc)
     t_start = time.monotonic()
     if today is None:
@@ -2264,6 +2363,31 @@ def run_cycle(
             price_dates_by_cal = _price_dates_by_calendar(cur, price_instruments)
         state.freshness_results = market_freshness(price_dates_by_cal, sessions_fn, today)
 
+        # --- C6b: satelita (B-38B) — PO ryzyku (M86 czyta risk_daily z tej transakcji) ---
+        # Wyjątek etapu = DATA FAILURE (kod 2); sekcje wcześniejszych etapów zostają.
+        # Katalog wyników obok raportu cyklu: `satelita-<D>_<HHMM>` (+ sufiks, gdy zajęty);
+        # asercja check-ignore jak dla raportu cyklu jest w `satellite_fn` (przed zapisem).
+        try:
+            sat_base = report_base_name(d, run_started_at).replace("cykl-", "satelita-", 1)
+            sat_dir = reports_dir / sat_base
+            n_dir = 2
+            while sat_dir.exists():
+                sat_dir = reports_dir / f"{sat_base}_{n_dir}"
+                n_dir += 1
+            state.satellite = satellite_fn(
+                conn, d, out_dir=sat_dir, run_at=run_started_at, write=True, check_ignored=check_ignored
+            )
+            if commit:
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (decyzja ownera)
+            if commit:
+                conn.rollback()
+            state.satellite = None
+            state.satellite_error = True
+            state.import_failures.append(
+                f"błąd etapu satelity: {type(exc).__name__}: {exc}{_origin_note(exc)}"
+            )
+
     except _StageStop:
         pass
     except Exception as exc:  # noqa: BLE001 — brief C8: wyjątek etapu -> DATA FAILURE, raport zawsze powstaje
@@ -2278,6 +2402,8 @@ def run_cycle(
             conn.rollback()
         state.import_failures.append(f"nieoczekiwany wyjątek: {type(exc).__name__}: {exc}")
 
+    if state.satellite is None:
+        state.stage_not_executed.add(STAGE_SATELLITE)
     state.runtime_seconds = time.monotonic() - t_start
     state.exit_code = 2 if has_data_failures(state) else 0
 

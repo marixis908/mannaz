@@ -495,7 +495,7 @@ def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -
                   SELECT f.base_symbol FROM instruments f
                   JOIN positions_fifo p ON p.instrument_id = f.id
                   WHERE f.instrument_type = 'future'
-              ))
+              ) OR i.is_benchmark)
             ORDER BY i.id
             """
         )

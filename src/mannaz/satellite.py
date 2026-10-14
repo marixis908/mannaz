@@ -7,12 +7,15 @@ Uklad:
       alerty, werdykt, regresja tygodniowa;
   (B) warstwa ladowania `load_inputs` (tylko SELECT) + skladanie wejsc
       do NAV (`compute_daily`, czyste przy gotowym `Inputs`);
-  (C) `run_satellite` — orkiestracja, zapis satellite.json / satellite.md.
+  (C) `compute_satellite` (wspolne liczenie), `run_satellite` (CLI, zapis
+      satellite.json / satellite.md) i `run_satellite_stage` (etap cyklu,
+      B-38B: rejestr 1 od S1, rejestr 2 od T42, rejestr trwaly M89).
 
 Konwencje: kwoty w PLN (float), kursy FX = NBP A, ostatni z data <= D (M1,
 M77); ceny = prices_daily.close_split_adj x czynnik warstwy
 `risk.layer_factor_after` (S3); regula ceny na D = `risk.resolve_price_on_d`
-(T27). Zadnego zapisu do bazy; zadnych per-pozycyjnych ilosci/kosztow w
+(T27). Zapis do bazy wylacznie w `persist_mandate_registry` (etap cyklu, tabele
+rejestru M89); poza tym tylko SELECT. Zadnych per-pozycyjnych ilosci/kosztow w
 wynikach (tylko agregaty i tickery z przyczyna niekompletnosci).
 """
 
@@ -25,12 +28,13 @@ import json
 import math
 import statistics
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
 
 from mannaz import risk as _risk
 from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE
+from mannaz.provenance import code_sha as _code_sha
 
 # ---------------------------------------------------------------------------
 # Stale
@@ -51,6 +55,14 @@ PRICE_TAIL = 45  # ile ostatnich cen <= D przekazywac do resolve_price_on_d
 MODEL_SHARE_LIMIT = 0.10  # T45: dzienny udzial wyceny modelowej w NAV powyzej -> dane niezweryfikowane
 MODEL_POINT_ROW_TYPES = ("kupno", "sprzedaz", "zamiana_wydanie", "zamiana_przyjecie")
 NEAR_LIMIT_PP = 0.01  # skladnik mandatu blizej limitu niz 1 pp -> wynik wrazliwy na wycene modelowa
+S1 = date(2023, 10, 12)  # rejestr 1: start indeksu satelity
+# Rejestr 2 (rew. 4.17, decyzja ownera 2026-10-14, raport-B38B P1): te same wielkosci co
+# rejestr 1, liczone od T42; werdykt M83 dla rejestru 2 nieobecny do T42 + 24 m.
+T42 = date(2026, 9, 30)
+REGISTRY2_VERDICT_MONTHS = 24
+BENCHMARK_SOURCE = "prices_daily.close_split_adj (warstwa split_adj, ciagla po splitach; T27)"
+# mapowanie skladnikow mandatu: nazwa w analizie -> skladnik rejestru M89 (tabele satellite_mandate_*)
+COMPONENT_BY_MANDATE_KEY = {"max_dd_abs": "abs", "max_dd_rel_sp500": "rel_sp500", "max_dd_rel_spyi": "rel_spyi"}
 
 # ---------------------------------------------------------------------------
 # (A) Klasyfikator przeplywow (M80)
@@ -1326,39 +1338,30 @@ def bench_on_axis(
     return out, stale
 
 
-def load_benchmarks(
-    d_from: date, d_to: date, out_dir: Path
-) -> dict[str, dict[date, tuple[float, str]]]:
-    """SXR8.DE i SPYI.DE (EUR) przez `prices.fetch_ohlc`: pole
-    adj_close_total_return, fallback close_split_adj (kolumna `field`).
-    Cache `benchmarks_cache.csv` w katalogu wynikow; gdy istnieje — czytany."""
-    path = out_dir / "benchmarks_cache.csv"
-    result: dict[str, dict[date, tuple[float, str]]] = {k: {} for k in BENCHMARK_SYMBOLS}
-    if path.exists():
-        sym_to_key = {v: k for k, v in BENCHMARK_SYMBOLS.items()}
-        with open(path, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                key = sym_to_key.get(row["symbol"])
-                if key:
-                    result[key][date.fromisoformat(row["date"])] = (float(row["price_eur"]), row["field"])
-        if all(result.values()):
-            return result
-        result = {k: {} for k in BENCHMARK_SYMBOLS}
-    from mannaz import prices as _prices
-
+def benchmark_series(inp: Inputs) -> tuple[dict[str, dict[date, float] | None], dict[str, str]]:
+    """Progi z `prices_daily` ta sama sciezka ceny co pozycje (`Inputs.prices` =
+    close_split_adj, jak w `Valuer.price`; mnoznik pence jak tam). Instrument
+    progu = instrument o `yahoo_symbol` z BENCHMARK_SYMBOLS (najnizszy id). Czynnika
+    warstwy NIE mnozymy: `layer_factor_after` przelicza ILOSC na warstwe split_adj
+    (S3), a `close_split_adj` jest juz ciagla w czasie (split SPYI uwzgledniony
+    przez dostawce); wymnozenie dawaloby cene surowa z skokiem w dniu splitu.
+    Zwraca (ceny EUR per prog | None, przyczyny braku per prog)."""
+    ymap = build_yahoo_map(inp.instruments)
+    out: dict[str, dict[date, float] | None] = {}
+    why: dict[str, str] = {}
     for key, sym in BENCHMARK_SYMBOLS.items():
-        for r in _prices.fetch_ohlc(sym, d_from - timedelta(days=10), d_to):
-            if r.adj_close_total_return is not None:
-                result[key][r.price_date] = (float(r.adj_close_total_return), "adj_close_total_return")
-            elif r.close_split_adj is not None:
-                result[key][r.price_date] = (float(r.close_split_adj), "close_split_adj")
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["symbol", "date", "price_eur", "field"])
-        for key, sym in BENCHMARK_SYMBOLS.items():
-            for d in sorted(result[key]):
-                w.writerow([sym, d.isoformat(), repr(result[key][d][0]), result[key][d][1]])
-    return result
+        iid = ymap.get(sym)
+        if iid is None:
+            out[key], why[key] = None, f"prog {sym}: brak instrumentu w instruments"
+            continue
+        series = inp.prices.get(iid)
+        if not series or not series[0]:
+            out[key], why[key] = None, f"prog {sym}: brak cen w prices_daily"
+            continue
+        info = inp.instruments[iid]
+        pence = float(_risk.gbp_pence_factor(info.quote_currency, info.yahoo_symbol))
+        out[key] = {d: c * pence for d, c in zip(series[0], series[1])}
+    return out, why
 
 
 def compare_with_p3_series(
@@ -1547,11 +1550,12 @@ def analyze_series(
     for comp, (ser, lim) in series_by_comp.items():
         dd = drawdown_series(ser)
         events, state = alert_states(list(zip(axis, dd)), lim)
+        dd_by_date = dict(zip(axis, dd))
         alerts[comp] = {
             "limit": lim,
             "current_drawdown": current_drawdown(ser),
             "state": state,
-            "events": [{"date": d.isoformat(), "level": lv} for d, lv in events],
+            "events": [{"date": d.isoformat(), "level": lv, "dd": dd_by_date[d]} for d, lv in events],
         }
     # rejestr naruszen: okna 24 m. konczace sie na koncach tygodni
     registry: list[dict[str, Any]] = []
@@ -1573,7 +1577,14 @@ def analyze_series(
             lims[f"max_dd_rel_{key}"] = L_REL
         ms = mandate_status(comps, lims)
         if ms.violations:
-            registry.append({"window_end": axis[i].isoformat(), "violations": ms.violations})
+            registry.append(
+                {
+                    "window_end": axis[i].isoformat(),
+                    "violations": ms.violations,
+                    "window_start": axis[a].isoformat(),
+                    "components": comps,
+                }
+            )
     res.update(
         {
             "windows": windows,
@@ -1637,21 +1648,26 @@ def build_yahoo_map(instruments: dict[int, InstrumentInfo]) -> dict[str, int]:
     return out
 
 
+def _base_id_for(
+    info: InstrumentInfo, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]
+) -> int | None:
+    """Id instrumentu bazowego kontraktu (`yahoo_symbol == base_symbol`) albo None."""
+    base_id = yahoo_map.get(info.base_symbol) if info.base_symbol else None
+    return base_id if base_id is not None and base_id in instruments else None
+
+
 def emitent_key_for(
     iid: int, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]
 ) -> tuple[Any, str]:
-    """(klucz, etykieta) emitenta wg reguly name_key z risk §19.2: equity/etf —
-    wlasny id; future — id instrumentu o yahoo_symbol == base_symbol kontraktu;
-    brak bazy -> wlasny id i etykieta = ticker serii (flaga: `is_future_no_base`)."""
+    """(klucz, etykieta) emitenta wg wspolnej reguly `risk.emitent_key` (§19.2):
+    equity/etf — wlasny id; future — id instrumentu o yahoo_symbol == base_symbol
+    kontraktu; brak bazy -> wlasny id i etykieta = ticker serii (flaga:
+    `is_future_no_base`). Tu tylko rozwiazanie bazy z `instruments`."""
     info = instruments.get(iid)
     if info is None:
         return iid, f"instrument {iid}"
-    if info.instrument_type == "future":
-        base_id = yahoo_map.get(info.base_symbol) if info.base_symbol else None
-        if base_id is None or base_id not in instruments:
-            return iid, info.ticker
-        return base_id, instruments[base_id].ticker
-    return iid, info.ticker
+    key = _risk.emitent_key(iid, info.instrument_type, _base_id_for(info, instruments, yahoo_map))
+    return key, instruments[key].ticker
 
 
 def is_future_no_base(iid: Any, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]) -> bool:
@@ -1659,8 +1675,7 @@ def is_future_no_base(iid: Any, instruments: dict[int, InstrumentInfo], yahoo_ma
     info = instruments.get(iid) if isinstance(iid, int) else None
     if info is None or info.instrument_type != "future":
         return False
-    base_id = yahoo_map.get(info.base_symbol) if info.base_symbol else None
-    return base_id is None or base_id not in instruments
+    return _base_id_for(info, instruments, yahoo_map) is None
 
 
 def _emitent_of(key_id: Any, instruments: dict[int, InstrumentInfo], yahoo_map: dict[str, int]) -> tuple[Any, str]:
@@ -2256,7 +2271,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Zakres: {report['d_from']} .. {report['d_to']}; os dni = XWAR + XNYS + XETR; "
         f"kwoty w PLN; FX = NBP A (<= D); ceny = prices_daily.close_split_adj x czynnik warstwy; "
         f"progi = {BENCHMARK_SYMBOLS['sp500']} i {BENCHMARK_SYMBOLS['spyi']} "
-        f"(pole adj_close_total_return, fallback close_split_adj) x EUR/PLN NBP A."
+        f"({BENCHMARK_SOURCE}) x EUR/PLN NBP A."
     )
     L.append("")
     L.append("## Dane")
@@ -2320,6 +2335,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         L.append(f"- {comp}: stan {a['state']}, obsuniecie biezace {_pct(a['current_drawdown'])} (limit {a['limit'] * 100:.0f}%); {ev}")
     L.append("")
     L.append(f"## Rejestr naruszen (okna 24 m., konce tygodni): {len(report.get('violation_registry', []))} okien z przekroczeniem")
+    _render_registry2(L, report.get("registry2"))
+    _render_swaps(L, report.get("swaps"))
+    _render_persistence(L, report.get("persistence"))
     _render_m86(L, report.get("m86"))
     return "\n".join(L) + "\n"
 
@@ -2373,6 +2391,85 @@ def _render_attribution(L: list[str], att: dict[str, Any] | None) -> None:
                  + "; ".join(f"{k}: {len(v)} dni (pierwszy {v[0]})" for k, v in viol.items()))
 
 
+def _render_registry2(L: list[str], r2: dict[str, Any] | None) -> None:
+    if not r2:
+        return
+    L.append("")
+    L.append(f"## Rejestr 2 (od T42 = {r2['T42']})")
+    if r2["status"] != "liczony":
+        L.append(f"- status: {r2['status']} (D < T42); rejestr 2 nieobecny")
+        return
+    L.append(f"- S: {r2['S']}; werdykt M83: {r2['verdict_label']}; dane zweryfikowane: {r2['data_verified']}")
+    for reason in r2["data_unverified_reasons"]:
+        L.append(f"  - {reason}")
+    for name, win in r2["windows"].items():
+        L.append(f"- okno {name}: {win['from']} .. {win['to']} ({win['n_days']} dni; kompletne: {win['complete']}); "
+                 f"TWR = {_pct(win['twr'])}; V_a = {_num(win['v_a'])} PLN; V_T = {_num(win['v_t'])} PLN")
+        L.append("  - " + "; ".join(
+            f"dW {b['label']} = {_num(b['delta_w_pln'])} PLN" + (" [niewykonalny]" if b["infeasible"] else "")
+            for b in win["bench"].values()))
+        m = win["mandate"]
+        L.append(f"  - mandat: {m['status']}; naruszenia: {', '.join(m['violations']) or '-'}; "
+                 f"max obsuniecia: " + ", ".join(f"{k} {_pct(v)}" for k, v in m["components"].items()))
+    for comp, a in r2["alerts"].items():
+        ev = ", ".join(f"{e['date']} {e['level']}" for e in a["events"]) or "brak zdarzen"
+        L.append(f"- alert {comp}: stan {a['state']}, obsuniecie biezace {_pct(a['current_drawdown'])} "
+                 f"(limit {a['limit'] * 100:.0f}%); {ev}")
+    L.append(f"- rejestr naruszen (okna 24 m. lub od T42, konce tygodni): {len(r2['violation_registry'])} okien z przekroczeniem")
+
+
+def _render_swaps(L: list[str], swaps: Sequence[dict[str, Any]] | None) -> None:
+    if swaps is None:
+        return
+    L.append("")
+    L.append("## Zamiany (zamiana_wydanie / zamiana_przyjecie)")
+    if not swaps:
+        L.append("- brak")
+        return
+    L.append("")
+    L.append("| data | dzien osi | grupa kont | wydany | przyjety | wynik dnia wydany | wynik dnia przyjety | suma | uwagi |")
+    L.append("|---|---|---|---|---|---:|---:|---:|---|")
+    for s in swaps:
+        notes = []
+        if s["ten_sam_emitent"]:
+            notes.append("ten sam emitent")
+        if s["day"] is None:
+            notes.append("poza atrybucja")
+        L.append(f"| {s['date']} | {s['day'] or '-'} | {s['account']} | {s['wydany']} | {s['przyjety']} | "
+                 f"{_num(s['wydany_pln'])} | {_num(s['przyjety_pln'])} | {_num(s['suma_pln'])} | {', '.join(notes) or '-'} |")
+    L.append("")
+
+
+def _render_persistence(L: list[str], pers: dict[Any, dict[str, Any]] | None) -> None:
+    if not pers:
+        return
+    L.append("")
+    L.append("## Rejestr trwaly M89")
+    for reg in sorted(pers):
+        p = pers[reg]
+        if p.get("absent"):
+            L.append(f"- rejestr {reg}: nieobecny (przed T42)")
+            continue
+        L.append(f"- rejestr {reg}: " + persistence_summary_line(p))
+
+
+def persistence_summary_line(p: dict[str, Any]) -> str:
+    """Jedna linia opisu przebiegu rejestru trwalego M89 (satellite.md i raport cyklu)."""
+    ev, vi = p["events"], p["violations"]
+    mode = "zapis" if p["write"] else "bez zapisu (na sucho)"
+    if p["initial_feed"]:
+        head = f"zasilenie poczatkowe: {len(ev['new'])} zdarzen, {len(vi['new'])} naruszen"
+    else:
+        head = (f"zdarzenia: nowe {len(ev['new'])}, zapisane wczesniej {ev['previous']}; "
+                f"naruszenia: nowe {len(vi['new'])}, zapisane wczesniej {vi['previous']}")
+    lost = [f"{x['component']} {x['event_date']} {x['level']}" for x in ev["not_reproduced"]] + [
+        f"naruszenie {x['component']} {x['window_end']}" for x in vi["not_reproduced"]]
+    return (f"{head}; nieodtworzone: {', '.join(lost) if lost else 'brak'}; "
+            f"naruszenia z pelnych tygodni: {vi['computed_full_weeks']} "
+            f"(okien z przekroczeniem: {vi['windows_with_exceedance']}, w biezacym tygodniu do zapisu w kolejnym cyklu: "
+            f"{vi['pending_current_week']}); status danych: {p['data_status']}; {mode}")
+
+
 def _render_m86(L: list[str], m: dict[str, Any] | None) -> None:
     if not m:
         return
@@ -2406,42 +2503,279 @@ def _render_m86(L: list[str], m: dict[str, Any] | None) -> None:
              f"netto kontrakty: {_pct(k['futures_net_share_nav'])} NAV")
 
 
-def run_satellite(
-    conn: Any,
+# ---------------------------------------------------------------------------
+# (C2) Rejestr 2 (od T42), zamiany, rejestr trwaly M89, wspolne liczenie
+# ---------------------------------------------------------------------------
+
+
+def registry2_label() -> str:
+    """M83 dla rejestru 2: etykieta stala do T42 + 24 m. (ISO)."""
+    return f"bez werdyktu do {minus_months(T42, -REGISTRY2_VERDICT_MONTHS).isoformat()}"
+
+
+def analyze_registry2(
+    axis: Sequence[date],
+    nav: Sequence[float | None],
+    flows: Sequence[float | None],
+    bench: dict[str, Sequence[float | None]],
+    verified_base: bool,
+    model_over: Sequence[date] = (),
+) -> dict[str, Any]:
+    """Rejestr 2 = te same wielkosci co rejestr 1 (TWR, dW wobec obu progow,
+    obsuniecia, mandat M88, alerty M89, rejestr naruszen) liczone od T42 do D:
+    `analyze_series` na osi/NAV/F/progach obcietych od pierwszego dnia osi >= T42
+    (okno kroczace = min(24 m., od T42) — `_window_bounds`). Werdykt M83:
+    etykieta stala `registry2_label()` niezaleznie od danych. D < T42 ->
+    status 'przed T42'."""
+    out: dict[str, Any] = {
+        "T42": T42.isoformat(),
+        "verdict_label": registry2_label(),
+        "status": "przed T42",
+        "S": None,
+        "windows": {},
+        "alerts": {},
+        "violation_registry": [],
+        "data_verified": False,
+        "data_unverified_reasons": [],
+    }
+    k = bisect.bisect_left(list(axis), T42)
+    if k >= len(axis):
+        return out
+    reasons: list[str] = []
+    verified = verified_base
+    over = [d for d in model_over if d >= T42]
+    if over:
+        verified = False
+        reasons.append(f"rejestr 2: udzial wyceny modelowej > {MODEL_SHARE_LIMIT * 100:.0f}% NAV w {len(over)} dniach (T45)")
+    an = analyze_series(
+        list(axis[k:]), list(nav[k:]), list(flows[k:]), {key: list(b[k:]) for key, b in bench.items()},
+        data_verified=verified,
+    )
+    for w in an.get("windows", {}).values():
+        if not w["complete"]:
+            verified = False
+            reasons.append(f"rejestr 2: okno {w['from']}..{w['to']} zawiera dzien niepelny")
+        v = w["verdict"]
+        v["result_computed"] = v["result"]
+        v["result"] = "bez werdyktu"
+        v["label"] = out["verdict_label"]
+    out.update(
+        {
+            "status": "liczony",
+            "S": an["S"],
+            "windows": an.get("windows", {}),
+            "alerts": an.get("alerts", {}),
+            "violation_registry": an.get("violation_registry", []),
+            "data_verified": bool(verified),
+            "data_unverified_reasons": reasons,
+        }
+    )
+    return out
+
+
+def compute_swaps(
+    inp: Inputs, axis: Sequence[date], att_daily: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Sekcja 'Zamiany' (decyzja 8): para wierszy zamiana_wydanie /
+    zamiana_przyjecie z tego samego dnia i rachunku; wynik dnia obu linii
+    emitentow z atrybucji dziennej M85 (linie emitentow zostaja osobne) i ich
+    suma. Wynik dnia = suma `total` linii pozycji/kontraktu danej grupy kont i
+    emitenta w dniu osi, do ktorego wpada wiersz (pierwszy dzien osi >= data
+    wiersza; wiersze do pierwszego dnia osi wlacznie nie sa atrybuowane). Bez
+    numerow rachunkow (grupa kont). None, gdy atrybucja dnia niedostepna."""
+    by_day = {e["date"]: e["lines"] for e in att_daily}
+    yahoo_map = build_yahoo_map(inp.instruments)
+    groups: dict[tuple[date, str], tuple[list[TxRow], list[TxRow]]] = {}
+    for r in inp.tx_rows:
+        if r.row_type in ("zamiana_wydanie", "zamiana_przyjecie"):
+            g = groups.setdefault((r.date, r.rachunek), ([], []))
+            g[0 if r.row_type == "zamiana_wydanie" else 1].append(r)
+    axis_l = list(axis)
+    out: list[dict[str, Any]] = []
+    for (dt, rach), (given, taken) in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        k = bisect.bisect_left(axis_l, dt)
+        day = axis_l[k] if 0 < k < len(axis_l) else None
+        lines = by_day.get(day.isoformat()) if day is not None else None
+        grp = account_group(rach)
+
+        def leg(r: TxRow | None) -> tuple[str, Any, float | None]:
+            if r is None or r.instrument_id is None or r.instrument_id not in inp.instruments:
+                return "-", None, None
+            ek = emitent_key_for(r.instrument_id, inp.instruments, yahoo_map)[0]
+            ticker = inp.instruments[r.instrument_id].ticker
+            if lines is None:
+                return ticker, ek, None
+            val = sum(
+                ln["total"] for ln in lines
+                if ln["kind"] in ATTRIB_POSITIONAL_KINDS and ln["account"] == grp and ln["emitent_key"] == ek
+            )
+            return ticker, ek, val
+
+        for n in range(max(len(given), len(taken))):
+            t_out, k_out, v_out = leg(given[n] if n < len(given) else None)
+            t_in, k_in, v_in = leg(taken[n] if n < len(taken) else None)
+            out.append(
+                {
+                    "date": dt.isoformat(),
+                    "day": day.isoformat() if day is not None else None,
+                    "account": grp,
+                    "wydany": t_out,
+                    "przyjety": t_in,
+                    "wydany_pln": v_out,
+                    "przyjety_pln": v_in,
+                    "suma_pln": (v_out + v_in) if (v_out is not None and v_in is not None) else None,
+                    "ten_sam_emitent": k_out is not None and k_out == k_in,
+                }
+            )
+    return out
+
+
+def _iso_week(d: date) -> tuple[int, int]:
+    iso = d.isocalendar()
+    return (iso[0], iso[1])
+
+
+def persist_mandate_registry(
+    cur: Any,
+    registry: int,
+    alerts: dict[str, Any],
+    violation_registry: Sequence[dict[str, Any]],
+    d: date,
+    data_status: str,
+    run_at: datetime,
+    code_sha_value: str | None,
+    write: bool = True,
+) -> dict[str, Any]:
+    """Rejestr trwaly M89 (tabele satellite_mandate_events / _violations, tylko
+    dopisywanie). Z przeliczenia (`alerts`, `violation_registry` z
+    `analyze_series`) buduje wiersze zdarzen (skladnik abs/rel_sp500/rel_spyi,
+    dd_current = obsuniecie w dniu zdarzenia) i naruszen (per skladnik
+    naruszajacy). NARUSZENIA TYLKO Z PELNYCH TYGODNI: do zapisu ida wpisy z
+    window_end w tygodniu ISO wczesniejszym niz tydzien ISO dnia D (okno do D w
+    srodku tygodnia nie odtwarza sie w kolejnym cyklu); zdarzenia zapisywane
+    wszystkie. Czyta wiersze rejestru (SELECT) i klasyfikuje wg kluczy UNIQUE
+    tabel: nowe (brak w tabeli), zapisane wczesniej (w tabeli i w przeliczeniu),
+    zapisane-nieodtworzone (w tabeli, brak w przeliczeniu; wiersz zostaje).
+    Strona zapisana jest ograniczona jak strona liczona (zdarzenia <= D,
+    naruszenia z pelnych tygodni), zeby tydzien D nie dawal falszywych roznic.
+    Zasilenie poczatkowe = obie tabele bez wierszy rejestru przed przebiegiem.
+    write=True: INSERT ... ON CONFLICT DO NOTHING (bez commit — commit robi
+    cykl); write=False: zero INSERT, wynik opisuje, co zostaloby wstawione."""
+    week_d = _iso_week(d)
+    ev_rows: dict[tuple[str, date, str], dict[str, Any]] = {}
+    for comp, a in alerts.items():
+        for ev in a["events"]:
+            if ev.get("dd") is None:
+                continue
+            ev_rows[(comp, date.fromisoformat(ev["date"]), ev["level"])] = {
+                "component": comp, "event_date": ev["date"], "level": ev["level"],
+                "dd_current": ev["dd"], "limit": a["limit"],
+            }
+    vi_rows: dict[tuple[str, date], dict[str, Any]] = {}
+    pending_current_week = 0
+    for entry in violation_registry:
+        w_end = date.fromisoformat(entry["window_end"])
+        if _iso_week(w_end) >= week_d:
+            pending_current_week += 1
+            continue
+        for name in entry["violations"]:
+            comp = COMPONENT_BY_MANDATE_KEY[name]
+            vi_rows[(comp, w_end)] = {
+                "component": comp, "window_start": entry["window_start"], "window_end": entry["window_end"],
+                "max_dd": entry["components"][name], "limit": L_MAX if comp == "abs" else L_REL,
+            }
+
+    cur.execute("SELECT component, event_date, level FROM satellite_mandate_events WHERE registry = %s", (registry,))
+    stored_ev_all = {(c, e, lv) for c, e, lv in cur.fetchall()}
+    cur.execute("SELECT component, window_end FROM satellite_mandate_violations WHERE registry = %s", (registry,))
+    stored_vi_all = {(c, w) for c, w in cur.fetchall()}
+    initial_feed = not stored_ev_all and not stored_vi_all
+    stored_ev = {k for k in stored_ev_all if k[1] <= d}
+    stored_vi = {k for k in stored_vi_all if _iso_week(k[1]) < week_d}
+
+    new_ev = [ev_rows[k] for k in sorted(ev_rows, key=lambda k: (k[1], k[0], k[2])) if k not in stored_ev_all]
+    new_vi = [vi_rows[k] for k in sorted(vi_rows, key=lambda k: (k[1], k[0])) if k not in stored_vi_all]
+    lost_ev = sorted(stored_ev - set(ev_rows), key=lambda k: (k[1], k[0], k[2]))
+    lost_vi = sorted(stored_vi - set(vi_rows), key=lambda k: (k[1], k[0]))
+
+    if write:
+        for r in new_ev:
+            cur.execute(
+                "INSERT INTO satellite_mandate_events "
+                "(registry, component, event_date, level, dd_current, limit_value, data_status, first_seen_run_at, code_sha) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (registry, component, event_date, level) DO NOTHING",
+                (registry, r["component"], r["event_date"], r["level"], r["dd_current"], r["limit"],
+                 data_status, run_at, code_sha_value),
+            )
+        for r in new_vi:
+            cur.execute(
+                "INSERT INTO satellite_mandate_violations "
+                "(registry, component, window_start, window_end, max_dd, limit_value, data_status, first_seen_run_at, code_sha) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (registry, component, window_end) DO NOTHING",
+                (registry, r["component"], r["window_start"], r["window_end"], r["max_dd"], r["limit"],
+                 data_status, run_at, code_sha_value),
+            )
+    return {
+        "registry": registry,
+        "write": write,
+        "data_status": data_status,
+        "initial_feed": initial_feed,
+        "events": {
+            "computed": len(ev_rows),
+            "new": new_ev,
+            "previous": len(set(ev_rows) & stored_ev_all),
+            "not_reproduced": [{"component": c, "event_date": e.isoformat(), "level": lv} for c, e, lv in lost_ev],
+        },
+        "violations": {
+            "computed_full_weeks": len(vi_rows),
+            "windows_with_exceedance": len(violation_registry),
+            "pending_current_week": pending_current_week,
+            "new": new_vi,
+            "previous": len(set(vi_rows) & stored_vi_all),
+            "not_reproduced": [{"component": c, "window_end": w.isoformat()} for c, w in lost_vi],
+        },
+    }
+
+
+def compute_satellite(
+    cur: Any,
     d_from: date,
     d_to: date,
-    out_dir: Path | str,
-    account_values: Path | str | None = None,
-    symbol_map: Path | str | None = None,
+    snapshots: Sequence[AccountValue] = (),
+    smap: dict[str, dict[str, str]] | None = None,
+    out_dir: Path | None = None,
     p3_series_path: Path | str | None = None,
-) -> dict[str, Any]:
-    """Orkiestracja E3: `conn.read_only = True` (zero zapisow do bazy), os dni,
-    NAV/przeplywy, progi, okna [S,T] i 24 m., bramka M78 (gdy `account_values`),
-    zapis satellite.json i satellite.md w `out_dir`. Zwraca podsumowanie
-    (agregaty)."""
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    conn.read_only = True
-    snapshots = load_account_values(account_values) if account_values else []
-    smap = load_symbol_map(symbol_map) if symbol_map else None
-    with conn.cursor() as cur:
-        inp = load_inputs(cur, d_from, d_to, smap, out, extra_days=sorted({s.date for s in snapshots}))
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Wspolne liczenie E3 (CLI `run_p3 satellite` i etap cyklu): tylko SELECT
+    na przekazanym kursorze; os dni, NAV/przeplywy, progi z `prices_daily`
+    (`benchmark_series`), rejestr 1 (od S) i rejestr 2 (od T42), okna, bramka M78
+    (gdy `snapshots`), atrybucja M85, zamiany, ryzyko M86. Nie zapisuje plikow
+    ani do bazy. Zwraca (report, payload); payload = report + serie dzienne."""
+    inp = load_inputs(cur, d_from, d_to, smap, out_dir, extra_days=sorted({s.date for s in snapshots}))
     daily = compute_daily(inp)
 
-    benches_raw = load_benchmarks(d_from, d_to, out)
+    bench_prices, bench_why = benchmark_series(inp)
     eurpln = lambda d: fx_on(inp.fx, "EUR", d)  # noqa: E731
+    axis = inp.axis
     bench: dict[str, list[float | None]] = {}
     bench_stale: dict[str, list[bool]] = {}
-    for key, rows in benches_raw.items():
-        bench[key], bench_stale[key] = bench_on_axis(inp.axis, {d: v[0] for d, v in rows.items()}, eurpln)
-    bench_fields = {k: sorted({v[1] for v in rows.values()}) for k, rows in benches_raw.items()}
+    reasons: list[str] = []
+    for key, prices_eur in bench_prices.items():
+        if prices_eur is None:
+            bench[key], bench_stale[key] = [None] * len(axis), [False] * len(axis)
+            reasons.append(bench_why[key])
+            continue
+        bench[key], bench_stale[key] = bench_on_axis(axis, prices_eur, eurpln)
+        n_none = sum(1 for v in bench[key] if v is None)
+        if n_none:
+            reasons.append(f"prog {BENCHMARK_SYMBOLS[key]}: brak ceny <= D albo kursu EUR/PLN w {n_none} dniach osi")
 
-    axis = inp.axis
     nav = [daily.navs[d].value for d in axis]
     flows = [daily.flows[d] for d in axis]
-    gate = m78_gate(snapshots, daily.navs) if snapshots else None
+    gate = m78_gate(list(snapshots), daily.navs) if snapshots else None
     day_incomplete = [d for d, n, f in zip(axis, nav, flows) if n is None or f is None]
-    reasons: list[str] = []
     if gate is None:
         reasons.append("brak bramki M78 (nie podano account_values)")
     elif gate["result"] == "rozjazd":
@@ -2486,6 +2820,10 @@ def run_satellite(
     for w in analysis["windows"].values():
         w["mandate"]["sensitive_to_model"] = bool(w["mandate"]["near_limit"]) and bool(model_days)
 
+    reg2 = analyze_registry2(axis, nav, flows, bench, verified_base, model_over)
+    for w in reg2["windows"].values():
+        w["mandate"]["sensitive_to_model"] = bool(w["mandate"]["near_limit"]) and bool(model_days)
+
     p3_control = None
     if p3_series_path:
         p3_control = compare_with_p3_series(
@@ -2494,6 +2832,11 @@ def run_satellite(
             p3_series_path,
         )
 
+    data_verified_1 = (
+        verified_base and not model_over
+        and not any(not w["complete"] for w in analysis["windows"].values())
+        and not any(prices is None for prices in bench_prices.values())
+    )
     report: dict[str, Any] = {
         "d_from": d_from.isoformat(),
         "d_to": d_to.isoformat(),
@@ -2501,15 +2844,15 @@ def run_satellite(
             "currency": "PLN",
             "fx": "NBP A, ostatni kurs z data <= D",
             "prices": "prices_daily.close_split_adj x layer_factor_after, regula T27",
-            "benchmarks": {k: {"symbol": BENCHMARK_SYMBOLS[k], "fields": bench_fields[k]} for k in BENCHMARK_SYMBOLS},
+            "benchmarks": {k: {"symbol": BENCHMARK_SYMBOLS[k], "source": BENCHMARK_SOURCE} for k in BENCHMARK_SYMBOLS},
         },
         "n_axis_days": len(axis),
         "n_incomplete_days": len(day_incomplete),
         "S": analysis["S"],
         "T": analysis["T"],
+        "nav_d_pln": nav[-1] if nav else None,
         "gate": gate,
-        "data_verified": verified_base and not model_over
-        and not any(not w["complete"] for w in analysis["windows"].values()),
+        "data_verified": bool(data_verified_1),
         "model_valuation": model_summary,
         "data_unverified_reasons": sorted(set(reasons)),
         "unknown_row_types": daily.unknown_row_types,
@@ -2520,6 +2863,7 @@ def run_satellite(
         "windows": analysis["windows"],
         "alerts": analysis.get("alerts", {}),
         "violation_registry": analysis.get("violation_registry", []),
+        "registry2": reg2,
     }
     series = []
     for i, d in enumerate(axis):
@@ -2545,14 +2889,115 @@ def run_satellite(
     # B-38a: atrybucja M85 (z tych samych NavResult/F co powyzej) i ryzyko M86 (SELECT risk_daily)
     att = compute_attribution(inp, daily, axis, analysis["windows"])
     report["attribution"] = att["attribution"]
+    report["swaps"] = compute_swaps(inp, axis, att["attribution_daily"])
     if axis:
-        with conn.cursor() as cur:
-            risk_rows = load_risk_snapshot(cur, axis[-1])
+        risk_rows = load_risk_snapshot(cur, axis[-1])
         report["m86"] = m86_snapshot(risk_rows, daily.navs[axis[-1]], axis[-1], inp.instruments,
                                      build_yahoo_map(inp.instruments))
     payload = dict(report)
     payload["attribution_daily"] = att["attribution_daily"]
     payload["series"] = series
+    return report, payload
+
+
+def write_satellite_outputs(out_dir: Path | str, report: dict[str, Any], payload: dict[str, Any]) -> Path:
+    """Zapis satellite.json i satellite.md w `out_dir`; zwraca sciezke satellite.md."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
     (out / "satellite.json").write_text(json.dumps(_clean(payload), ensure_ascii=False, indent=1), encoding="utf-8")
-    (out / "satellite.md").write_text(render_markdown(report), encoding="utf-8")
+    md = out / "satellite.md"
+    md.write_text(render_markdown(report), encoding="utf-8")
+    return md
+
+
+def run_satellite(
+    conn: Any,
+    d_from: date,
+    d_to: date,
+    out_dir: Path | str,
+    account_values: Path | str | None = None,
+    symbol_map: Path | str | None = None,
+    p3_series_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """CLI `run_p3 satellite`: `conn.read_only = True` (zero zapisow do bazy),
+    `compute_satellite`, zapis satellite.json / satellite.md w `out_dir`.
+    Zwraca podsumowanie (agregaty). Rejestr trwaly M89 NIE jest tu zapisywany."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    conn.read_only = True
+    snapshots = load_account_values(account_values) if account_values else []
+    smap = load_symbol_map(symbol_map) if symbol_map else None
+    with conn.cursor() as cur:
+        report, payload = compute_satellite(cur, d_from, d_to, snapshots, smap, out, p3_series_path)
+    write_satellite_outputs(out, report, payload)
     return report
+
+
+# ---------------------------------------------------------------------------
+# (C3) Etap satelity cyklu
+# ---------------------------------------------------------------------------
+
+
+class SatelliteStageError(RuntimeError):
+    """Etap satelity nie moze zapisac wynikow (np. katalog poza .gitignore)."""
+
+
+@dataclass
+class SatelliteStageResult:
+    """Podsumowanie etapu satelity dla raportu cyklu."""
+
+    d: date
+    report: dict[str, Any]
+    persistence: dict[int, dict[str, Any]]
+    out_dir: Path | None = None
+    md_path: Path | None = None
+    written: bool = False  # True: wiersze M89 wstawione (write=True)
+
+
+_UNSET: Any = object()
+
+
+def run_satellite_stage(
+    conn: Any,
+    d: date,
+    out_dir: Path | None = None,
+    run_at: datetime | None = None,
+    write: bool = True,
+    check_ignored: Callable[[Path], bool] | None = None,
+    code_sha_value: Any = _UNSET,
+) -> SatelliteStageResult:
+    """Etap satelity cyklu (decyzja 6): d_from = S1, d_to = D, bez account_values
+    (bramka M78 nieobecna -> dane niezweryfikowane, przyczyna w raporcie). Czyta
+    baze przez polaczenie cyklu (NIE ustawia `conn.read_only`); zapisuje
+    wylacznie do dwoch tabel M89 (rejestr 1 i 2) i — gdy `out_dir` —
+    satellite.json / satellite.md (przed jakimkolwiek zapisem
+    `check_ignored(out_dir/satellite.md)` musi byc True, inaczej
+    `SatelliteStageError`). write=False: zero INSERT; z `out_dir=None` rowniez
+    zero plikow (pomiar na sucho). Commit robi wywolujacy."""
+    if out_dir is not None and check_ignored is not None and not check_ignored(Path(out_dir) / "satellite.md"):
+        raise SatelliteStageError(f"katalog satelity nie jest objety .gitignore: {out_dir}; nic nie zapisano")
+    if run_at is None:
+        run_at = datetime.now(timezone.utc)
+    sha = _code_sha() if code_sha_value is _UNSET else code_sha_value
+    with conn.cursor() as cur:
+        report, payload = compute_satellite(cur, S1, d)
+        persistence: dict[int, dict[str, Any]] = {}
+        status1 = "zweryfikowane" if report["data_verified"] else "niezweryfikowane"
+        persistence[1] = persist_mandate_registry(
+            cur, 1, report["alerts"], report["violation_registry"], d, status1, run_at, sha, write
+        )
+        reg2 = report["registry2"]
+        if reg2["status"] == "liczony":
+            status2 = "zweryfikowane" if reg2["data_verified"] else "niezweryfikowane"
+            persistence[2] = persist_mandate_registry(
+                cur, 2, reg2["alerts"], reg2["violation_registry"], d, status2, run_at, sha, write
+            )
+        else:
+            persistence[2] = {"registry": 2, "absent": True, "write": write}
+    report["persistence"] = persistence
+    payload["persistence"] = persistence
+    md_path = write_satellite_outputs(out_dir, report, payload) if out_dir is not None else None
+    return SatelliteStageResult(
+        d=d, report=report, persistence=persistence,
+        out_dir=Path(out_dir) if out_dir is not None else None, md_path=md_path, written=write,
+    )

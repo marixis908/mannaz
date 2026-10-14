@@ -1296,6 +1296,16 @@ def _base_instrument(cur: psycopg.Cursor, base_symbol: str | None) -> dict[str, 
     return {"id": row[0], "currency": row[1], "yahoo_symbol": row[2], "exchange": row[3]}
 
 
+def emitent_key(instrument_id: int, instrument_type: str | None, base_instrument_id: int | None) -> int:
+    """B-38B: JEDNA regula klucza emitenta (name_key poziomu 1, §19.2) dla
+    `risk_daily.name_key` i atrybucji/M86 satelity. Czysta. equity/etf — wlasny
+    id; future — id instrumentu bazowego (`yahoo_symbol == base_symbol`
+    kontraktu), a gdy bazy brak (`base_instrument_id` None) — wlasny id."""
+    if instrument_type == "future" and base_instrument_id is not None:
+        return base_instrument_id
+    return instrument_id
+
+
 def _price_series(cur: psycopg.Cursor, instrument_id: int, end_date: date) -> dict[str, list]:
     cur.execute(
         """
@@ -1810,7 +1820,11 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 multiplier_missing=False,
                 price_is_stale=coverage.price_is_stale,
                 price_date_used=coverage.price_date_used,
-                name_key=coverage.price_instrument_id,
+                name_key=emitent_key(
+                    pos["instrument_id"],
+                    instrument_type,
+                    coverage.price_instrument_id if instrument_type == "future" else None,
+                ),
                 note=note,
             )
             computed.append(row)

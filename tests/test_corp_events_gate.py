@@ -31,6 +31,7 @@ from mannaz.db import get_connection
 from mannaz.fx import FxSummary
 from mannaz.prices import PricesSummary
 from mannaz.risk import RiskSummary
+from _satstub import satellite_stub
 
 
 def _event(instrument_id: int = 1, ticker: str = "TESTSYM", d: date = date(1990, 3, 5),
@@ -87,6 +88,7 @@ def _cycle_kwargs(tmp_path: Path, conn, detector, risk_spy=None, **over):
         risk_fn=risk_spy or _Spy(RiskSummary(risk_date=date(1990, 1, 1))),
         check_ignored=lambda p: True,
         detect_corp_events_fn=detector,
+        satellite_fn=satellite_stub,  # B-38B: zero prawdziwego etapu satelity
     )
     kw.update(over)
     return kw

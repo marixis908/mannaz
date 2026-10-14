@@ -236,7 +236,9 @@ def cmd_risk(args: argparse.Namespace) -> None:
 def cmd_satellite(args: argparse.Namespace) -> None:
     """E3 (brief CC-OS2, §21.6): ocena satelity jako calosci. Tylko SELECT
     (`conn.read_only = True`); wyniki do `--out` (satellite.json, satellite.md,
-    benchmarks_cache.csv, ewentualnie prices_cache.csv). Wyłącznie agregaty."""
+    ewentualnie prices_cache.csv). Progi z `prices_daily` (B-38B), bez sieci poza
+    mapą symboli; rejestr trwały M89 zapisuje wyłącznie etap satelity cyklu.
+    Wyłącznie agregaty."""
     conn = get_connection()
     try:
         report = run_satellite(
