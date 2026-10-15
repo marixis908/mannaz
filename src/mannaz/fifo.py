@@ -79,7 +79,9 @@ class PositionResult:
       sum(l.qty for l in lots) == qty
       sum(l.qty * l.unit_cost for l in lots if l.qty > 0) == residual_cost
     Pozostałe pola bez zmian: first/last_entry_date liczone po WSZYSTKICH
-    kupnach w historii (nie tylko po lotach z `lots`). Po domknięciu przez
+    kupnach w historii (nie tylko po lotach z `lots`); przy allow_short=True
+    także po sprzedażach otwierających lub powiększających lot krótki
+    (CC-SH C2: pozycja otwarta wyłącznie sprzedażą ma daty, nie None). Po domknięciu przez
     wygaśnięcie kontraktu / wykup certyfikatu (`resolve_position_as_of`)
     `lots == ()`, a qty/residual_cost zostają jak w `compute_position`."""
 
@@ -151,6 +153,9 @@ def compute_position(
             if allow_short:
                 # świadome otwarcie/powiększenie krótkiej pozycji — znamy cenę sprzedaży
                 lots.append([remaining, unit_price, r["date"], False])
+                # CC-SH C2: sprzedaż otwierająca/powiększająca krótką też wyznacza daty wejścia
+                first_entry_date = r["date"] if first_entry_date is None else min(first_entry_date, r["date"])
+                last_entry_date = r["date"] if last_entry_date is None else max(last_entry_date, r["date"])
             else:
                 oversell_events += 1
                 # brak wcześniejszego lota na pełną ilość -> pozycja ujemna, koszt umowny 0

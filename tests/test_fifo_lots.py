@@ -144,10 +144,10 @@ def test_g_literal_regression_five_fields():
         D(25), D(200), d1, d3, 0,
     )
 
-    # S3: krótki kontrakt
+    # S3: krótki kontrakt (CC-SH C2: sprzedaż otwierająca krótką wyznacza daty wejścia)
     p = compute_position([_sell(d1, 3, 30)], [], allow_short=True)
     assert (p.qty, p.residual_cost, p.first_entry_date, p.last_entry_date, p.oversell_events) == (
-        D(-3), D(0), None, None, 0,
+        D(-3), D(0), d1, d1, 0,
     )
 
     # S4: nadwyżka sprzedaży na rachunku akcyjnym
