@@ -468,7 +468,7 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 - `fundamentals`: unikalny `(instrument_id, period_end, filed_at, taxonomy)`
 - `fx_rates`: unikalny `(pair, date, fixing_id)`
 - `derived_metrics`: unikalny `(instrument_id, date, metric, code_version)`
-- `satellite_mandate_events`: unikalny `(registry, component, event_date, level)`; `satellite_mandate_violations`: unikalny `(registry, component, window_end)`; na obu trigger `BEFORE UPDATE OR DELETE` z `RAISE EXCEPTION` (rew. 4.17)
+- `satellite_mandate_events`: unikalny `(registry, component, event_date, level)`; `satellite_mandate_violations`: unikalny `(registry, component, window_end)`; na obu triggery `BEFORE UPDATE OR DELETE` (`FOR EACH ROW`) i `BEFORE TRUNCATE` (`FOR EACH STATEMENT`) z `RAISE EXCEPTION` (rew. 4.17)
 - Trigger `BEFORE UPDATE OR DELETE` z `RAISE EXCEPTION` na wszystkich tabelach append-only
 - Migracje przez Alembic, nigdy ręcznie
 
@@ -1208,7 +1208,7 @@ Limity rozstrzygają o statusie mandatu, nie zatrzymują straty; stratę ogranic
 - Ostrzeżenie przy przejściu przez 75% limitu, alert przy przejściu przez 100% (T44). Ostrzeżenie nie blokuje eskalacji do alertu. Po komunikacie danego poziomu jego ponawianie jest wstrzymane do zejścia obsunięcia bieżącego poniżej 50% limitu; stan naruszenia pozostaje widoczny w raporcie. Nowe naruszenie innego składnika zawsze generuje alert.
 - Zmiana L_max, L_rel lub T44 obowiązuje od daty decyzji, z uzasadnieniem w dzienniku decyzji; nie zmienia historycznych statusów. Zmierzona beta satelity sama w sobie nie jest podstawą podniesienia limitu.
 
-**Zapis (rew. 4.17).** Etap satelity w cyklu (po etapie ryzyka, na D cyklu) przelicza zdarzenia alertów i naruszenia z pełnej serii dla rejestru 1 i 2 i dopisuje je do `satellite_mandate_events` i `satellite_mandate_violations` (`INSERT … ON CONFLICT DO NOTHING`); UPDATE i DELETE odrzuca w bazie trigger. Wiersz zapisany raz zostaje, także gdy przeliczenie po rewizji danych go nie odtwarza. Raport cyklu rozróżnia zdarzenia nowe w przebiegu, zapisane wcześniej (licznik) i zapisane, nieodtworzone w bieżącym przeliczeniu (lista); pierwszy przebieg oznacza zasilenie początkowe liczbą zdarzeń i naruszeń. Zapis następuje także przy danych niezweryfikowanych, ze statusem danych w wierszu. Naruszenia zapisuje się dla okien kończących się w tygodniach ISO zakończonych przed tygodniem D; tydzień D raport pokazuje jako bieżący, a zapis następuje w kolejnym cyklu. Zdarzenia alertów zapisuje się wszystkie.
+**Zapis (rew. 4.17).** Etap satelity w cyklu (po etapie ryzyka, na D cyklu) przelicza zdarzenia alertów i naruszenia z pełnej serii dla rejestru 1 i 2 i dopisuje je do `satellite_mandate_events` i `satellite_mandate_violations` (`INSERT … ON CONFLICT DO NOTHING`); UPDATE, DELETE i TRUNCATE odrzuca w bazie trigger. Wiersz zapisany raz zostaje, także gdy przeliczenie po rewizji danych go nie odtwarza. Raport cyklu rozróżnia zdarzenia nowe w przebiegu, zapisane wcześniej (licznik) i zapisane, nieodtworzone w bieżącym przeliczeniu (lista); pierwszy przebieg oznacza zasilenie początkowe liczbą zdarzeń i naruszeń. Zapis następuje także przy danych niezweryfikowanych, ze statusem danych w wierszu. Naruszenia zapisuje się dla okien kończących się w tygodniach ISO zakończonych przed tygodniem D; tydzień D raport pokazuje jako bieżący, a zapis następuje w kolejnym cyklu. Zdarzenia alertów zapisuje się wszystkie.
 
 **T39.** Tolerancja uzgodnienia M78: ≤ 0,01% wartości rachunku na datę migawki. [S]
 

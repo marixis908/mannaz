@@ -11,8 +11,8 @@
 --    odczyt P2 2026-10-14). SPYI (id 3) zostaje rdzeniem, wiersz bez zmian.
 -- 3. `satellite_mandate_events` i `satellite_mandate_violations` — rejestr M89
 --    tylko do dopisywania: wiersz zapisany raz zostaje także wtedy, gdy
---    przeliczenie po rewizji danych go nie odtwarza. UPDATE i DELETE odrzuca
---    trigger. Zapis: etap satelity cyklu, INSERT ... ON CONFLICT DO NOTHING.
+--    przeliczenie po rewizji danych go nie odtwarza. UPDATE, DELETE i TRUNCATE
+--    odrzucają triggery (rew. 2 briefu: TRUNCATE, FOR EACH STATEMENT). Zapis: etap satelity cyklu, INSERT ... ON CONFLICT DO NOTHING.
 --
 -- Idempotentny: drugie zastosowanie = 0 zmian. Zgodny wstecz: kod sprzed
 -- B-38B nie czyta nowych obiektów, a wiersza SXR8 nie wybiera do cen ani
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS satellite_mandate_violations (
     CONSTRAINT uq_satellite_mandate_violations UNIQUE (registry, component, window_end)
 );
 
--- 5. Tylko dopisywanie: UPDATE i DELETE odrzucone w bazie.
+-- 5. Tylko dopisywanie: UPDATE, DELETE i TRUNCATE odrzucone w bazie.
 CREATE OR REPLACE FUNCTION satellite_registry_append_only() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -95,6 +95,18 @@ BEGIN
         CREATE TRIGGER trg_satellite_mandate_violations_append_only
             BEFORE UPDATE OR DELETE ON satellite_mandate_violations
             FOR EACH ROW EXECUTE FUNCTION satellite_registry_append_only();
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_satellite_mandate_events_no_truncate'
+                   AND tgrelid = 'satellite_mandate_events'::regclass) THEN
+        CREATE TRIGGER trg_satellite_mandate_events_no_truncate
+            BEFORE TRUNCATE ON satellite_mandate_events
+            FOR EACH STATEMENT EXECUTE FUNCTION satellite_registry_append_only();
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_satellite_mandate_violations_no_truncate'
+                   AND tgrelid = 'satellite_mandate_violations'::regclass) THEN
+        CREATE TRIGGER trg_satellite_mandate_violations_no_truncate
+            BEFORE TRUNCATE ON satellite_mandate_violations
+            FOR EACH STATEMENT EXECUTE FUNCTION satellite_registry_append_only();
     END IF;
 END $$;
 

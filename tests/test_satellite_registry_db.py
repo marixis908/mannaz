@@ -110,6 +110,24 @@ def test_e_trigger_rejects_update_and_delete(conn, insert_sql, row, update_sql, 
 
 
 @pytest.mark.db
+def test_e2_trigger_rejects_truncate(conn):
+    """Rew. 2 briefu: TRUNCATE obu tabel M89 odrzucony; kontrolka dodatnia —
+    TRUNCATE tabeli tymczasowej w tej samej transakcji przechodzi."""
+    with conn.cursor() as cur:
+        for table in ("satellite_mandate_events", "satellite_mandate_violations"):
+            with pytest.raises(psycopg.errors.RaiseException, match="tylko do dopisywania: TRUNCATE"):
+                with conn.transaction():
+                    cur.execute(f"TRUNCATE {table}")
+        cur.execute("CREATE TEMP TABLE t_b38b_truncate_ctl (x int) ON COMMIT DROP")
+        cur.execute("INSERT INTO t_b38b_truncate_ctl VALUES (1)")
+        with conn.transaction():
+            cur.execute("TRUNCATE t_b38b_truncate_ctl")
+        cur.execute("SELECT count(*) FROM t_b38b_truncate_ctl")
+        assert cur.fetchone()[0] == 0
+    conn.rollback()
+
+
+@pytest.mark.db
 def test_f_unique_and_on_conflict_do_nothing_no_duplicates(conn):
     an, axis = _analysis_1990()
     d = axis[-1]
