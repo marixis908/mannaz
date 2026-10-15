@@ -92,6 +92,16 @@ TRANSFER_INTERNAL_RE = re.compile(
 TRANSFER_EXTERNAL_RE = re.compile(r"^Przelew na zewnątrz$")
 TRANSFER_TO_BROKER_RE = re.compile(r"^Przelew do DM BOŚ$")
 
+# --- wymiana waluty na rachunku (brief CC-FX, B-63) --------------------------
+# Kurs w tytule = PLN za 1 jednostkę waluty obcej pary (zmierzone na eksporcie
+# 2026-10-15: 25633,80 USD × 3,9011 = 100000,02 PLN). Obie nogi (PLN i waluta
+# obca) mają ten sam tytuł; kontrola pary nóg w `_fx_leg_failures`.
+FX_EXCHANGE_RE = re.compile(
+    r"^Wymiana waluty (?P<pair>[A-Z]{3}/[A-Z]{3}) (?P<rate>\d+(?:\.\d+)?)$"
+)
+FX_FEE_RE = re.compile(r"^Opłata za wymianę waluty (?P<pair>[A-Z]{3}/[A-Z]{3})$")
+FX_LEG_TOL_PER_RATE = Decimal("0.01")  # |kwota obca × kurs − |kwota PLN|| <= 0,01 × kurs
+
 # --- zdarzenia korporacyjne -------------------------------------------------
 
 CERT_REDEMPTION_RE = re.compile(
@@ -345,6 +355,17 @@ def parse_title(title: str) -> ParsedTitle:
     if TRANSFER_TO_BROKER_RE.match(title):
         return ParsedTitle(row_type="przelew_do_domu_maklerskiego")
 
+    m = FX_EXCHANGE_RE.match(title)
+    if m:
+        return ParsedTitle(
+            row_type="wymiana_waluty",
+            extra={"pair": m.group("pair"), "rate": Decimal(m.group("rate"))},
+        )
+
+    m = FX_FEE_RE.match(title)
+    if m:
+        return ParsedTitle(row_type="oplata_wymiana_waluty", extra={"pair": m.group("pair")})
+
     m = CERT_REDEMPTION_RE.match(title)
     if m:
         return ParsedTitle(
@@ -423,11 +444,43 @@ def _sha256_of_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _fx_legs_match(pair: str, rate: Decimal, legs: list[RawRow]) -> bool:
+    """Para nóg jednej wymiany: para walut z PLN, tyle samo nóg PLN co obcych,
+    nogi parowane po |kwocie|, przeciwne znaki, |obca × kurs − |PLN|| <= tolerancja."""
+    ccys = pair.split("/")
+    if "PLN" not in ccys or len(set(ccys)) != 2:
+        return False
+    foreign = ccys[0] if ccys[1] == "PLN" else ccys[1]
+    pln = sorted((r.amount for r in legs if r.currency == "PLN"), key=abs)
+    fgn = sorted((r.amount for r in legs if r.currency == foreign), key=abs)
+    if not pln or len(pln) != len(fgn) or len(pln) + len(fgn) != len(legs):
+        return False
+    tol = FX_LEG_TOL_PER_RATE * rate
+    for a_pln, a_fgn in zip(pln, fgn):
+        if a_pln * a_fgn >= 0 or abs(abs(a_fgn) * rate - abs(a_pln)) > tol:
+            return False
+    return True
+
+
+def _fx_leg_failures(rows: list[RawRow]) -> set[int]:
+    """Indeksy wierszy `wymiana_waluty`, których grupa (data, rachunek, para,
+    kurs) nie tworzy zgodnych par nóg (decyzja 4 briefu CC-FX)."""
+    groups: dict[tuple, list[int]] = {}
+    for i, r in enumerate(rows):
+        if r.parsed.row_type == "wymiana_waluty":
+            k = (r.transaction_date, r.rachunek, r.parsed.extra["pair"], r.parsed.extra["rate"])
+            groups.setdefault(k, []).append(i)
+    bad: set[int] = set()
+    for (_, _, pair, rate), idx in groups.items():
+        if not _fx_legs_match(pair, rate, [rows[i] for i in idx]):
+            bad.update(idx)
+    return bad
+
+
 def parse_source_file(path: Path) -> ParsedFile:
     path = Path(path)
     sha256 = _sha256_of_file(path)
     rows: list[RawRow] = []
-    unknown_titles: list[str] = []
     occurrence_counter: dict[tuple, int] = {}
 
     with open(path, encoding="utf-8-sig", newline="") as fh:
@@ -448,8 +501,6 @@ def parse_source_file(path: Path) -> ParsedFile:
             occurrence_no = occurrence_counter[key]
 
             parsed = parse_title(title_raw)
-            if parsed.row_type == "unknown":
-                unknown_titles.append(title_raw)
 
             rows.append(
                 RawRow(
@@ -464,6 +515,12 @@ def parse_source_file(path: Path) -> ParsedFile:
                     parsed=parsed,
                 )
             )
+
+    # Nogi wymiany bez pary albo z rozjazdem kwot -> wiersz nieznany (ten sam
+    # tor co nieznany tytuł: plik nie zaimportowany, DATA FAILURE).
+    for i in _fx_leg_failures(rows):
+        rows[i].parsed = ParsedTitle(row_type="unknown")
+    unknown_titles = [r.title_raw for r in rows if r.parsed.row_type == "unknown"]
 
     return ParsedFile(
         path=path,

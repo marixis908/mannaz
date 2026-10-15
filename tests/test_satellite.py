@@ -233,22 +233,22 @@ def test_unknown_row_type_raises():
         external_flow_pln([_row("cos_nowego", 1.0)], ONE)
 
 
-def test_flow_class_complete_21_types():
-    assert len(FLOW_CLASS) == 21
+def test_flow_class_complete_23_types():
+    assert len(FLOW_CLASS) == 23
     assert {v for v in FLOW_CLASS.values()} == {"zewnetrzny", "wewnetrzny", "handel", "dochod", "koszt"}
     expected = {
         "zewnetrzny": {"przelew_do_domu_maklerskiego", "przelew_zewnetrzny", "bilans_otwarcia"},
-        "wewnetrzny": {"przelew_wewnetrzny"},
+        "wewnetrzny": {"przelew_wewnetrzny", "wymiana_waluty"},
         "handel": {"kupno", "sprzedaz", "zamiana_akcji", "zamiana_przyjecie", "zamiana_wydanie",
                    "wykup_certyfikatow", "depozyt_doplata", "depozyt_zwrot"},
         "dochod": {"dywidenda_gpw", "dywidenda_netto", "dywidenda_brutto"},
         "koszt": {"podatek_dywidenda", "oplata_rachunek", "oplata_prowadzenie_rachunku", "oplata_przechowanie",
-                  "oplata_transakcyjna", "prowizja_wygasniecie"},
+                  "oplata_transakcyjna", "prowizja_wygasniecie", "oplata_wymiana_waluty"},
     }
     for cls, types in expected.items():
         for t in types:
             assert classify(t) == cls
-    assert sum(len(v) for v in expected.values()) == 21
+    assert sum(len(v) for v in expected.values()) == 23
 
 
 def test_is_core_override_makes_everything_external():

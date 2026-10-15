@@ -78,6 +78,7 @@ FLOW_CLASS: dict[str, str] = {
     "przelew_zewnetrzny": "zewnetrzny",
     "bilans_otwarcia": "zewnetrzny",
     "przelew_wewnetrzny": "wewnetrzny",
+    "wymiana_waluty": "wewnetrzny",  # przewalutowanie na tym samym rachunku (B-63)
     "kupno": "handel",
     "sprzedaz": "handel",
     "zamiana_akcji": "handel",
@@ -95,6 +96,7 @@ FLOW_CLASS: dict[str, str] = {
     "oplata_przechowanie": "koszt",
     "oplata_transakcyjna": "koszt",
     "prowizja_wygasniecie": "koszt",
+    "oplata_wymiana_waluty": "koszt",
 }
 
 
@@ -1605,7 +1607,9 @@ def analyze_series(
 
 ATTRIB_DAILY_TOL = 0.01  # decyzja 4: |roznica dzienna| > 0,01 PLN -> naruszenie
 ATTRIB_CUM_TOL = 1.00  # decyzja 4: |roznica skumulowana| > 1,00 PLN -> naruszenie
-ATTRIB_FEE_ROW_TYPES = ("oplata_rachunek", "oplata_prowadzenie_rachunku", "oplata_przechowanie")
+ATTRIB_FEE_ROW_TYPES = (
+    "oplata_rachunek", "oplata_prowadzenie_rachunku", "oplata_przechowanie", "oplata_wymiana_waluty",
+)
 ATTRIB_CROSS = (("by_account", "account"), ("by_emitent", "emitent"), ("by_currency", "currency"))
 ATTRIB_POSITIONAL_KINDS = ("pozycja", "kontrakt")
 ATTRIB_CONVENTIONS = (
@@ -1733,6 +1737,8 @@ def _attribute_day(
         cls = classify(r.row_type, r.is_core)
         if grp == KONTRAKTOWY_GROUP:
             continue  # KONTRAKTOWY idzie przez `kon_rows`
+        if r.row_type == "wymiana_waluty":
+            continue  # obie nogi zostaja w liniach gotowki (rachunek, waluta); spread = ich suma (B-63)
         non_cash = r.row_type in non_cash_types
         x = 1.0
         if not non_cash:
