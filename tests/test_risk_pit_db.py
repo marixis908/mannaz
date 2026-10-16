@@ -395,11 +395,17 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn, monkey
             "RRX": (Decimal("147.1249443064230666500510631"), Decimal("138.4614601726314087088018862")),
         }
         prev_by_key = {(r.rachunek, r.instrument_id, r.settlement_currency): r for r in summary.rows}
-        differing = {}
+        assert len(prev_by_key) == len(summary.rows)
+        assert set(prev_by_key) == {(r.rachunek, r.instrument_id, r.settlement_currency) for r in summary_419.rows}
+        changed = []
         for r in summary_419.rows:
             p = prev_by_key[(r.rachunek, r.instrument_id, r.settlement_currency)]
             if p.stop_effective != r.stop_effective:
-                differing[r.broker_ticker] = (p.stop_effective.quantize(q), r.stop_effective.quantize(q))
+                changed.append((r.broker_ticker, p.stop_effective.quantize(q), r.stop_effective.quantize(q)))
+        # recenzja Codexa R2' MINOR-1: liczba pozycji przed redukcja do slownika po tickerze
+        assert len(changed) == len(expected_stops) == 4
+        differing = {t: (a, b) for t, a, b in changed}
+        assert len(differing) == len(changed)
         assert differing == {t: (a.quantize(q), b.quantize(q)) for t, (a, b) in expected_stops.items()}
     finally:
         conn.rollback()
