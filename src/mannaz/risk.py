@@ -1150,6 +1150,186 @@ def resolve_default_risk_date_pure(candidates_with_completeness: list[tuple[date
 
 
 # ---------------------------------------------------------------------------
+# Rew. 4.19 (brief CC-CH2) — reguła stopu jako dane: Chandelier okresu
+# posiadania (A), kotwica 2N kontraktów w cenach bazy (B1), kontekst trendu (A8).
+# Jedna czysta funkcja `compute_position_stop` z flagami reguły — wariant
+# poprzedniej reguły (A5) to to samo wywołanie z `RULE_PREV`, bez kopii pętli.
+# ---------------------------------------------------------------------------
+
+STOP_RULE_VERSION = "4.19"
+
+
+@dataclass(frozen=True)
+class StopRule:
+    """hold_window: Chandelier = zapadka wartości Chandeliera okresu posiadania
+    (okno od sesji po wejściu, A1-A4). base_anchor: loty kontraktu wyceniane
+    zamknięciem bazy z sesji transakcji (B1) — w bieżącym 2N i w 2N_held."""
+
+    hold_window: bool
+    base_anchor: bool
+
+
+RULE_419 = StopRule(True, True)
+RULE_PREV = StopRule(False, False)  # produkcja sprzed rew. 4.19
+
+
+class BaseAnchorMissingError(RuntimeError):
+    """B1: brak zamknięcia bazy w sesji transakcji lota kontraktu — DATA FAILURE,
+    nigdy ciche przejście na cenę kontraktu."""
+
+    def __init__(self, ticker: str, session_date: date):
+        self.ticker = ticker
+        self.session_date = session_date
+        super().__init__(f"{ticker}: brak zamkniecia bazy w sesji transakcji {session_date.isoformat()} (B1)")
+
+
+@dataclass
+class PositionStop:
+    entry_price: Decimal | None  # kotwica użyta w 2N (warstwa split_adj); kontrakt reguły 4.19: kotwica B1
+    stop_2n: Decimal | None
+    stop_2n_held: Decimal | None
+    stop_chandelier: Decimal | None
+    stop_effective: Decimal | None
+    stop_source: str | None
+    holding_period_start: date | None
+    entry_idx: int | None  # indeks sesji początku okresu posiadania (e)
+    ratchet_start_date: date
+    ratchet_start_idx: int
+
+
+def base_anchor_rows(
+    txn_rows: list[dict[str, Any]], dates: list[date], closes: list[Decimal], ticker: str
+) -> list[dict[str, Any]]:
+    """B1: cena KAŻDEGO lota zastąpiona zamknięciem bazy z sesji transakcji
+    (`_index_on_or_after`). Brak zamknięcia -> `BaseAnchorMissingError`."""
+    out = []
+    for r in txn_rows:
+        idx = _index_on_or_after(dates, r["date"])
+        close = closes[idx] if idx is not None else None
+        if close is None:
+            raise BaseAnchorMissingError(ticker, r["date"])
+        out.append(dict(r, price=close))
+    return out
+
+
+def hold_chandelier_at(
+    highs: list[Decimal],
+    lows: list[Decimal],
+    atr22: list[Decimal | None],
+    t: int,
+    e_idx: int,
+    is_short: bool,
+) -> Decimal | None:
+    """Chandelier okresu posiadania w sesji t: okno [max(e+1, t-21), t],
+    ATR22 z pełnej historii. Okno puste (t <= e) -> None."""
+    start = max(e_idx + 1, t - CHANDELIER_WINDOW + 1)
+    if start > t or atr22[t] is None:
+        return None
+    if is_short:
+        return min(lows[start : t + 1]) + CHANDELIER_ATR_MULT * atr22[t]
+    return max(highs[start : t + 1]) - CHANDELIER_ATR_MULT * atr22[t]
+
+
+def compute_position_stop(
+    txn_rows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    dates: list[date],
+    highs: list[Decimal],
+    lows: list[Decimal],
+    closes: list[Decimal],
+    atr20: list[Decimal | None],
+    atr22: list[Decimal | None],
+    chand_series: list[Decimal | None],
+    layer_factor: Decimal,
+    is_short: bool,
+    allow_short: bool,
+    as_of: date,
+    is_contract: bool,
+    ticker: str,
+    rule: StopRule,
+) -> PositionStop:
+    """Część stopu z pętli `run_risk` (czysta, bez kursora) sterowana flagami reguły.
+    RATCHET_START, początek okresu posiadania i daty lotów liczone z oryginalnych
+    wierszy (daty te same po podmianie cen B1)."""
+    d_idx = len(dates) - 1
+    rows = txn_rows
+    if rule.base_anchor and is_contract:
+        rows = base_anchor_rows(txn_rows, dates, closes, ticker)
+
+    entry_result = compute_weighted_entry_price(rows, events, allow_short=allow_short)
+    entry_price = entry_result.entry_price / layer_factor if entry_result.entry_price is not None else None
+    last_idx = None
+    if entry_result.last_remaining_date is not None:
+        last_idx = _index_on_or_before(dates, entry_result.last_remaining_date)
+    atr20_at_last_entry = atr20[last_idx] if last_idx is not None else None
+    stop_2n = two_n_stop(entry_price, atr20_at_last_entry, is_short)
+
+    ratchet_start_date = resolve_ratchet_start(txn_rows, events, as_of)
+    ratchet_start_idx = _index_on_or_after(dates, ratchet_start_date)
+    if ratchet_start_idx is None:
+        ratchet_start_idx = d_idx
+
+    hps = holding_period_start(txn_rows, events)
+    e_idx = _index_on_or_after(dates, hps) if hps is not None else None
+
+    if rule.hold_window:
+        stop_chandelier = None
+        if e_idx is not None:
+            start = max(e_idx + 1, ratchet_start_idx)
+            if start <= d_idx:
+                values: list[Decimal | None] = [None] * (d_idx + 1)
+                for t in range(start, d_idx + 1):
+                    values[t] = hold_chandelier_at(highs, lows, atr22, t, e_idx, is_short)
+                stop_chandelier = ratchet_extreme(values, start, d_idx, is_short)
+    else:
+        stop_chandelier = ratchet_extreme(chand_series, ratchet_start_idx, d_idx, is_short)
+
+    held_2n = stop_2n_held(
+        rows, events, dates, atr20, ratchet_start_date, as_of,
+        layer_factor, is_short, allow_short, stop_2n,
+    )
+    stop_eff, stop_source = stop_effective(stop_2n, stop_chandelier, is_short, held_2n)
+    return PositionStop(
+        entry_price=entry_price,
+        stop_2n=stop_2n,
+        stop_2n_held=held_2n,
+        stop_chandelier=stop_chandelier,
+        stop_effective=stop_eff,
+        stop_source=stop_source,
+        holding_period_start=hps,
+        entry_idx=e_idx,
+        ratchet_start_date=ratchet_start_date,
+        ratchet_start_idx=ratchet_start_idx,
+    )
+
+
+def entry_against_trend(
+    anchor: Decimal | None,
+    chand_series: list[Decimal | None],
+    entry_idx: int | None,
+    is_short: bool,
+) -> bool | None:
+    """A8 (kontekst trendu, NIE stop): long — kotwica wejścia poniżej Chandeliera
+    kroczącego (22 sesje, bez zapadki) w sesji `e`; short — powyżej. None gdy
+    brak `e`, kotwicy albo Chandeliera w `e`."""
+    if entry_idx is None or anchor is None:
+        return None
+    chand_e = chand_series[entry_idx]
+    if chand_e is None:
+        return None
+    return (anchor > chand_e) if is_short else (anchor < chand_e)
+
+
+def prev_rule_needed(prev_rules: set) -> bool:
+    """A5: wariant poprzedniej reguły liczony tylko, gdy wersja reguły poprzedniej
+    oceny != bieżąca. Zbiór pusty (brak poprzedniej oceny) -> False; zbiór
+    != {STOP_RULE_VERSION} (w tym {None} — wiersze sprzed zmiany) -> True."""
+    if not prev_rules:
+        return False
+    return prev_rules != {STOP_RULE_VERSION}
+
+
+# ---------------------------------------------------------------------------
 # Orkiestracja / DB
 # ---------------------------------------------------------------------------
 
@@ -1193,6 +1373,17 @@ class PositionRiskRow:
     name_key: int | None = None
     name_risk_pct: Decimal | None = None
     note: str = ""
+    # rew. 4.19 (brief CC-CH2): zapisywane do risk_daily (sql/019)
+    stop_rule: str | None = None
+    stop_effective_prev_rule: Decimal | None = None
+    stop_source_prev_rule: str | None = None
+    risk_state_prev_rule: str | None = None  # 'HIGH' | 'NORMAL' | None
+    chandelier_rolling_ctx: Decimal | None = None
+    entry_against_trend: bool | None = None
+    entry_price_contract: Decimal | None = None  # tylko future: srednia wazona cen kontraktu
+    # tylko w pamieci (raport A8), nie zapisywane
+    holding_period_start: date | None = None
+    chandelier_rolling_at_entry: Decimal | None = None
 
 
 @dataclass
@@ -1634,6 +1825,16 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
         computed: list[PositionRiskRow] = []
         incomplete_items: list[IncompleteRiskItem] = []
 
+        # A5 (rew. 4.19): wersja reguly poprzedniej oceny. To zapytanie NIE wplywa
+        # na stop (stop nie czyta risk_daily) — tylko wlacza wariant poprzedniej
+        # reguly do kolumn *_prev_rule.
+        cur.execute(
+            "SELECT DISTINCT stop_rule FROM risk_daily "
+            "WHERE risk_date = (SELECT max(risk_date) FROM risk_daily WHERE risk_date < %s)",
+            (as_of,),
+        )
+        compute_prev_rule = prev_rule_needed({r[0] for r in cur.fetchall()})
+
         for pos in positions:
             broker_ticker = pos["broker_ticker"]
             rachunek = pos["rachunek"]
@@ -1733,31 +1934,48 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
             )
 
             first_idx = None
-            last_idx = None
             if entry_result.first_remaining_date is not None:
                 first_idx = _index_on_or_after(dates, entry_result.first_remaining_date)
-            if entry_result.last_remaining_date is not None:
-                last_idx = _index_on_or_before(dates, entry_result.last_remaining_date)
 
-            atr20_at_last_entry = atr20[last_idx] if last_idx is not None else None
-            stop_2n = two_n_stop(entry_price_adj, atr20_at_last_entry, is_short)
-
-            # --- stop_chandelier_D: zapadka od RATCHET_START deterministyczny
-            # (brief CC-S, S5, naprawa F4) — tylko z cen/transakcji <= D, zero
-            # zależności od risk_daily. txn_rows/events już przefiltrowane do
-            # <= as_of (_entry_transactions/_instrument_split_events). ---
-            ratchet_start_date = resolve_ratchet_start(txn_rows, events, as_of)
-            ratchet_start_idx = _index_on_or_after(dates, ratchet_start_date)
-            if ratchet_start_idx is None:
-                ratchet_start_idx = d_idx
-
-            stop_chandelier = ratchet_extreme(chand_series, ratchet_start_idx, d_idx, is_short)
-            # B-52 (brief CC-B52): zapadka 2N w bieżącym okresie posiadania.
-            held_2n = stop_2n_held(
-                txn_rows, events, dates, atr20, ratchet_start_date, as_of,
-                layer_factor, is_short, allow_short, stop_2n,
+            # Rew. 4.19: stop z reguly RULE_419 (A + B1); `entry_result`/`first_idx`
+            # zostaja z oryginalnych wierszy (notatki, chandelier_hold).
+            # `stop_chandelier`/zapadka 2N: tylko ceny/transakcje <= D (brief CC-S, S5,
+            # B-52), zero zaleznosci od risk_daily.
+            is_contract = instrument_type == "future"
+            stop_args = (
+                txn_rows, events, dates, highs, lows, closes, atr20, atr22, chand_series,
+                layer_factor, is_short, allow_short, as_of, is_contract, broker_ticker,
             )
-            stop_eff, stop_source = stop_effective(stop_2n, stop_chandelier, is_short, held_2n)
+            try:
+                ps = compute_position_stop(*stop_args, RULE_419)
+            except BaseAnchorMissingError as exc:
+                incomplete_items.append(
+                    IncompleteRiskItem(
+                        broker_ticker, yahoo_symbol, coverage.exchange,
+                        f"base_close_missing:{exc.session_date.isoformat()}",
+                    )
+                )
+                continue
+            stop_2n = ps.stop_2n
+            stop_chandelier = ps.stop_chandelier
+            stop_eff, stop_source = ps.stop_effective, ps.stop_source
+
+            # A5: wariant poprzedniej reguly (ta sama funkcja, RULE_PREV) — tylko
+            # gdy wersja reguly poprzedniej oceny != biezaca.
+            stop_prev = stop_source_prev = risk_state_prev = None
+            if compute_prev_rule:
+                ps_prev = compute_position_stop(*stop_args, RULE_PREV)
+                stop_prev, stop_source_prev = ps_prev.stop_effective, ps_prev.stop_source
+                prev_breached = is_breached(close_d, stop_prev, is_short)
+                risk_state_prev = (
+                    None if prev_breached is None else ("HIGH" if prev_breached else "NORMAL")
+                )
+
+            # A8: kontekst trendu (NIE stop) — stary skladnik chandelier (zapadka od
+            # RATCHET_START) i flaga wejscia wbrew trendowi.
+            chandelier_rolling_ctx = ratchet_extreme(chand_series, ps.ratchet_start_idx, d_idx, is_short)
+            chandelier_rolling_at_entry = chand_series[ps.entry_idx] if ps.entry_idx is not None else None
+            against_trend = entry_against_trend(ps.entry_price, chand_series, ps.entry_idx, is_short)
 
             # --- chandelier_from_entry: STARY wariant (zapadka od pierwszego
             # pozostałego lotu) — zachowany jako kolumna informacyjna, NIE
@@ -1797,7 +2015,7 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 is_core=is_core,
                 qty=qty,
                 position_kind=position_kind,
-                entry_price=entry_price_adj,
+                entry_price=ps.entry_price,
                 close_d=close_d,
                 atr20=atr20_d,
                 atr22=atr22_d,
@@ -1826,6 +2044,15 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                     coverage.price_instrument_id if instrument_type == "future" else None,
                 ),
                 note=note,
+                stop_rule=STOP_RULE_VERSION,
+                stop_effective_prev_rule=stop_prev,
+                stop_source_prev_rule=stop_source_prev,
+                risk_state_prev_rule=risk_state_prev,
+                chandelier_rolling_ctx=chandelier_rolling_ctx,
+                entry_against_trend=against_trend,
+                entry_price_contract=entry_price_adj if is_contract else None,
+                holding_period_start=ps.holding_period_start,
+                chandelier_rolling_at_entry=chandelier_rolling_at_entry,
             )
             computed.append(row)
 
@@ -2074,7 +2301,9 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             risk_pct_satellite_capital, level1_breach,
             regime, warning, multiplier_missing, price_is_stale, price_date_used,
             name_key, name_risk_pct,
-            note, computed_at, code_sha
+            note, computed_at, code_sha,
+            stop_rule, stop_effective_prev_rule, stop_source_prev_rule, risk_state_prev_rule,
+            chandelier_rolling_ctx, entry_against_trend, entry_price_contract
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s,
@@ -2085,6 +2314,8 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
             %s, %s, %s
         )
         """,
@@ -2099,5 +2330,7 @@ def _write_row(cur: psycopg.Cursor, risk_date: date, row: PositionRiskRow, compu
             row.regime, row.warning, row.multiplier_missing, row.price_is_stale, row.price_date_used,
             row.name_key, row.name_risk_pct,
             row.note, computed_at, code_sha(),
+            row.stop_rule, row.stop_effective_prev_rule, row.stop_source_prev_rule, row.risk_state_prev_rule,
+            row.chandelier_rolling_ctx, row.entry_against_trend, row.entry_price_contract,
         ),
     )

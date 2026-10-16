@@ -42,6 +42,7 @@ from mannaz.prices import PricesSummary, detect_window_fillers, run_prices_fetch
 from mannaz.provenance import triggered_by
 from mannaz.satellite import SatelliteStageResult, persistence_summary_line, run_satellite_stage
 from mannaz.risk import (
+    STOP_RULE_VERSION,
     IncompleteRiskDateError,
     IncompleteRiskItem,
     Level1Name,
@@ -346,6 +347,9 @@ class StopEventRow:
     # rozróżnia. `currency` (powyżej) to waluta WYCENY (quote_currency albo,
     # gdy brak, settlement_currency) — może być inna niż settlement_currency.
     settlement_currency: str
+    # Rew. 4.19 (A6/m4): stan wg POPRZEDNIEJ reguły na D (risk.PositionRiskRow.
+    # risk_state_prev_rule: 'HIGH'/'NORMAL'/None) — None poza pierwszym cyklem po zmianie reguły.
+    risk_state_prev_rule: str | None = None
 
 
 @dataclass(frozen=True)
@@ -359,6 +363,16 @@ class StopEvent:
     price_source_symbol: str | None
     currency: str
     settlement_currency: str
+    # Rew. 4.19 (A6/m4): przejście NORMAL -> HIGH spowodowane WYŁĄCZNIE zmianą reguły.
+    rule_change_only: bool = False
+
+
+def is_rule_change_only(risk_state_prev_rule: str | None) -> bool:
+    """Rew. 4.19 (A6/m4): zdarzenie M69 (przejście do HIGH względem poprzedniej
+    oceny, `stop_events`) jest „wyłącznie zmianą reguły” wtedy i tylko wtedy,
+    gdy stara reguła na D daje NORMAL (`risk_state_prev_rule`). Także dla pozycji
+    bez wiersza poprzedniej oceny: bez zmiany reguły zdarzenia by nie było."""
+    return risk_state_prev_rule == "NORMAL"
 
 
 def stop_events(
@@ -401,6 +415,7 @@ def stop_events(
                 price_source_symbol=row.price_source_symbol,
                 currency=row.currency,
                 settlement_currency=row.settlement_currency,
+                rule_change_only=is_rule_change_only(row.risk_state_prev_rule),
             )
         )
     return events
@@ -729,6 +744,9 @@ class StopOrderRow:
     atr22_threshold: Decimal | None  # 0,25*ATR22 na D, w stop_d_currency; None gdy brak ATR22
     base_symbol_label: str | None  # kontrakty: symbol bazy ("poziom na bazie"); inaczej None
     decision: str
+    # Rew. 4.19 (A5): 'poluzowanie' | 'zaostrzenie' | '0' albo None (brak wariantu poprzedniej reguły).
+    rule_change: str | None = None
+    is_contract: bool = False  # m2: nagłówek M62 dla kontraktów
 
 
 def stop_change_arrow(stop_d: Decimal | None, stop_prev: Decimal | None) -> str:
@@ -744,25 +762,54 @@ def stop_change_arrow(stop_d: Decimal | None, stop_prev: Decimal | None) -> str:
     return "bez zmiany"
 
 
-def build_stop_order_rows(
-    items: list[
-        tuple[
-            str, str, str, Decimal | None, str, str, Decimal | None, str | None, Decimal | None, bool | None
-        ]
-    ]
-) -> list[StopOrderRow]:
+def rule_change_direction(
+    position_kind: str, stop_new: Decimal | None, stop_prev_rule: Decimal | None
+) -> str | None:
+    """Rew. 4.19 (A5): kierunek zmiany stopu spowodowanej zmianą reguły — z
+    porównania `stop_effective` (nowa reguła) z `stop_effective_prev_rule` (stara
+    reguła, ta sama data D i dane). Long: nowa > stara = 'zaostrzenie'; short:
+    nowa < stara = 'zaostrzenie'; przeciwnie 'poluzowanie'; równe '0'. None, gdy
+    brak wariantu poprzedniej reguły (NULL) albo brak stopu."""
+    if stop_prev_rule is None or stop_new is None:
+        return None
+    if stop_new == stop_prev_rule:
+        return "0"
+    tighter = (stop_new < stop_prev_rule) if position_kind == "short" else (stop_new > stop_prev_rule)
+    return "zaostrzenie" if tighter else "poluzowanie"
+
+
+def rule_change_note(rule_change: str | None) -> str | None:
+    if rule_change is None:
+        return None
+    return f"zmiana reguły rew. {STOP_RULE_VERSION}: {rule_change}"
+
+
+# m2 (rew. 4.19): zdanie pod nagłówkiem M62, gdy tabela zawiera kontrakty.
+STOP_ORDER_CONTRACT_NOTE = (
+    "Stop kontraktu jest poziomem monitorowania ceny instrumentu bazowego; porównania używają cen bazy; "
+    "poziom zlecenia na kontrakcie wymaga odrębnego przeliczenia."
+)
+
+
+def build_stop_order_rows(items: list[tuple]) -> list[StopOrderRow]:
     """items: (broker_ticker, rachunek, position_kind, stop_d, stop_d_currency,
-    settlement_currency, stop_prev, base_symbol_label, atr22_d, below_stop),
-    jeden per pozycja satelity otwarta na D w `risk_daily`. Zwraca wiersze
-    posortowane: najpierw stan HIGH, potem decyzje zaczynające się od „tak”."""
+    settlement_currency, stop_prev, base_symbol_label, atr22_d, below_stop
+    [, stop_prev_rule, is_contract]) — jeden per pozycja satelity otwarta na D w
+    `risk_daily`; dwa ostatnie elementy opcjonalne (rew. 4.19:
+    `stop_effective_prev_rule` i flaga kontraktu). Zwraca wiersze posortowane:
+    najpierw stan HIGH, potem decyzje zaczynające się od „tak”."""
     rows: list[StopOrderRow] = []
-    for ticker, rachunek, kind, stop_d, ccy, settlement_ccy, stop_prev, base_label, atr22_d, below_stop in items:
+    for item in items:
+        ticker, rachunek, kind, stop_d, ccy, settlement_ccy, stop_prev, base_label, atr22_d, below_stop = item[:10]
+        stop_prev_rule = item[10] if len(item) > 10 else None
+        is_contract = bool(item[11]) if len(item) > 11 else False
         state = "HIGH" if below_stop is True else "NORMAL"
         threshold = STOP_ORDER_MIN_CHANGE_ATR * atr22_d if atr22_d is not None else None
         decision = stop_order_decision(kind, stop_d, stop_prev, atr22_d, below_stop)
         rows.append(
             StopOrderRow(
-                ticker, rachunek, kind, state, stop_d, ccy, settlement_ccy, stop_prev, threshold, base_label, decision
+                ticker, rachunek, kind, state, stop_d, ccy, settlement_ccy, stop_prev, threshold, base_label, decision,
+                rule_change_direction(kind, stop_d, stop_prev_rule), is_contract,
             )
         )
     rows.sort(
@@ -856,6 +903,40 @@ def format_money(value: Decimal | None, currency: str) -> str:
     if value is None:
         return "brak"
     return f"{format_number(value)} {currency}"
+
+
+# ---------------------------------------------------------------------------
+# A8 (rew. 4.19) — kontekst trendu (NIE stop): pozycje z wejściem wbrew trendowi
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TrendContextRow:
+    broker_ticker: str
+    rachunek: str
+    position_kind: str  # 'long' | 'short'
+    holding_period_start: date | None
+    anchor: Decimal | None  # kotwica wejścia (risk.PositionRiskRow.entry_price)
+    chandelier_rolling_at_entry: Decimal | None
+    chandelier_rolling_ctx: Decimal | None
+    currency: str
+    entry_against_trend: bool | None = True
+
+
+def trend_context_entries(rows: list[TrendContextRow], prev_date: date | None) -> list[TrendContextRow]:
+    """A8 (zmiana specyfikacji planisty 2026-10-16): pozycje z `entry_against_trend`
+    = True ORAZ początkiem okresu posiadania PO dacie poprzedniej oceny
+    (`holding_period_start > prev_date`); `prev_date` None (brak poprzedniej
+    oceny) -> wszystkie z flagą True. Stara pozycja z flagą True nie wraca w
+    raporcie, nowa tak."""
+    out = []
+    for r in rows:
+        if r.entry_against_trend is not True:
+            continue
+        if prev_date is not None and (r.holding_period_start is None or r.holding_period_start <= prev_date):
+            continue
+        out.append(r)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1250,9 @@ class ReportState:
 
     # Ryzyko
     risk_aggregates: RiskReportAggregates | None = None
+    # A8 (rew. 4.19): kontekst trendu — wynik `trend_context_entries` (już po
+    # filtrze wzgl. `prev_risk_date`); to NIE jest stop.
+    trend_context: list[TrendContextRow] = field(default_factory=list)
 
     # B-05: informacja (NIE DATA FAILURE, nie zatrzymuje cyklu, nie zmienia
     # kodu wyjścia): rewizje cen dostawcy z bieżącego przebiegu oraz
@@ -1406,7 +1490,8 @@ def _render_stop_section(state: ReportState) -> list[str]:
             f"| {e.broker_ticker} | {account_label(e.rachunek)} | {e.settlement_currency} | "
             f"{_fmt_date(e.price_date_used)} | "
             f"{format_money(e.close_d, e.currency)} | {format_money(e.stop_effective, e.currency)} | "
-            f"{e.stop_source} | {e.price_source_symbol or 'brak'} |"
+            f"{e.stop_source}{' (wyłącznie zmiana reguły)' if e.rule_change_only else ''} | "
+            f"{e.price_source_symbol or 'brak'} |"
         )
     return lines
 
@@ -1454,6 +1539,8 @@ def _render_stop_orders_section(state: ReportState) -> list[str]:
     if not state.stop_order_rows:
         lines.append("brak")
         return lines
+    if any(r.is_contract for r in state.stop_order_rows):
+        lines.append(STOP_ORDER_CONTRACT_NOTE)
     # Z2 (brief CC-C fix): kolumna "waluta rozliczenia" — patrz uzasadnienie w
     # `_render_stop_section`.
     lines.append(
@@ -1468,7 +1555,8 @@ def _render_stop_orders_section(state: ReportState) -> list[str]:
             f"{r.state} | {r.position_kind} | "
             f"{format_money(r.stop_d, r.stop_d_currency)} | {format_money(r.stop_prev, r.stop_d_currency)} | "
             f"{zmiana} | {format_money(r.atr22_threshold, r.stop_d_currency)} | "
-            f"{r.base_symbol_label or '-'} | {r.decision} |"
+            f"{r.base_symbol_label or '-'} | {r.decision}"
+            f"{'; ' + rule_change_note(r.rule_change) if r.rule_change is not None else ''} |"
         )
     return lines
 
@@ -1544,6 +1632,23 @@ def _render_risk_section(state: ReportState) -> list[str]:
             lines.append(f"    - {ticker}: cena z {_fmt_date(d)}")
     else:
         lines.append("- pozycje stale (T27): brak")
+    lines.append("")
+    lines.append("### Kontekst trendu (nie jest stopem)")
+    if not state.trend_context:
+        lines.append("brak")
+    else:
+        lines.append(
+            "| ticker | rachunek | kierunek | początek okresu | kotwica | Chandelier kroczący w e | "
+            "Chandelier kroczący na D |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
+        for t in state.trend_context:
+            lines.append(
+                f"| {t.broker_ticker} | {account_label(t.rachunek)} | {t.position_kind} | "
+                f"{_fmt_date(t.holding_period_start)} | {format_money(t.anchor, t.currency)} | "
+                f"{format_money(t.chandelier_rolling_at_entry, t.currency)} | "
+                f"{format_money(t.chandelier_rolling_ctx, t.currency)} |"
+            )
     return lines
 
 
@@ -2368,6 +2473,7 @@ def run_cycle(
                 price_source_symbol=price_source_symbols.get(row.instrument_id),
                 currency=row.quote_currency or row.settlement_currency,
                 settlement_currency=row.settlement_currency,
+                risk_state_prev_rule=row.risk_state_prev_rule,
             )
             for row in risk_summary.rows
         ]
@@ -2382,11 +2488,7 @@ def run_cycle(
         # przeglądzie nadzorcy, P1/P3) — dla kontraktu ATR jest już liczone na
         # instrumencie BAZOWYM przez `risk.run_risk` (patrz docstring modułu
         # risk.py, P4.2), więc `row.atr22` jest już właściwą wartością.
-        stop_order_items: list[
-            tuple[
-                str, str, str, Decimal | None, str, str, Decimal | None, str | None, Decimal | None, bool | None
-            ]
-        ] = []
+        stop_order_items: list[tuple] = []
         for row in risk_summary.rows:
             if not is_risk_budget_eligible(row.instrument_type, row.is_core):
                 continue
@@ -2404,9 +2506,32 @@ def run_cycle(
                     base_symbol_label,
                     row.atr22,
                     row.below_stop,
+                    row.stop_effective_prev_rule,
+                    row.instrument_type == "future",
                 )
             )
         state.stop_order_rows = build_stop_order_rows(stop_order_items)
+
+        # A8 (rew. 4.19): kontekst trendu (NIE stop) — satelita, nowe okresy
+        # posiadania względem poprzedniej oceny (`trend_context_entries`).
+        state.trend_context = trend_context_entries(
+            [
+                TrendContextRow(
+                    broker_ticker=row.broker_ticker,
+                    rachunek=row.rachunek,
+                    position_kind=row.position_kind,
+                    holding_period_start=row.holding_period_start,
+                    anchor=row.entry_price,
+                    chandelier_rolling_at_entry=row.chandelier_rolling_at_entry,
+                    chandelier_rolling_ctx=row.chandelier_rolling_ctx,
+                    currency=row.quote_currency or row.settlement_currency,
+                    entry_against_trend=row.entry_against_trend,
+                )
+                for row in risk_summary.rows
+                if is_risk_budget_eligible(row.instrument_type, row.is_core)
+            ],
+            prev_date,
+        )
 
         # HEARTBEAT — pokrycie n/N (price_date_used == D, stale wyłączone)
         satellite_rows = [r for r in risk_summary.rows if is_risk_budget_eligible(r.instrument_type, r.is_core)]
