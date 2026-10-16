@@ -381,6 +381,26 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn, monkey
         assert len(summary_419.rows) == 57
         assert summary_419.capital_satelite_pln == ref_capital_total
         assert abs(summary_419.capital_satelite_positions_pln - ref_capital_positions) < Decimal("0.01")
+
+        # Wartosci jawne obu regul (pomiar CC-CH2 po B-76, 2026-10-16, u5_measure.py):
+        # ryzyko satelity w % kapitalu i stopy pozycji, w ktorych reguly sie roznia
+        # (wszystkie z okresem posiadania < 22 sesji przed 24.09); pozostale 53 bez zmiany.
+        q = Decimal("1e-10")
+        assert abs(summary.total_risk_pct_satellite_capital - Decimal("3.691658489748660355839777537")) < q
+        assert abs(summary_419.total_risk_pct_satellite_capital - Decimal("3.858477905338277992089663065")) < q
+        expected_stops = {  # ticker: (RULE_PREV, RULE_419)
+            "TXT": (Decimal("46.52134207069217007720851533"), Decimal("38.94060201160326446095835376")),
+            "FMDVZ26": (Decimal("90.69648657101400322096806475"), Decimal("90.11648473995931322096806475")),
+            "MKSI": (Decimal("238.6311854078404729131229240"), Decimal("226.3611963941686229131229240")),
+            "RRX": (Decimal("147.1249443064230666500510631"), Decimal("138.4614601726314087088018862")),
+        }
+        prev_by_key = {(r.rachunek, r.instrument_id, r.settlement_currency): r for r in summary.rows}
+        differing = {}
+        for r in summary_419.rows:
+            p = prev_by_key[(r.rachunek, r.instrument_id, r.settlement_currency)]
+            if p.stop_effective != r.stop_effective:
+                differing[r.broker_ticker] = (p.stop_effective.quantize(q), r.stop_effective.quantize(q))
+        assert differing == {t: (a.quantize(q), b.quantize(q)) for t, (a, b) in expected_stops.items()}
     finally:
         conn.rollback()
 
