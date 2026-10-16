@@ -470,6 +470,43 @@ def test_t15_missing_base_close_raises_with_ticker_for_contract_b1():
     assert case(bars_ok, [(e, 1, 104)], rule=RULE_419, **kw).stop_2n == D(96)
 
 
+def test_t15b_lot_session_missing_from_series_is_data_failure_not_next_record():
+    """Recenzja Codexa R1, M1: `_price_series` pomija rekordy bez zamkniecia, wiec
+    brak sesji lota (wt. 2026-09-29) w serii nie moze zostac zastapiony nastepnym
+    rekordem (sr. 2026-09-30, close 120). Kontrprzyklad Codexa: kotwica 120,
+    stop 116, HIGH przy close 110 zamiast DATA FAILURE."""
+    lot = {"date": date(2026, 9, 29), "type": "kupno", "qty": D(1), "price": D(105)}
+    dates_gap = [date(2026, 9, 25), date(2026, 9, 30)]
+    closes_gap = [D(100), D(120)]
+    session_is_lot_date = lambda d: d  # noqa: E731 - sesja rynku = data lota (dzien sesyjny)
+    # bez kalendarza (czyste testy): stary wybor _index_on_or_after -> nastepny rekord
+    assert R.base_anchor_rows([lot], dates_gap, closes_gap, "FKTEST")[0]["price"] == D(120)
+    # z kalendarzem: brak rekordu sesji lota -> DATA FAILURE z tickerem
+    with pytest.raises(BaseAnchorMissingError, match="FKTEST") as ei:
+        R.base_anchor_rows([lot], dates_gap, closes_gap, "FKTEST", session_is_lot_date)
+    assert ei.value.session_date == date(2026, 9, 29)
+    # ta sama sciezka przez compute_position_stop (run_risk przekazuje lot_session)
+    n = len(dates_gap)
+    with pytest.raises(BaseAnchorMissingError, match="FKTEST"):
+        compute_position_stop(
+            [lot], [], dates_gap, [D(121), D(121)], [D(99), D(99)], closes_gap, [D(2)] * n, [D(2)] * n,
+            [None] * n, D(1), False, False, dates_gap[-1], True, "FKTEST", RULE_419, session_is_lot_date,
+        )
+    # kontrolka dodatnia: rekord sesji lota jest -> kotwica = jego zamkniecie
+    dates_ok = [date(2026, 9, 25), date(2026, 9, 29), date(2026, 9, 30)]
+    closes_ok = [D(100), D(110), D(120)]
+    assert R.base_anchor_rows([lot], dates_ok, closes_ok, "FKTEST", session_is_lot_date)[0]["price"] == D(110)
+
+
+def test_t15c_lot_session_resolver_uses_exchange_calendar():
+    """lot_session_resolver: pierwsza sesja kalendarza gieldy >= data lota (XWAR)."""
+    resolve = R.lot_session_resolver(R.EXCHANGE_TO_CALENDAR_CODE["GPW"], date(2026, 10, 15))
+    assert resolve(date(2026, 9, 29)) == date(2026, 9, 29)  # wtorek, sesja
+    assert resolve(date(2026, 10, 3)) == date(2026, 10, 5)  # sobota -> poniedzialek
+    assert resolve(date(2026, 10, 16)) is None  # po as_of: brak sesji w zakresie
+    assert R.lot_session_resolver(None, date(2026, 10, 15))(date(2026, 9, 29)) is None
+
+
 # ---------------------------------------------------------------- T16 (A8, zmiana specyfikacji)
 def _tcr(ticker, flag, hps):
     return TrendContextRow(

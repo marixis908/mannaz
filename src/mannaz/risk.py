@@ -1197,14 +1197,46 @@ class PositionStop:
     ratchet_start_idx: int
 
 
+def lot_session_resolver(calendar_code: str | None, as_of: date) -> Callable[[date], date | None]:
+    """B1 (recenzja Codexa R1, M1): sesja rynku bazy dla daty lota = pierwsza
+    sesja kalendarza giełdy >= data lota (i <= as_of). Seria cen pomija rekordy
+    bez zamknięcia (`_price_series`), więc następny rekord serii nie jest dowodem
+    następnej sesji rynku. Brak kalendarza albo data poza jego zakresem -> None
+    (DATA FAILURE w `base_anchor_rows`)."""
+    if calendar_code is None:
+        return lambda d: None
+    cal = xcals.get_calendar(calendar_code)
+
+    def resolve(d: date) -> date | None:
+        try:
+            sessions = cal.sessions_in_range(d.isoformat(), as_of.isoformat())
+        except ValueError:
+            return None
+        return sessions[0].date() if len(sessions) else None
+
+    return resolve
+
+
 def base_anchor_rows(
-    txn_rows: list[dict[str, Any]], dates: list[date], closes: list[Decimal], ticker: str
+    txn_rows: list[dict[str, Any]],
+    dates: list[date],
+    closes: list[Decimal],
+    ticker: str,
+    lot_session: Callable[[date], date | None] | None = None,
 ) -> list[dict[str, Any]]:
-    """B1: cena KAŻDEGO lota zastąpiona zamknięciem bazy z sesji transakcji
-    (`_index_on_or_after`). Brak zamknięcia -> `BaseAnchorMissingError`."""
+    """B1: cena KAŻDEGO lota zastąpiona zamknięciem bazy z sesji transakcji.
+    `lot_session` (run_risk: `lot_session_resolver`) wyznacza sesję rynku lota;
+    wymagany jest rekord serii DOKŁADNIE z tej sesji. Bez `lot_session` (czyste
+    testy) sesja = `_index_on_or_after` na serii. Brak zamknięcia ->
+    `BaseAnchorMissingError`."""
+    index_by_date = {d: i for i, d in enumerate(dates)}
     out = []
     for r in txn_rows:
-        idx = _index_on_or_after(dates, r["date"])
+        if lot_session is None:
+            idx = _index_on_or_after(dates, r["date"])
+        else:
+            session = lot_session(r["date"])
+            idx = index_by_date.get(session) if session is not None else None
         close = closes[idx] if idx is not None else None
         if close is None:
             raise BaseAnchorMissingError(ticker, r["date"])
@@ -1247,14 +1279,15 @@ def compute_position_stop(
     is_contract: bool,
     ticker: str,
     rule: StopRule,
+    lot_session: Callable[[date], date | None] | None = None,
 ) -> PositionStop:
     """Część stopu z pętli `run_risk` (czysta, bez kursora) sterowana flagami reguły.
     RATCHET_START, początek okresu posiadania i daty lotów liczone z oryginalnych
-    wierszy (daty te same po podmianie cen B1)."""
+    wierszy (daty te same po podmianie cen B1). `lot_session`: patrz `base_anchor_rows`."""
     d_idx = len(dates) - 1
     rows = txn_rows
     if rule.base_anchor and is_contract:
-        rows = base_anchor_rows(txn_rows, dates, closes, ticker)
+        rows = base_anchor_rows(txn_rows, dates, closes, ticker, lot_session)
 
     entry_result = compute_weighted_entry_price(rows, events, allow_short=allow_short)
     entry_price = entry_result.entry_price / layer_factor if entry_result.entry_price is not None else None
@@ -1946,8 +1979,16 @@ def run_risk(conn: psycopg.Connection, as_of: date | None = None, commit: bool =
                 txn_rows, events, dates, highs, lows, closes, atr20, atr22, chand_series,
                 layer_factor, is_short, allow_short, as_of, is_contract, broker_ticker,
             )
+            # B1: sesja lota z kalendarza giełdy bazy, nie z następnego rekordu serii.
+            lot_session = (
+                lot_session_resolver(
+                    EXCHANGE_TO_CALENDAR_CODE.get(coverage.exchange) if coverage.exchange else None, as_of
+                )
+                if is_contract
+                else None
+            )
             try:
-                ps = compute_position_stop(*stop_args, RULE_419)
+                ps = compute_position_stop(*stop_args, RULE_419, lot_session)
             except BaseAnchorMissingError as exc:
                 incomplete_items.append(
                     IncompleteRiskItem(
