@@ -1213,7 +1213,10 @@ def _z2_state_with_accounts_in_every_section() -> ReportState:
             decision="tak",
         )
     ]
-    # Zmiany pozycji
+    # Zmiany pozycji (B-74: wiersze renderowane dopiero po policzeniu wzgledem poprzedniej oceny;
+    # bez tych dwoch pol wiersz CCC/KONTRAKTOWY nie trafialby do raportu i test maskowania pomijalby te sekcje)
+    state.position_changes_computed = True
+    state.position_changes_prev_date = date(2026, 9, 18)
     state.position_changes = [
         PositionChange(broker_ticker="CCC", rachunek=_Z2_RACHUNEK_KONTRAKTOWY, rodzaj="nowa"),
     ]
