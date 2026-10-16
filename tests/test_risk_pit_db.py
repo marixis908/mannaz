@@ -293,14 +293,19 @@ def test_u5_open_market_gap_on_real_data_raises_and_writes_nothing(db_conn):
 
 
 @pytest.mark.db
-def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
+def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn, monkeypatch):
     """U5 (8): run_risk(2026-09-24, commit=False) — dzien inicjalizacji
     systemu, wg [Z] kazda pozycja ma komplet na D (cena dokladnie na D) —
     57 wierszy, stale_positions_count=0, a `capital_satelite_positions_pln`/
     `total_risk_pct_satellite_capital` rowne wartosci referencyjnej policzonej
     W TYM TESCIE z BIEZACEJ (sprzed przebiegu) tabeli risk_daily + instruments
     (sumy C = kapital pozycji, R = suma risk_pln pozycji uprawnionych do
-    budzetow) — regresja 24.09 nie moze sie zmienic (brief CC-U, fakt [Z])."""
+    budzetow) — regresja 24.09 nie moze sie zmienic (brief CC-U, fakt [Z]).
+    Rew. 4.19 (brief CC-CH2): wiersze 24.09 w bazie sa liczone stara regula
+    stopu, wiec referencja ryzyka obowiazuje dla RULE_PREV (podmiana w procesie);
+    przy RULE_419 zmienia sie tylko ryzyko (stop), kapital i liczba wierszy nie."""
+    import mannaz.risk as risk_module
+
     conn = db_conn
     d = date(2026, 9, 24)
     try:
@@ -357,7 +362,9 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
             (ref_satellite_risk_total / ref_capital_total * Decimal(100)) if ref_capital_total else None
         )
 
-        summary = run_risk(conn, as_of=d, commit=False)
+        with monkeypatch.context() as m:
+            m.setattr(risk_module, "RULE_419", risk_module.RULE_PREV)
+            summary = run_risk(conn, as_of=d, commit=False)
 
         assert len(summary.rows) == 57
         assert summary.stale_positions_count == 0
@@ -368,6 +375,12 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn):
         # suma Decimal (28 cyfr) w innej kolejnosci niz run_risk (kolejnosc
         # wierszy risk_daily zmienia sie po przeliczeniu D) — roznica do 1e-27
         assert abs(summary.total_risk_pct_satellite_capital - ref_total_risk_pct) < Decimal("1e-20")
+
+        # Rew. 4.19: regula biezaca — kapital i wiersze bez zmian (stop nie wchodzi do kapitalu).
+        summary_419 = run_risk(conn, as_of=d, commit=False)
+        assert len(summary_419.rows) == 57
+        assert summary_419.capital_satelite_pln == ref_capital_total
+        assert abs(summary_419.capital_satelite_positions_pln - ref_capital_positions) < Decimal("0.01")
     finally:
         conn.rollback()
 
@@ -500,5 +513,52 @@ def test_b36_explicit_d_with_incomplete_kontraktowy_raises_default_d_skips_it(db
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM risk_daily WHERE risk_date = %s", (d,))
             assert cur.fetchone()[0] == count_before
+    finally:
+        conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Rew. 4.19 (brief CC-CH2, C4): kolumny sql/019 w risk_daily po run_risk.
+# Ta sama transakcja, rollback; zadnego innego DML.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+def test_ch2_risk_daily_rule_419_columns_match_summary_rows(db_conn):
+    """Po run_risk(D, commit=False) wiersze risk_daily na D maja: stop_rule = '4.19'
+    wszedzie; entry_price_contract NOT NULL tylko dla future; chandelier_rolling_ctx,
+    entry_against_trend, stop_effective_prev_rule, stop_source_prev_rule,
+    risk_state_prev_rule zgodne z summary.rows (NULL albo wartosc)."""
+    conn = db_conn
+    d = resolve_default_risk_date(conn)
+    if d is None:
+        pytest.skip("brak sesji kompletnej wg T27 — nie da sie wyznaczyc D")
+    try:
+        summary = run_risk(conn, as_of=d, commit=False)
+        assert summary.rows, "brak wierszy ryzyka na D w bazie testowej"
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rachunek, instrument_id, settlement_currency, stop_rule, entry_price_contract,
+                       chandelier_rolling_ctx, entry_against_trend, stop_effective_prev_rule,
+                       stop_source_prev_rule, risk_state_prev_rule
+                FROM risk_daily WHERE risk_date = %s
+                """,
+                (d,),
+            )
+            db_rows = {(r[0], r[1], r[2]): r[3:] for r in cur.fetchall()}
+        assert len(db_rows) == len(summary.rows)
+        for row in summary.rows:
+            key = (row.rachunek, row.instrument_id, row.settlement_currency)
+            stop_rule, epc, ctx, eat, prev_eff, prev_src, prev_state = db_rows[key]
+            assert stop_rule == "4.19", key
+            assert (epc is not None) == (row.instrument_type == "future"), key
+            assert epc == row.entry_price_contract, key
+            assert ctx == row.chandelier_rolling_ctx, key
+            assert eat == row.entry_against_trend, key
+            assert prev_eff == row.stop_effective_prev_rule, key
+            assert prev_src == row.stop_source_prev_rule, key
+            assert prev_state == row.risk_state_prev_rule, key
+            assert prev_state in (None, "HIGH", "NORMAL"), key
     finally:
         conn.rollback()
