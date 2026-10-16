@@ -7,6 +7,7 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 calendar
     python -m mannaz.run_p3 corp-actions
     python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
+    python -m mannaz.run_p3 prices-correct --file CSV [--dry-run] [--convention TEKST]
     python -m mannaz.run_p3 satellite --from YYYY-MM-DD --to YYYY-MM-DD --out DIR [--account-values CSV] [--symbol-map CSV]
 
 Bez argumentów `--instrument-ids`/`--currencies`/`--start`/`--end`, `prices` i
@@ -25,9 +26,12 @@ NIGDY per-pozycji ilości/koszty/kwoty (zasada projektu)."""
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import psycopg
@@ -47,7 +51,13 @@ from mannaz.fx import DEFAULT_START as FX_DEFAULT_START
 from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
 from mannaz.instruments_map import run_instrument_mapping, run_instrument_mapping_from_file
 from mannaz.prices import DEFAULT_START as PRICES_DEFAULT_START
-from mannaz.prices import run_prices_fetch, session_closed
+from mannaz.prices import (
+    ManualCorrectionRejectedError,
+    ManualCorrectionSummary,
+    apply_manual_corrections,
+    run_prices_fetch,
+    session_closed,
+)
 from mannaz.provenance import triggered_by
 from mannaz.risk import level1_name_labels, level1_names_for_summary, run_risk
 from mannaz.satellite import run_satellite
@@ -126,6 +136,14 @@ def cmd_prices(args: argparse.Namespace) -> None:
         f"instruments_with_rejected_rows={summary.instruments_with_rejected_rows} "
         f"instruments_empty_response={summary.instruments_empty_response} "
         f"rows_rejected_total={summary.rows_rejected_total}"
+    )
+    # B-76: wypełniacze dostawcy — (a) identyczne, (b) zapisany inny, (c) brak wiersza.
+    print(
+        f"B-76: filler_identical={sum(r.filler_identical for r in summary.results)} "
+        f"filler_kept_total={summary.filler_kept_total} "
+        f"instruments_filler_kept={summary.instruments_filler_kept} "
+        f"filler_missing_total={summary.filler_missing_total} "
+        f"revisions_total={summary.revisions_total}"
     )
     for r in summary.results:
         print(
@@ -411,6 +429,73 @@ def cmd_prune_unclosed(args: argparse.Namespace) -> None:
         print(f"usuniete: {result.deleted}")
 
 
+def _read_correction_csv(path: Path) -> tuple[list[tuple], list[tuple[str, date | None, str]]]:
+    """B-76 (N1): CSV z nagłówkiem (co najmniej yahoo_symbol,date,open,high,low,
+    close,volume; inne kolumny ignorowane). Zwraca (wiersze, odrzucone przy
+    parsowaniu jako (symbol, data, powód))."""
+    rows: list[tuple] = []
+    bad: list[tuple[str, date | None, str]] = []
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        for rec in csv.DictReader(fh):
+            symbol = (rec.get("yahoo_symbol") or "").strip()
+            try:
+                price_date = date.fromisoformat((rec.get("date") or "").strip())
+            except ValueError:
+                bad.append((symbol, None, "data"))
+                continue
+            try:
+                vals = tuple(
+                    Decimal((rec.get(k) or "").strip()) for k in ("open", "high", "low", "close", "volume")
+                )
+            except InvalidOperation:
+                bad.append((symbol, price_date, "ohlc"))
+                continue
+            if not all(v.is_finite() for v in vals):
+                bad.append((symbol, price_date, "ohlc"))
+                continue
+            rows.append((symbol, price_date, *vals))
+    return rows, bad
+
+
+def cmd_prices_correct(args: argparse.Namespace) -> None:
+    """B-76 (N1): `prices-correct --file CSV [--dry-run] [--convention TEKST]`.
+    Wydruk (R6): sha256 pliku, liczności, per symbol liczba i zakres dat, lista
+    odrzuconych (symbol, data, powód), PASS/FAIL — bez wartości cen. Kod wyjścia
+    != 0 przy odrzuconych."""
+    path = Path(args.file)
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    rows, parse_bad = _read_correction_csv(path)
+    summary = ManualCorrectionSummary()
+    conn = get_connection()
+    try:
+        try:
+            summary = apply_manual_corrections(
+                # wszystko albo nic: blad parsowania CSV wymusza walidacje bez zapisu
+                conn, rows, convention=args.convention, dry_run=bool(args.dry_run) or bool(parse_bad)
+            )
+        except ManualCorrectionRejectedError as exc:
+            summary = exc.summary
+    finally:
+        conn.close()
+    rejected = parse_bad + summary.rejected
+    summary.rows_input += len(parse_bad)
+    print(f"plik: {path.name}")
+    print(f"sha256: {sha}")
+    print(f"tryb: {'dry-run (bez zapisu)' if args.dry_run else 'zapis'}")
+    print(f"wejscie: {summary.rows_input}")
+    print(f"do zapisu: {summary.rows_to_write}")
+    print(f"odrzucone: {len(rejected)}")
+    print(f"zapisane: {summary.rows_written}")
+    for symbol in sorted(summary.per_symbol):
+        lo, hi = summary.dates_per_symbol[symbol]
+        print(f"  {symbol}\t{summary.per_symbol[symbol]}\t{lo.isoformat()}..{hi.isoformat()}")
+    for symbol, price_date, reason in rejected:
+        print(f"  ODRZUCONY {symbol}\t{price_date.isoformat() if price_date else 'brak'}\t{reason}")
+    print("PASS" if not rejected else "FAIL")
+    if rejected:
+        sys.exit(1)
+
+
 def cmd_cycle(args: argparse.Namespace) -> None:
     conn = get_connection()
     try:
@@ -513,6 +598,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="liczba kandydatow z dry-run; rozjazd = rollback, nic nie usuniete"
     )
     p_prune.set_defaults(func=cmd_prune_unclosed)
+
+    p_corr = sub.add_parser(
+        "prices-correct",
+        help="B-76 (N1) — reczna korekta wierszy-wypelniaczy prices_daily z pliku CSV",
+    )
+    p_corr.add_argument("--file", required=True, help="CSV: yahoo_symbol,date,open,high,low,close,volume")
+    p_corr.add_argument("--dry-run", action="store_true", help="walidacja bez zapisu (rollback)")
+    p_corr.add_argument("--convention", default="tradingview_manual_b76")
+    p_corr.set_defaults(func=cmd_prices_correct)
 
     p_cycle = sub.add_parser(
         "cycle", help="C2-C7 — cykl tygodniowy: import -> FIFO -> bramka rejestracji -> ceny/FX -> ryzyko -> raport"

@@ -360,6 +360,10 @@ class SymbolPricesResult:
     # zastosować (nieznany kod / data poza zakresem / data niebędąca sesją).
     # Instrument bez kalendarza (calendar_code None) NIE liczy się tutaj.
     rows_calendar_fallback: int = 0
+    # B-76: wypełniacze dostawcy (O=H=L=C, volume 0) — patrz `is_provider_filler`.
+    filler_identical: int = 0  # zapisany wiersz identyczny na OHLC -> pominięty
+    filler_kept: int = 0  # zapisany wiersz inny -> NIE nadpisany
+    filler_missing: int = 0  # brak zapisanego wiersza -> niezapisany + wpis provider_filler
 
 
 @dataclass
@@ -385,6 +389,21 @@ class PricesSummary:
     instruments_calendar_fallback: int = 0
     # B-49: instrumenty, dla których fetch_ohlc padł dwukrotnie na błędzie sieci.
     instruments_connection_error: int = 0
+    # B-76: wypełniacze dostawcy — przypadek (b) (zapisany wiersz inny, nie nadpisany)
+    # i (c) (brak zapisanego wiersza, wpis `provider_filler`).
+    filler_kept_total: int = 0
+    instruments_filler_kept: int = 0
+    filler_missing_total: int = 0
+
+
+# B-76: wypełniacz dostawcy. Yahoo dla brakujących notowań zwraca O=H=L=C =
+# poprzednie zamknięcie i volume 0 (zmierzone: 262 takie wiersze w bazie, 0
+# wierszy z volume 0 innych niż wypełniacz; legalne płaskie sesje mają volume > 0).
+# volume None != 0, więc None to nie wypełniacz.
+def is_provider_filler(open_: Any, high: Any, low: Any, close: Any, volume: Any) -> bool:
+    if open_ is None or high is None or low is None or close is None or volume is None:
+        return False
+    return open_ == high == low == close and volume == 0
 
 
 # B-05 (Y3): kolumny OHLC split_adj wchodzące do porównania rewizji dostawcy
@@ -589,7 +608,14 @@ def run_prices_fetch(
     po `NETWORK_RETRY_SLEEP_SECONDS` (`sleep` wstrzykiwalne); druga porażka =
     wpis `ingest_errors` (`connection_error`), status instrumentu
     "connection_error", zero zapisów, przejście do następnego instrumentu.
-    Wyjątek spoza tej krotki przerywa etap (inne `YFException` -> `fetch_ohlc` zwraca [])."""
+    Wyjątek spoza tej krotki przerywa etap (inne `YFException` -> `fetch_ohlc` zwraca []).
+
+    B-76: wiersz-wypełniacz dostawcy (`is_provider_filler`: O=H=L=C i volume 0)
+    NIGDY nie jest zapisywany ani nie nadpisuje zapisanego wiersza i nie daje
+    `provider_revision`: (a) zapisany identyczny na OHLC -> pominięty po cichu;
+    (b) zapisany inny -> zostaje bez zmian (`filler_kept`); (c) brak zapisanego
+    -> niezapisany + wpis `ingest_errors` `provider_filler` (w cyklu to DATA
+    FAILURE). `rows_inserted` nie liczy pominiętych."""
     if end is None:
         end = date.today()
 
@@ -752,6 +778,34 @@ def run_prices_fetch(
             inserted = 0
             for row in valid_rows:
                 stored = stored_by_date.get(row.price_date)
+                # B-76: wypełniacz dostawcy nigdy nie trafia do INSERT/UPDATE ani do
+                # wykrywania rewizji (08.10: filler nadpisał poprawny wiersz).
+                if is_provider_filler(
+                    row.open_split_adj,
+                    row.high_split_adj,
+                    row.low_split_adj,
+                    row.close_split_adj,
+                    row.volume_split_adj,
+                ):
+                    if stored is not None:
+                        if _format_revision_detail(stored, row) is None:
+                            result.filler_identical += 1
+                        else:
+                            result.filler_kept += 1
+                            summary.filler_kept_total += 1
+                    else:
+                        _log_ingest_error(
+                            cur,
+                            source="yahoo",
+                            instrument_id=instrument_id,
+                            price_date=row.price_date,
+                            error_type="provider_filler",
+                            detail=f"Yahoo: O=H=L=C={row.close_split_adj}, volume 0; wiersz niezapisany (B-76)",
+                            run_started_at=run_started_at,
+                        )
+                        result.filler_missing += 1
+                        summary.filler_missing_total += 1
+                    continue
                 if stored is not None:
                     revision_detail = _format_revision_detail(stored, row)
                     if revision_detail is not None:
@@ -812,6 +866,8 @@ def run_prices_fetch(
                 )
                 inserted += 1
             result.rows_inserted = inserted
+            if result.filler_kept:
+                summary.instruments_filler_kept += 1
 
             # source_runs.sha256_input jest zdefiniowany dla plików (P2.4); dla API
             # bez pliku wejściowego używamy sha256 deterministycznego opisu zapytania
@@ -833,4 +889,196 @@ def run_prices_fetch(
         if commit:
             conn.commit()
 
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# B-76 — detektor wypełniaczy w oknie sesji (K1)
+# ---------------------------------------------------------------------------
+
+
+def find_window_fillers(rows: Any, d: date, window: int = 22) -> list[tuple[str, str | None, date]]:
+    """B-76: czysty detektor. `rows` = iterowalne krotki (symbol, exchange,
+    price_date, open, high, low, close, volume). Okno liczone PER GIEŁDA
+    (exchange None = osobna grupa): ostatnie `window` RÓŻNYCH `price_date` <= d
+    wśród wierszy tej giełdy (sesja = data z ceną, jak w risk.py). Zwraca
+    (symbol, exchange, price_date) wierszy-wypełniaczy w oknie swojej giełdy,
+    posortowane (symbol, data). Wiersze z datą > d są ignorowane."""
+    by_exchange: dict[str | None, list[tuple[str, date, bool]]] = {}
+    for symbol, exchange, price_date, open_, high, low, close, volume in rows:
+        if price_date > d:
+            continue
+        by_exchange.setdefault(exchange, []).append(
+            (symbol, price_date, is_provider_filler(open_, high, low, close, volume))
+        )
+    found: list[tuple[str, str | None, date]] = []
+    for exchange, items in by_exchange.items():
+        sessions = sorted({pd_ for _, pd_, _ in items}, reverse=True)
+        in_window = {pd_ for rank, pd_ in enumerate(sessions, start=1) if rank <= window}
+        for symbol, pd_, is_filler in items:
+            if is_filler and pd_ in in_window:
+                found.append((symbol, exchange, pd_))
+    found.sort(key=lambda t: (t[0], t[2]))
+    return found
+
+
+def detect_window_fillers(cur: psycopg.Cursor, d: date, window: int = 22) -> list[tuple[str, str | None, date]]:
+    """B-76: wersja bazodanowa `find_window_fillers` — jedno zapytanie
+    (price_date w [d - 120 dni, d], bez filtra source; symbol =
+    COALESCE(yahoo_symbol, broker_ticker))."""
+    cur.execute(
+        """
+        SELECT COALESCE(i.yahoo_symbol, i.broker_ticker), i.exchange, p.price_date,
+               p.open_split_adj, p.high_split_adj, p.low_split_adj, p.close_split_adj,
+               p.volume_split_adj
+        FROM prices_daily p
+        JOIN instruments i ON i.id = p.instrument_id
+        WHERE p.price_date <= %s AND p.price_date >= %s
+        """,
+        (d, d - timedelta(days=120)),
+    )
+    return find_window_fillers(cur.fetchall(), d, window)
+
+
+# ---------------------------------------------------------------------------
+# B-76 — korekta ręczna wypełniaczy (N1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ManualCorrectionSummary:
+    rows_input: int = 0
+    rows_to_write: int = 0
+    # (yahoo_symbol, price_date, powód): "symbol" / "brak wiersza" / "nie filler" / "ohlc" / "duplikat"
+    rejected: list[tuple[str, date | None, str]] = field(default_factory=list)
+    rows_written: int = 0
+    per_symbol: dict[str, int] = field(default_factory=dict)
+    dates_per_symbol: dict[str, tuple[date, date]] = field(default_factory=dict)
+
+
+class ManualCorrectionRejectedError(RuntimeError):
+    """B-76: korekta ręczna z >0 odrzuconych wierszy — rollback całości."""
+
+    def __init__(self, summary: ManualCorrectionSummary):
+        super().__init__(f"korekta reczna odrzucona: {len(summary.rejected)} wierszy odrzuconych (rollback)")
+        self.summary = summary
+
+
+def apply_manual_corrections(
+    conn: psycopg.Connection,
+    rows: list[tuple[str, date, Any, Any, Any, Any, Any]],
+    *,
+    convention: str = "tradingview_manual_b76",
+    dry_run: bool = True,
+    now: datetime | None = None,
+) -> ManualCorrectionSummary:
+    """B-76 (N1): ręczna korekta WYŁĄCZNIE wierszy-wypełniaczy (`prices_daily`,
+    source='yahoo'). `rows` = (yahoo_symbol, price_date, open, high, low, close,
+    volume). Odrzucane (powód): "symbol" (nie dokładnie jeden instrument z tym
+    yahoo_symbol), "brak wiersza", "nie filler" (zapisany wiersz nie jest
+    wypełniaczem), "ohlc" (wartości niedodatnie/niespójne), "duplikat" (ten sam
+    symbol+data dwa razy w wejściu). Wszystko albo nic: jedna transakcja;
+    commit tylko gdy nie `dry_run` i 0 odrzuconych; `dry_run` -> rollback
+    zawsze (zwraca podsumowanie, nic nie zapisuje); przy >0 odrzuconych i
+    `dry_run=False` -> rollback + `ManualCorrectionRejectedError`."""
+    run_started_at = now if now is not None else datetime.now(timezone.utc)
+    summary = ManualCorrectionSummary(rows_input=len(rows))
+    planned: list[tuple[int, str, date, tuple[Any, ...], tuple[Any, ...]]] = []
+    seen: set[tuple[str, date]] = set()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ingest_errors_table(cur)
+            for symbol, price_date, o_, h_, l_, c_, v_ in rows:
+                if (symbol, price_date) in seen:
+                    summary.rejected.append((symbol, price_date, "duplikat"))
+                    continue
+                seen.add((symbol, price_date))
+                cur.execute("SELECT id FROM instruments WHERE yahoo_symbol = %s", (symbol,))
+                found = cur.fetchall()
+                if len(found) != 1:
+                    summary.rejected.append((symbol, price_date, "symbol"))
+                    continue
+                instrument_id = found[0][0]
+                cur.execute(
+                    """
+                    SELECT open_split_adj, high_split_adj, low_split_adj, close_split_adj, volume_split_adj
+                    FROM prices_daily
+                    WHERE instrument_id = %s AND price_date = %s AND source = 'yahoo'
+                    """,
+                    (instrument_id, price_date),
+                )
+                stored = cur.fetchone()
+                if stored is None:
+                    summary.rejected.append((symbol, price_date, "brak wiersza"))
+                    continue
+                if not is_provider_filler(*stored):
+                    summary.rejected.append((symbol, price_date, "nie filler"))
+                    continue
+                vals = (o_, h_, l_, c_, v_)
+                if (
+                    any(x is None for x in vals)
+                    or any(x <= 0 for x in vals)
+                    or l_ > min(o_, c_)
+                    or h_ < max(o_, c_)
+                ):
+                    summary.rejected.append((symbol, price_date, "ohlc"))
+                    continue
+                planned.append((instrument_id, symbol, price_date, vals, tuple(stored)))
+            summary.rows_to_write = len(planned)
+
+            if not dry_run and not summary.rejected:
+                for instrument_id, symbol, price_date, (o_, h_, l_, c_, v_), stored in planned:
+                    events = _instrument_split_events(cur, instrument_id)
+                    cur.execute(
+                        """
+                        UPDATE prices_daily SET
+                            open_split_adj = %s, high_split_adj = %s, low_split_adj = %s,
+                            close_split_adj = %s, volume_split_adj = %s,
+                            open_raw = %s, high_raw = %s, low_raw = %s, close_raw = %s,
+                            adjustment_convention = %s, fetched_at = now()
+                        WHERE instrument_id = %s AND price_date = %s AND source = 'yahoo'
+                        """,
+                        (
+                            o_,
+                            h_,
+                            l_,
+                            c_,
+                            v_,
+                            reconstruct_raw(o_, price_date, events),
+                            reconstruct_raw(h_, price_date, events),
+                            reconstruct_raw(l_, price_date, events),
+                            reconstruct_raw(c_, price_date, events),
+                            convention,
+                            instrument_id,
+                            price_date,
+                        ),
+                    )
+                    _log_ingest_error(
+                        cur,
+                        source="tradingview",
+                        instrument_id=instrument_id,
+                        price_date=price_date,
+                        error_type="manual_correction",
+                        detail=(
+                            "B-76: old O/H/L/C/V="
+                            + "/".join(str(x) for x in stored)
+                            + " new="
+                            + "/".join(str(x) for x in (o_, h_, l_, c_, v_))
+                        ),
+                        run_started_at=run_started_at,
+                    )
+                    summary.rows_written += 1
+        for _, symbol, price_date, _, _ in planned:
+            summary.per_symbol[symbol] = summary.per_symbol.get(symbol, 0) + 1
+            lo, hi = summary.dates_per_symbol.get(symbol, (price_date, price_date))
+            summary.dates_per_symbol[symbol] = (min(lo, price_date), max(hi, price_date))
+        if not dry_run and not summary.rejected:
+            conn.commit()
+        else:
+            conn.rollback()
+    except BaseException:
+        conn.rollback()
+        raise
+    if summary.rejected and not dry_run:
+        raise ManualCorrectionRejectedError(summary)
     return summary

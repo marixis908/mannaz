@@ -38,7 +38,7 @@ from mannaz.import_history import (
     import_parsed_files,
 )
 from mannaz.parse_history import ParsedFile, parse_source_file
-from mannaz.prices import PricesSummary, run_prices_fetch
+from mannaz.prices import PricesSummary, detect_window_fillers, run_prices_fetch
 from mannaz.provenance import triggered_by
 from mannaz.satellite import SatelliteStageResult, persistence_summary_line, run_satellite_stage
 from mannaz.risk import (
@@ -1149,6 +1149,9 @@ class ReportState:
     # pominięte przez detektor; elementy: corp_actions.SkippedCloses.
     corp_events_skipped_closes: list = field(default_factory=list)
     price_ingest_errors: list[str] = field(default_factory=list)
+    # B-76 (K1): świece-wypełniacze dostawcy (O=H=L=C, volume 0) w oknie 22
+    # sesji do D: (symbol, exchange, price_date). Niepusta => DATA FAILURE.
+    window_fillers: list[tuple[str, str | None, date]] = field(default_factory=list)
     fx_failures: list[str] = field(default_factory=list)
     date_incomplete_items: list[IncompleteRiskItem] = field(default_factory=list)
     d_resolution_failure: str | None = None
@@ -1189,6 +1192,9 @@ class ReportState:
     # etap cen nie wykonał się albo stub nie zwrócił PricesSummary).
     unclosed_session_rows: int = 0
     unclosed_session_instruments: int = 0
+    # B-76: informacja: wypełniacze dostawcy pominięte (zapisany wiersz inny).
+    filler_kept_rows: int = 0
+    filler_kept_instruments: int = 0
     # B-48 (D2 rew. 3): świece ocenione regułą daty zamiast kalendarza.
     calendar_fallback_rows: int = 0
     calendar_fallback_instruments: int = 0
@@ -1202,6 +1208,7 @@ def has_data_failures(state: ReportState) -> bool:
         or state.registration_queue
         or state.corp_events_review
         or state.price_ingest_errors
+        or state.window_fillers
         or state.fx_failures
         or state.date_incomplete_items
         or state.d_resolution_failure is not None
@@ -1306,6 +1313,24 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
     elif state.price_ingest_errors:
         for e in state.price_ingest_errors:
             lines.append(f"- {e}")
+    else:
+        lines.append("brak")
+
+    lines.append("")
+    lines.append("### Świece-wypełniacze dostawcy w oknie 22 sesji (B-76)")
+    # Lista ma pierwszeństwo przed notką etapu: detektor działa zaraz po ustaleniu
+    # D, a etap ryzyka może zawieść później — FAILURE nie może zniknąć z raportu.
+    if state.window_fillers:
+        grouped: dict[tuple[str, str | None], list[date]] = {}
+        for symbol, exchange, price_date in state.window_fillers:
+            grouped.setdefault((symbol, exchange), []).append(price_date)
+        for (symbol, exchange), dates_ in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+            lines.append(
+                f"- {symbol} ({exchange or 'brak'}): {len(dates_)} "
+                f"(daty: {', '.join(_fmt_date(x) for x in sorted(dates_))})"
+            )
+    elif state.d is None:
+        lines.append(stage_note(STAGE_RISK) or "nie wykonano (D nieustalone)")
     else:
         lines.append("brak")
 
@@ -1529,8 +1554,18 @@ def _render_provider_revisions_section(state: ReportState) -> list[str]:
         lines.append(f"nie wykonano (cykl zatrzymany na etapie {STAGE_LABELS[STAGE_PRICES_FX]})")
         return lines
     revs = state.provider_revisions
+    # B-76: informacja zagregowana (liczba, bez listy), tylko gdy > 0.
+    filler_lines = (
+        [
+            f"- wypełniacze dostawcy pominięte (zapisany wiersz inny, B-76): {state.filler_kept_rows} wierszy, "
+            f"{state.filler_kept_instruments} instrumentów"
+        ]
+        if state.filler_kept_rows
+        else []
+    )
     if not revs:
         lines.append("brak")
+        lines.extend(filler_lines)
         return lines
     dates = [r.price_date for r in revs if r.price_date is not None]
     n_inst = len({(r.instrument_id, r.ticker) for r in revs})
@@ -1564,6 +1599,7 @@ def _render_provider_revisions_section(state: ReportState) -> list[str]:
                 lines.append(f"| {r.ticker} | {_fmt_date(r.price_date)} | {r.detail} |")
         else:
             lines.append("brak")
+    lines.extend(filler_lines)
     return lines
 
 
@@ -2195,6 +2231,8 @@ def run_cycle(
             if isinstance(prices_summary, PricesSummary):
                 state.unclosed_session_rows = prices_summary.rows_unclosed_session_total
                 state.unclosed_session_instruments = prices_summary.instruments_unclosed_session
+                state.filler_kept_rows = prices_summary.filler_kept_total
+                state.filler_kept_instruments = prices_summary.instruments_filler_kept
                 state.calendar_fallback_rows = prices_summary.rows_calendar_fallback_total
                 state.calendar_fallback_instruments = prices_summary.instruments_calendar_fallback
         except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (brief C5/C8)
@@ -2257,6 +2295,11 @@ def run_cycle(
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop()
         state.d = d
+
+        # B-76 (K1): wypełniacze dostawcy w oknie 22 sesji do D — DATA FAILURE,
+        # bez zatrzymania cyklu.
+        with conn.cursor() as cur:
+            state.window_fillers = detect_window_fillers(cur, d)
 
         with conn.cursor() as cur:
             cur.execute("SELECT max(risk_date) FROM risk_daily WHERE risk_date < %s", (d,))
