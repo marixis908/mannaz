@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.18 · 2026-10-15**
+**Rewizja 4.19 · 2026-10-16**
 
 ---
 
@@ -42,7 +42,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.15 | 2026-10-05 | §19.3: zapadka „nigdy w dół” z §19.1 obejmuje stop efektywny w okresie posiadania (najwyższy 2N od początku zapadki), sygnał „Dokupienia poniżej stopu” w raporcie cyklu, kontrakty poza zakresem sygnału (B-52, wariant A, brief CC-B52 rew. 3) |
 | 4.16 | 2026-10-14 | M85 doprecyzowanie: jedna wycena z NAV, tożsamość dzienna bez korekty, składnik transakcje dnia, koszty przy emitencie, gotówka i KONTRAKTOWY w atrybucji (decyzja ownera 2026-10-14, brief CC-B38A) |
 | 4.17 | 2026-10-14 | T42 = 2026-09-30; M81 progi w `prices_daily` (instrument `is_benchmark`, cena = TR dla ETF akumulujących); M89 rejestr zdarzeń i naruszeń tylko do dopisywania (trigger), raport: nowe / zapisane / nieodtworzone; §8 dwie tabele i kolumna `is_benchmark` (decyzje ownera 2026-10-14, brief CC-B38B) |
-| **4.18** | **2026-10-15** | **M85 doprecyzowanie: opłata za wymianę waluty (`oplata_wymiana_waluty`) w linii „opłaty” rachunku, spread przewalutowania w linii gotówki rachunku i waluty (B-63, brief CC-FX)** |
+| 4.18 | 2026-10-15 | M85 doprecyzowanie: opłata za wymianę waluty (`oplata_wymiana_waluty`) w linii „opłaty” rachunku, spread przewalutowania w linii gotówki rachunku i waluty (B-63, brief CC-FX) |
+| **4.19** | **2026-10-16** | **§19.1 M23, §19.3: Chandelier okresu posiadania (okno od sesji po wejściu, zapadka od max(e+1, RATCHET_START)), A8 kontekst trendu i flaga wejścia wbrew trendowi (w raporcie tylko nowe wejścia), adnotacja zmiany reguły i M69 „wyłącznie zmiana reguły”; §19.4: kotwica 2N kontraktów = zamknięcie bazy z sesji każdego lota (także zapadka 2N); §26: O-51 B2 odrzucony (brak notowań kontraktów); decyzja: owner 2026-10-16 (brief CC-CH2, pomiar CC-CH, recenzja Codexa, ocena zewnętrzna)** |
 
 ### 0.3 Oznaczenia
 
@@ -194,7 +195,7 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 
 ### 3.4 O ryzyku
 
-**M23.** Twarde stopy są funkcją zmienności, nie procentu ceny: Chandelier Exit `max(high,22) − 3×ATR22` i stop 2N `entry − 2×ATR20`.
+**M23.** Twarde stopy są funkcją zmienności, nie procentu ceny: Chandelier Exit `max(high,22) − 3×ATR22` i stop 2N `entry − 2×ATR20`. Od rew. 4.19 okno Chandeliera stopu obejmuje wyłącznie sesje bieżącego okresu posiadania po sesji wejścia (§19.1).
 
 **M24.** Wielkość pozycji jest funkcją zmienności: `(kapitał × 0,01) / (2 × ATR20_w_walucie_notowania)`, przewalutowane na PLN po kursie z §10.
 
@@ -984,13 +985,19 @@ Domyślne D przebiegu ryzyka to ostatnia data kompletna jednocześnie w cenach (
 
 | Prio | Klasa | Reguła |
 |---|---|---|
-| 1 | **STOP LOSS** | Chandelier `max(high,22) − 3×ATR22` albo stop 2N `entry − 2×ATR20`, nigdy przesuwany w dół |
+| 1 | **STOP LOSS** | Chandelier okresu posiadania `max(high[max(e+1, t−21)..t]) − 3×ATR22(t)` albo stop 2N `entry − 2×ATR20`, nigdy przesuwany w dół |
 | 2 | **REGIME EXIT** | `close < SMA200` ∧ SMA200 opada 21 sesji |
 | 3 | **THESIS EXIT** | naruszone kryterium falsyfikacji z rejestru tez |
 | 4 | **RELATIVE EXIT** | porażka wobec benchmarku zastępczego przez 24 miesiące — **tylko przy VALUE ≠ CHEAP** (M26) |
 | 5 | **OSTRZEŻENIE** | `σ20 > 2 × σ60` albo `close/max(close,252) < 0,75` — nie wyjście |
 
 **Cena wejścia stopu 2N:** cenę każdego lotu rozliczonego w walucie innej niż waluta notowania przelicza się na walutę notowania kursem krzyżowym NBP A z dnia transakcji (ostatni fixing z datą ≤ data transakcji), przed średnią ważoną pozostałych lotów; brak kursu dla lotu → brak stopu 2N, nigdy podstawienie innego kursu (B-41).
+
+**Chandelier okresu posiadania (rew. 4.19).** `e` = sesja początku bieżącego okresu posiadania (pierwsza sesja z datą ≥ dacie otwarcia okresu). Kandydat Chandeliera w sesji `t`: dla pozycji długiej `max(high[max(e+1, t−21)..t]) − 3×ATR22(t)`, dla krótkiej `min(low[max(e+1, t−21)..t]) + 3×ATR22(t)`; ATR22 liczony z pełnej historii cen. Sesja wejścia jest wyłączona z okna, więc dla `t ≤ e` okno jest puste i kandydata nie ma — na zamknięciu sesji wejścia poziomem jest stop 2N. Okno ma najwyżej 22 sesje; po 22 sesjach od wejścia pokrywa się z oknem kroczącym. Kosztem tej konwencji jest pominięcie ekstremów z sesji wejścia przypadających po transakcji: ruch w sesji wejścia nie podnosi stopu (bez kompensacji w kodzie).
+Stop jest **poziomem monitorowania po zamknięciu sesji** — nie definiuje zlecenia obowiązującego od chwili transakcji.
+Przy identycznych cenach, okresie posiadania, ATR22, 2N i 2N z zapadką zmiana z rew. 4.19 wyłącznie luzuje stop albo go nie zmienia: okno okresu posiadania jest podzbiorem okna kroczącego, a zakres zapadki — podzbiorem dotychczasowego (pomiar CC-CH: 0 zaostrzeń na 58 pozycjach).
+
+**Kontekst trendu — nie jest stopem (rew. 4.19, A8).** Raport pokazuje dawny Chandelier kroczący 22 sesji (bez okresu posiadania, z zapadką od RATCHET_START na D) jako kontekst trendu. Flaga **wejścia wbrew trendowi**: dla pozycji długiej kotwica wejścia < Chandelier kroczący (bez zapadki) w sesji `e`, dla krótkiej > ; kotwica = cena wejścia w walucie notowania (akcje, ETF), dla kontraktów kotwica 2N z §19.4. Brak Chandeliera w `e` (za krótka historia) → flaga nieustalona. Flaga jest zapisywana dla każdej pozycji; podsekcja raportu „Kontekst trendu (nie jest stopem)” pokazuje tylko nowe wejścia, czyli pozycje, których okres posiadania zaczął się po dacie poprzedniej oceny. Ani kontekst, ani flaga nie zmieniają stopu ani stanu ryzyka.
 
 ### 19.2 Sizing i budżety
 
@@ -1014,12 +1021,17 @@ Poziom 3: suma otwartych ryzyk       ≤ 15%
 - Pozycje **już poniżej** poziomu stopu w dniu pierwszym → stan `RISK = HIGH` i **jednorazowy raport inicjalizacyjny**, nie 31 alertów. Alert właściwy dopiero przy kolejnym przecięciu.
 - Stop 2N od historycznego wejścia dla pozycji z dużym zyskiem jest **martwy** — zastępowany przez Chandelier z §19.1 (`max(high,22) − 3×ATR22`), z zapadką „nigdy w dół" biegnącą od dnia inicjalizacji systemu. Dla pozycji otwartej po dniu inicjalizacji zapadka biegnie od otwarcia bieżącego okresu posiadania; zamknięcie pozycji zeruje stan zapadki.
 - Zapadka „nigdy w dół” z §19.1 obejmuje **stop efektywny** w bieżącym okresie posiadania, nie tylko składnik Chandeliera: stop efektywny = wyższy z Chandeliera z zapadką i najwyższego stopu 2N obowiązującego od początku zapadki (dla pozycji krótkiej lustrzanie). Dokupienie poniżej ceny wejścia obniża bieżący składnik 2N, ale nie obniża stopu efektywnego. Dokupienie pozycji akcyjnej po cenie (w walucie notowania) niższej niż stop efektywny z ostatniej oceny przed transakcją jest zdarzeniem do przeglądu w raporcie cyklu (sekcja „Dokupienia poniżej stopu”); kontrakty są poza zakresem tego sygnału, bo ich stop liczony jest na cenie bazy. *Decyzja ownera 2026-10-05 (B-52, wariant A); przypadek: FTAI 2026-10-01 — kod do tego dnia stosował zapadkę wyłącznie do Chandeliera.*
+- Zapadka Chandeliera okresu posiadania (§19.1) obejmuje sesje `[max(e+1, RATCHET_START), D]`; 2N, 2N z zapadką i stop efektywny bez zmian.
+- **Zmiana reguły stopu (rew. 4.19).** Każdy wiersz oceny ryzyka nosi wersję reguły stopu (`stop_rule = '4.19'`; wiersze sprzed zmiany: brak wartości). Gdy wersja reguły poprzedniej oceny różni się od bieżącej, na D liczony jest również wariant poprzedniej reguły (stara ścieżka, bez Chandeliera okresu posiadania i bez kotwicy bazy kontraktów) i zapisywany obok (stop, źródło, stan ryzyka); w pozostałych ocenach tych pól nie ma. Odczyt wersji poprzedniej oceny nie wpływa na stop. Tabela M62 dostaje adnotację „zmiana reguły rew. 4.19: poluzowanie | zaostrzenie | 0” z porównania stopu efektywnego nowej i poprzedniej reguły na tym samym D i tych samych danych.
+- Zdarzenie M69 przejścia NORMAL → HIGH względem poprzedniej oceny oznaczane jest „wyłącznie zmiana reguły” wtedy i tylko wtedy, gdy stan ryzyka wariantu poprzedniej reguły na D = NORMAL. Pozostałe zdarzenia M69 bez zmian.
 - Raport inicjalizacyjny jest **poza limitem 15 alertów miesięcznie** i występuje dokładnie raz.
 
 ### 19.4 Instrumenty pochodne
 
 - Ekspozycja kontraktu terminowego = liczba × mnożnik × kurs instrumentu bazowego, w PLN.
 - ATR, stop i REGIME liczy się na instrumencie bazowym.
+- **Kotwica 2N kontraktu (rew. 4.19).** Cena każdego lota kontraktu (transakcja otwierająca lub powiększająca pozycję) jest zastępowana zamknięciem instrumentu bazowego z sesji tej transakcji (pierwsza sesja z datą ≥ dacie transakcji), przed agregacją FIFO — w bieżącym stopie 2N i we wszystkich historycznych punktach zapadki 2N. Dalej ścieżka bez zmian (ATR20 z sesji ostatniego pozostałego lota, zapadka 2N, stop efektywny). Brak zamknięcia bazy w sesji lota → DATA FAILURE z tickerem, nigdy ciche przejście na cenę kontraktu.
+- Stop kontraktu jest **poziomem monitorowania ceny bazy**; porównania z nim używają cen bazy. Cena transakcji kontraktu jest zapisywana osobno (`entry_price_contract`, średnia ważona); `entry_price` kontraktu to kotwica użyta w 2N. Poziom zlecenia na kontrakcie wymaga odrębnego przeliczenia (również zdanie w nagłówku tabeli M62 dla kontraktów).
 - Ryzyko = (close bazy − stop) × liczba × mnożnik; dla pozycji krótkiej lustrzanie, ze stopem nad ceną.
 - Kontrakty wchodzą do budżetów ryzyka poziomów 1–3. Nominał kontraktu nie wchodzi do kapitału satelity; wchodzi wartość rachunku KONTRAKTOWY = środki ogółem łącznie z depozytem zablokowanym. Broker rozlicza wynik zmienny codziennie w środkach, więc nie dolicza się go osobno.
 - Kapitał satelity w budżetach ryzyka poziomów 1–3 to NAV satelity z §21.6 (M78): pozycje satelity bez rdzenia i bez nominału kontraktów, gotówka rachunków AKCYJNY i ZAGRANICZNY (bez wierszy niegotówkowych) oraz wartość rachunku KONTRAKTOWY; NAV niepełny na D oznacza brak przebiegu ryzyka dla D (B-17).
@@ -1476,6 +1488,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 | **O-48** | Bramki „IR > 0” i „drawdown satelity ≤ 1,5 × drawdown benchmarku” | Znak IR to tylko znak średniej nadwyżki, bez jej niepewności; mnożnik drawdownu zwiększa dopuszczalną stratę, gdy benchmarkowi idzie źle | Nic |
 | **O-49** | Zamrożony miks rdzenia (SPYI + V80A + V60A) jako benchmark decyzyjny | Kapitał satelity nie wraca do rdzenia (decyzja ownera 2026-10-02); owner wskazał SPYI jako próg | Zmiana przeznaczenia kapitału satelity |
 | **O-50** | EUR jako waluta oceny satelity | Werdykt nie zależy od waluty, gdy obie strony liczone są w tej samej (ΔW_EUR = ΔW_PLN / kurs EUR/PLN z dnia T); drugi widok bez nowej informacji | Nic |
+| **O-51** | Kotwica 2N kontraktu B2: cena kontraktu skorygowana o bazę (cena transakcji − (zamknięcie kontraktu − zamknięcie bazy) w sesji wejścia) | Odrzucona 2026-10-16: w danych brak zamknięć kontraktów (0 z 8 kontraktów, pomiar CC-CH); wymagałaby osobnego źródła notowań kontraktów. Przyjęto B1 (§19.4) | Tylko nowy argument z danych: dostępne zamknięcia kontraktów |
 
 ### 26.4 Operacje
 
