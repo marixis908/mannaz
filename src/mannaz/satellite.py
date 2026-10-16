@@ -26,6 +26,7 @@ import calendar
 import csv
 import json
 import math
+import re
 import statistics
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -1408,6 +1409,53 @@ def load_account_values(path: Path | str) -> list[AccountValue]:
                 cash_total=_opt_value(row.get("cash_total")),
             ))
     return sorted(out, key=lambda s: (s.date, s.account, s.currency))
+
+
+class AccountValuesError(ValueError):
+    """B-73: plik kotwicy `account_values_RRRR-MM-DD.csv` w katalogu kotwic jest
+    niepoprawny (blad parsowania, data wiersza != data z nazwy, duplikat klucza
+    (data, rachunek, waluta)). Tresc zawsze zaczyna sie od nazwy pliku."""
+
+
+_ACCOUNT_VALUES_FILE_RE = re.compile(r"^account_values_(\d{4}-\d{2}-\d{2})\.csv$")
+
+
+def load_account_values_dir(directory: Path | str) -> list[AccountValue]:
+    """B-73: wszystkie pliki `account_values_RRRR-MM-DD.csv` (dokladnie ten wzorzec
+    nazwy) z `directory`, posortowane po nazwie; kazdy przez `load_account_values`.
+    Asercje (blad -> `AccountValuesError` z nazwa pliku w tresci): data kazdego
+    wiersza == data z nazwy pliku; brak duplikatu klucza (data, rachunek, waluta)
+    w pliku i miedzy plikami; plik parsuje sie. Katalog nieistniejacy albo bez
+    plikow o tym wzorcu -> `[]`."""
+    root = Path(directory)
+    if not root.is_dir():
+        return []
+    files = sorted(
+        (f for f in root.iterdir() if f.is_file() and _ACCOUNT_VALUES_FILE_RE.match(f.name)),
+        key=lambda f: f.name,
+    )
+    out: list[AccountValue] = []
+    seen: dict[tuple[date, str, str], str] = {}
+    for f in files:
+        try:
+            file_date = date.fromisoformat(_ACCOUNT_VALUES_FILE_RE.match(f.name).group(1))
+            rows = load_account_values(f)
+        except (ValueError, KeyError, OSError, csv.Error) as exc:
+            raise AccountValuesError(f"{f.name}: blad parsowania pliku: {type(exc).__name__}: {exc}") from exc
+        for r in rows:
+            if r.date != file_date:
+                raise AccountValuesError(
+                    f"{f.name}: data wiersza {r.date.isoformat()} != data z nazwy {file_date.isoformat()}"
+                )
+            key = (r.date, r.account, r.currency)
+            if key in seen:
+                where = "w tym samym pliku" if seen[key] == f.name else f"juz w {seen[key]}"
+                raise AccountValuesError(
+                    f"{f.name}: duplikat klucza ({r.date.isoformat()}, {r.account}, {r.currency}) {where}"
+                )
+            seen[key] = f.name
+            out.append(r)
+    return sorted(out, key=lambda a: (a.date, a.account, a.currency))
 
 
 # ---------------------------------------------------------------------------
@@ -2971,9 +3019,14 @@ def run_satellite_stage(
     write: bool = True,
     check_ignored: Callable[[Path], bool] | None = None,
     code_sha_value: Any = _UNSET,
+    snapshots: Sequence[AccountValue] = (),
 ) -> SatelliteStageResult:
-    """Etap satelity cyklu (decyzja 6): d_from = S1, d_to = D, bez account_values
-    (bramka M78 nieobecna -> dane niezweryfikowane, przyczyna w raporcie). Czyta
+    """Etap satelity cyklu (decyzja 6): d_from = S1, d_to = D. B-73: `snapshots` =
+    kotwice M78 (`load_account_values_dir`); kotwice z data poza [S1, D] sa
+    pomijane i zapisane w `report["anchors_out_of_range"]` (lista dat ISO),
+    pozostale trafiaja do `compute_satellite`. Bez kotwic (domyslnie) bramka M78
+    nieobecna -> dane niezweryfikowane, przyczyna w raporcie (dotychczasowe
+    zachowanie). Czyta
     baze przez polaczenie cyklu (NIE ustawia `conn.read_only`); zapisuje
     wylacznie do dwoch tabel M89 (rejestr 1 i 2) i — gdy `out_dir` —
     satellite.json / satellite.md (przed jakimkolwiek zapisem
@@ -2985,8 +3038,13 @@ def run_satellite_stage(
     if run_at is None:
         run_at = datetime.now(timezone.utc)
     sha = _code_sha() if code_sha_value is _UNSET else code_sha_value
+    in_range = [a for a in snapshots if S1 <= a.date <= d]
+    out_of_range = sorted({a.date.isoformat() for a in snapshots if not (S1 <= a.date <= d)})
     with conn.cursor() as cur:
-        report, payload = compute_satellite(cur, S1, d)
+        report, payload = compute_satellite(cur, S1, d, in_range)
+        if out_of_range:
+            report["anchors_out_of_range"] = out_of_range
+            payload["anchors_out_of_range"] = out_of_range
         persistence: dict[int, dict[str, Any]] = {}
         status1 = "zweryfikowane" if report["data_verified"] else "niezweryfikowane"
         persistence[1] = persist_mandate_registry(

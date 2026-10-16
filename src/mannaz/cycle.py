@@ -38,9 +38,20 @@ from mannaz.import_history import (
     import_parsed_files,
 )
 from mannaz.parse_history import ParsedFile, parse_source_file
-from mannaz.prices import PricesSummary, detect_window_fillers, run_prices_fetch
+from mannaz.prices import (
+    PricesSummary,
+    ProviderMessage,
+    capture_provider_messages,
+    detect_window_fillers,
+    run_prices_fetch,
+)
 from mannaz.provenance import triggered_by
-from mannaz.satellite import SatelliteStageResult, persistence_summary_line, run_satellite_stage
+from mannaz.satellite import (
+    SatelliteStageResult,
+    load_account_values_dir,
+    persistence_summary_line,
+    run_satellite_stage,
+)
 from mannaz.risk import (
     STOP_RULE_VERSION,
     IncompleteRiskDateError,
@@ -49,6 +60,7 @@ from mannaz.risk import (
     RiskSummary,
     level1_name_labels,
     level1_names_for_summary,
+    open_positions_as_of,
     _default_calendar_facts,
     _fx_rate_on_or_before,
     convert_entry_rows_to_quote,
@@ -693,6 +705,8 @@ def stop_order_decision(
     stop_prev: Decimal | None,
     atr22_d: Decimal | None = None,
     below_stop: bool | None = None,
+    rule_changed: bool = False,
+    rule_change: str | None = None,
 ) -> str:
     """Brief CC-C, C7 §3 (M62), poprawka po przeglądzie nadzorcy (P1/P3):
       - `below_stop is True` (stan HIGH) -> `STOP_ORDER_HIGH_MESSAGE`, bez
@@ -706,7 +720,15 @@ def stop_order_decision(
         ATR22 — bez progu)' (nie blokujemy aktualizacji brakiem progu);
       - bez zmiany (`stop_d == stop_prev`) -> 'nie';
       - ruch w złą stronę (zapadka trzyma poprzedni poziom) ->
-        'nie (zapadka: zostaw poprzedni poziom)'."""
+        'nie (zapadka: zostaw poprzedni poziom)';
+      - B-80: ruch w złą stronę (`stop_d != stop_prev`), stan nie-HIGH, a poprzednia
+        ocena liczona INNĄ regułą stopu (`rule_changed is True`) i zmiana reguły
+        jest poluzowaniem (`rule_change == 'poluzowanie'`) -> 'tak (zmiana reguły
+        rew. <STOP_RULE_VERSION>)' zamiast trzymania poprzedniego poziomu
+        (poluzowanie wynika ze zmiany reguły, nie z ruchu ceny).
+    B-80 (B80.4): po zmianie reguły zapadkę liczy się od pierwszej oceny nową
+    regułą — na kolejnej ocenie reguła poprzedniej oceny = bieżąca, więc
+    `rule_changed` jest False i obowiązuje zwykła zapadka."""
     if below_stop is True:
         return STOP_ORDER_HIGH_MESSAGE
     if stop_prev is None:
@@ -718,6 +740,8 @@ def stop_order_decision(
     if not good_direction:
         if stop_d == stop_prev:
             return "nie"
+        if rule_changed is True and rule_change == "poluzowanie":
+            return f"tak (zmiana reguły rew. {STOP_RULE_VERSION})"
         return "nie (zapadka: zostaw poprzedni poziom)"
     if atr22_d is None:
         return "tak (brak ATR22 — bez progu)"
@@ -794,22 +818,27 @@ STOP_ORDER_CONTRACT_NOTE = (
 def build_stop_order_rows(items: list[tuple]) -> list[StopOrderRow]:
     """items: (broker_ticker, rachunek, position_kind, stop_d, stop_d_currency,
     settlement_currency, stop_prev, base_symbol_label, atr22_d, below_stop
-    [, stop_prev_rule, is_contract]) — jeden per pozycja satelity otwarta na D w
-    `risk_daily`; dwa ostatnie elementy opcjonalne (rew. 4.19:
-    `stop_effective_prev_rule` i flaga kontraktu). Zwraca wiersze posortowane:
+    [, stop_prev_rule, is_contract, rule_changed]) — jeden per pozycja satelity
+    otwarta na D w `risk_daily`; trzy ostatnie elementy opcjonalne (rew. 4.19:
+    `stop_effective_prev_rule` i flaga kontraktu; B-80: `rule_changed` — czy
+    poprzednia ocena była liczona inną regułą stopu, domyślnie False). Zwraca wiersze posortowane:
     najpierw stan HIGH, potem decyzje zaczynające się od „tak”."""
     rows: list[StopOrderRow] = []
     for item in items:
         ticker, rachunek, kind, stop_d, ccy, settlement_ccy, stop_prev, base_label, atr22_d, below_stop = item[:10]
         stop_prev_rule = item[10] if len(item) > 10 else None
         is_contract = bool(item[11]) if len(item) > 11 else False
+        rule_changed = bool(item[12]) if len(item) > 12 else False  # B-80
         state = "HIGH" if below_stop is True else "NORMAL"
         threshold = STOP_ORDER_MIN_CHANGE_ATR * atr22_d if atr22_d is not None else None
-        decision = stop_order_decision(kind, stop_d, stop_prev, atr22_d, below_stop)
+        rule_change = rule_change_direction(kind, stop_d, stop_prev_rule)
+        decision = stop_order_decision(
+            kind, stop_d, stop_prev, atr22_d, below_stop, rule_changed=rule_changed, rule_change=rule_change
+        )
         rows.append(
             StopOrderRow(
                 ticker, rachunek, kind, state, stop_d, ccy, settlement_ccy, stop_prev, threshold, base_label, decision,
-                rule_change_direction(kind, stop_d, stop_prev_rule), is_contract,
+                rule_change, is_contract,
             )
         )
     rows.sort(
@@ -1254,6 +1283,10 @@ class ReportState:
     # filtrze wzgl. `prev_risk_date`); to NIE jest stop.
     trend_context: list[TrendContextRow] = field(default_factory=list)
 
+    # B-81: komunikaty dostawcy (yfinance) z etapow detektora/cen/FX, w kolejnosci
+    # etapow; informacja (NIE DATA FAILURE).
+    provider_messages: list[ProviderMessage] = field(default_factory=list)
+
     # B-05: informacja (NIE DATA FAILURE, nie zatrzymuje cyklu, nie zmienia
     # kodu wyjścia): rewizje cen dostawcy z bieżącego przebiegu oraz
     # przeliczenie D wobec zapisu poprzedniego.
@@ -1265,8 +1298,14 @@ class ReportState:
     satellite: SatelliteStageResult | None = None
     satellite_error: bool = False
 
-    # Zmiany pozycji
+    # Zmiany pozycji (B-74): względem poprzedniej oceny (`position_changes_prev_date`),
+    # nie względem snapshotu FIFO sprzed/po `run_fifo`.
     position_changes: list[PositionChange] = field(default_factory=list)
+    position_changes_computed: bool = False  # sekcja policzona (D ustalone)
+    position_changes_prev_date: date | None = None
+    # tickery pozycji otwartych i zamkniętych MIĘDZY ocenami (nieobecne ani w
+    # `before` (prev_date), ani w `after` (D)); posortowane, unikalne.
+    position_changes_between: list[str] = field(default_factory=list)
     archetype_missing: list[str] = field(default_factory=list)
 
     # HEARTBEAT
@@ -1431,15 +1470,17 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
     lines.append("")
     lines.append("### D niekompletne")
     note = stage_note(STAGE_RISK)
-    if note:
-        lines.append(note)
-    elif state.date_incomplete_items or state.d_resolution_failure:
+    # B-70 (B70.2): pozycje niekompletne na D wymienione tickerem ZAWSZE — także gdy
+    # `IncompleteRiskDateError` zatrzymał etap ryzyka (wcześniej notatka etapu je ukrywała).
+    if state.date_incomplete_items or state.d_resolution_failure:
         if state.d_resolution_failure:
             lines.append(f"- {state.d_resolution_failure}")
         for it in state.date_incomplete_items:
             lines.append(
                 f"- {it.broker_ticker} · {it.price_instrument or 'brak'} · {it.exchange or 'brak'} · {it.reason}"
             )
+    elif note:
+        lines.append(note)
     else:
         lines.append("brak")
 
@@ -1737,19 +1778,53 @@ def _render_risk_recompute_section(state: ReportState) -> list[str]:
 
 def _render_position_changes_section(state: ReportState) -> list[str]:
     lines = ["## Zmiany pozycji"]
-    if STAGE_FIFO in state.stage_not_executed:
-        lines.append(f"nie wykonano (cykl zatrzymany na etapie {STAGE_LABELS[STAGE_FIFO]})")
-    elif not state.position_changes:
-        lines.append("brak")
+    if not state.position_changes_computed:
+        lines.append("nie wykonano (cykl zatrzymany przed ustaleniem D)")
+    elif state.position_changes_prev_date is None:
+        lines.append("brak poprzedniej oceny")
     else:
-        for c in state.position_changes:
-            lines.append(f"- {c.broker_ticker} ({account_label(c.rachunek)}): {c.rodzaj}")
+        lines.append(f"względem poprzedniej oceny ({state.position_changes_prev_date.isoformat()})")
+        if not state.position_changes:
+            lines.append("brak")
+        else:
+            for c in state.position_changes:
+                lines.append(f"- {c.broker_ticker} ({account_label(c.rachunek)}): {c.rodzaj}")
+        between = ", ".join(state.position_changes_between) if state.position_changes_between else "brak"
+        lines.append(f"otwarte i zamknięte między ocenami: {between}")
     lines.append("")
     if state.archetype_missing:
         lines.append(f"Do rejestracji (§12): brak archetypu: {', '.join(state.archetype_missing)}")
     else:
         lines.append("Do rejestracji (§12): brak")
     return lines
+
+
+PROVIDER_MESSAGE_MAX_CHARS = 120
+
+
+def _provider_messages_line(messages: list[ProviderMessage]) -> str:
+    """B-81: linia HEARTBEAT zawsze obecna; tresc kazdego komunikatu skrocona do 120 znakow."""
+    if not messages:
+        return "- komunikaty dostawcy: 0"
+
+    def short(text: str) -> str:
+        if len(text) <= PROVIDER_MESSAGE_MAX_CHARS:
+            return text
+        return text[: PROVIDER_MESSAGE_MAX_CHARS - 3] + "..."
+
+    items = "; ".join(f"{m.symbol}: {short(m.text)}" for m in messages)
+    return f"- komunikaty dostawcy: {len(messages)} ({items})"
+
+
+def _call_capturing_provider_messages(state: ReportState, fn: Callable[..., Any], *args: Any) -> Any:
+    """B-81: wywolanie etapu w `capture_provider_messages()`; komunikaty trafiaja do
+    `state.provider_messages` takze gdy etap rzuca wyjatek (obslugiwany jak dotad)."""
+    cap = capture_provider_messages()
+    try:
+        with cap:
+            return fn(*args)
+    finally:
+        state.provider_messages.extend(cap.messages)
 
 
 def _render_heartbeat_section(state: ReportState) -> list[str]:
@@ -1764,6 +1839,7 @@ def _render_heartbeat_section(state: ReportState) -> list[str]:
         f"- świece z regułą daty zamiast kalendarza: {state.calendar_fallback_rows} "
         f"(instrumentów: {state.calendar_fallback_instruments})"
     )
+    lines.append(_provider_messages_line(state.provider_messages))
     lines.append("- pliki przetworzone:")
     if state.files_processed:
         for f in state.files_processed:
@@ -1836,6 +1912,36 @@ def _render_satellite_registry(
         lines.append(f"- rejestr trwały: {persistence_summary_line(pers)}")
 
 
+def _render_satellite_anchors(rep: dict[str, Any]) -> list[str]:
+    """B-73: kotwice M78 w sekcji satelity — per data, jedna linia na skladnik
+    (rachunek/waluta skladnik: zgodny | niezgodny (rel. roznica) | brak | niepelny),
+    bez kwot; kotwice poza zakresem [S1, D] osobno. Brak bramki i brak kotwic poza
+    zakresem -> zero linii (przyczyna jest juz w `data_unverified_reasons`)."""
+    lines: list[str] = []
+    gate = rep.get("gate")
+    if gate:
+        by_date: dict[str, list[dict[str, Any]]] = {}
+        for r in gate["rows"]:
+            by_date.setdefault(r["date"], []).append(r)
+        for day in sorted(by_date):
+            lines.append(f"- kotwica {day}:")
+            for r in by_date[day]:
+                status = r["status"]
+                if status == "zgodny":
+                    verdict = "zgodny"
+                elif status == "niezgodny":
+                    rel = r.get("rel_diff")
+                    verdict = "niezgodny" if rel is None else f"niezgodny ({_sat_num(rel * 100, 4)}%)"
+                elif status == "brak danych":
+                    verdict = "brak"
+                else:
+                    verdict = "niepelny"
+                lines.append(f"  - {r['account']}/{r['currency']} {r['component']}: {verdict}")
+    for day in rep.get("anchors_out_of_range") or []:
+        lines.append(f"- kotwica poza zakresem: {day}")
+    return lines
+
+
 def _render_satellite_section(state: ReportState) -> list[str]:
     lines = ["## Satelita (§21.6)"]
     sat = state.satellite
@@ -1853,6 +1959,7 @@ def _render_satellite_section(state: ReportState) -> list[str]:
     lines.append(f"- status danych: {'zweryfikowane' if rep['data_verified'] else 'niezweryfikowane'}")
     for reason in rep["data_unverified_reasons"]:
         lines.append(f"  - {reason}")
+    lines.extend(_render_satellite_anchors(rep))
     lines.append("")
     _render_satellite_registry(
         lines, f"Rejestr 1 (od S = {rep['S']})", rep.get("alerts", {}), rep["windows"], None,
@@ -1924,6 +2031,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INCOMING_DIR = REPO_ROOT / "_incoming"
 DEFAULT_RAW_ARCHIVE_DIR = REPO_ROOT / "data" / "raw" / "financeHistory"
 DEFAULT_REPORTS_DIR = REPO_ROOT / "data" / "reports"
+# B-73: katalog kotwic M78 `account_values_RRRR-MM-DD.csv` (ten sam mechanizm co
+# `opening_balances.DEFAULT_PATH`: data/manual, poza gitem).
+DEFAULT_MANUAL_DIR = REPO_ROOT / "data" / "manual"
 
 
 def _nearest_existing_ancestor(path: Path) -> Path:
@@ -2008,6 +2118,20 @@ class CycleResult:
 
 def _sha8(sha256: str) -> str:
     return sha256[:8]
+
+
+def _snapshot_key(r: PositionSnapshotRow) -> tuple[str, int, str]:
+    return (r.rachunek, r.instrument_id, r.currency)
+
+
+def _snapshot_from_open_positions(rows: list[dict[str, Any]]) -> list[PositionSnapshotRow]:
+    """B-74: wynik `risk.open_positions_as_of` -> wejście `diff_positions`."""
+    return [
+        PositionSnapshotRow(
+            r["rachunek"], r["broker_ticker"], r["instrument_id"], r["settlement_currency"], r["qty"]
+        )
+        for r in rows
+    ]
 
 
 def _positions_fifo_snapshot(cur: psycopg.Cursor) -> list[PositionSnapshotRow]:
@@ -2159,6 +2283,7 @@ def run_cycle(
     incoming_dir: Path = DEFAULT_INCOMING_DIR,
     raw_archive_dir: Path = DEFAULT_RAW_ARCHIVE_DIR,
     reports_dir: Path = DEFAULT_REPORTS_DIR,
+    account_values_dir: Path = DEFAULT_MANUAL_DIR,
     today: date | None = None,
     commit: bool = True,
     fetch_prices: Callable[..., PricesSummary] = run_prices_fetch,
@@ -2174,7 +2299,8 @@ def run_cycle(
     """Brief CC-C, C2–C8: orkiestracja jednego przebiegu cyklu tygodniowego.
     Etapy w kolejności: import -> detektor zdarzeń korporacyjnych (B-29, bramka
     DATA REVIEW, bez zapisu) -> FIFO -> bramka rejestracji -> ceny/FX ->
-    ryzyko -> satelita (B-38B: ocena §21.6 + rejestr trwały M89) -> raport.
+    ryzyko -> satelita (B-38B: ocena §21.6 + rejestr trwały M89; B-73: kotwice M78
+    z `account_values_dir`) -> raport.
     Wyjątek złapany per etap zamienia się w DATA FAILURE (raport powstaje
     zawsze)."""
     run_started_at = datetime.now(timezone.utc)
@@ -2293,7 +2419,7 @@ def run_cycle(
         # Split musi być wykryty, zanim cokolwiek użyje pozycji (FIFO, ryzyko).
         # Detektor nie zapisuje (zapis po potwierdzeniu ownera: run_p3 corp-actions).
         try:
-            corp_result = detect_corp_events_fn(conn)
+            corp_result = _call_capturing_provider_messages(state, detect_corp_events_fn, conn)
         except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (nic nie wypada po cichu)
             state.import_failures.append(f"błąd etapu detektora zdarzeń: {type(exc).__name__}: {exc}")
             state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
@@ -2311,12 +2437,9 @@ def run_cycle(
             raise _StageStop()
 
         # --- C3: FIFO -------------------------------------------------------
-        with conn.cursor() as cur:
-            before_snapshot = _positions_fifo_snapshot(cur)
+        # B-74: zmiany pozycji liczone względem poprzedniej oceny po ustaleniu D
+        # (patrz C6), nie z snapshotu przed/po `run_fifo`.
         run_fifo(conn, as_of=today, commit=commit)
-        with conn.cursor() as cur:
-            after_snapshot = _positions_fifo_snapshot(cur)
-        state.position_changes = diff_positions(before_snapshot, after_snapshot)
         with conn.cursor() as cur:
             state.archetype_missing = _archetype_missing_tickers(cur)
 
@@ -2331,7 +2454,7 @@ def run_cycle(
 
         # --- C5: ceny i FX ----------------------------------------------------
         try:
-            prices_summary = fetch_prices(conn)
+            prices_summary = _call_capturing_provider_messages(state, fetch_prices, conn)
             # B-48: defensywnie — stuby testowe mogą zwracać None / inny obiekt.
             if isinstance(prices_summary, PricesSummary):
                 state.unclosed_session_rows = prices_summary.rows_unclosed_session_total
@@ -2346,7 +2469,7 @@ def run_cycle(
             raise _StageStop() from exc
 
         try:
-            fx_summary = fetch_fx(conn, NBP_CURRENCIES)
+            fx_summary = _call_capturing_provider_messages(state, fetch_fx, conn, NBP_CURRENCIES)
         except Exception as exc:  # noqa: BLE001
             state.import_failures.append(f"błąd etapu ceny/FX: {type(exc).__name__}: {exc}{_origin_note(exc)}")
             state.stage_not_executed.add(STAGE_RISK)
@@ -2411,6 +2534,29 @@ def run_cycle(
             prev_date = cur.fetchone()[0]
         state.prev_risk_date = prev_date
 
+        # B-74: zmiany pozycji względem poprzedniej oceny — PRZED `risk_fn`, żeby
+        # sekcja powstała także przy `IncompleteRiskDateError`.
+        state.position_changes_computed = True
+        state.position_changes_prev_date = prev_date
+        if prev_date is not None:
+            with conn.cursor() as cur:
+                before_rows = open_positions_as_of(cur, prev_date)
+                after_rows = open_positions_as_of(cur, d)
+                before_snapshot = _snapshot_from_open_positions(before_rows)
+                after_snapshot = _snapshot_from_open_positions(after_rows)
+                state.position_changes = diff_positions(before_snapshot, after_snapshot)
+                known_keys = {_snapshot_key(r) for r in before_snapshot} | {
+                    _snapshot_key(r) for r in after_snapshot
+                }
+                between: set[str] = set()
+                day = prev_date + timedelta(days=1)
+                while day < d:
+                    for r in _snapshot_from_open_positions(open_positions_as_of(cur, day)):
+                        if _snapshot_key(r) not in known_keys:
+                            between.add(r.broker_ticker)
+                    day += timedelta(days=1)
+                state.position_changes_between = sorted(between)
+
         # B-05 (Y4): migawka risk_daily na D PRZED przeliczeniem (run_risk robi
         # DELETE + INSERT dla D), porównanie zaraz po risk_fn.
         with conn.cursor() as cur:
@@ -2437,14 +2583,21 @@ def run_cycle(
         # `prev_evaluation_maps`.
         prev_stops: dict[tuple[str, int, str], Decimal] = {}
         prev_risk_state: dict[tuple[str, int, str], str | None] = {}
+        # B-80: klucz -> czy `risk_daily.stop_rule` poprzedniej oceny != bieżąca
+        # reguła (NULL = inna). Brak wiersza na `prev_date` -> klucza nie ma.
+        prev_rule_changed: dict[tuple[str, int, str], bool] = {}
         if prev_date is not None:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT rachunek, instrument_id, settlement_currency, stop_effective, risk_state "
+                    "SELECT rachunek, instrument_id, settlement_currency, stop_effective, risk_state, stop_rule "
                     "FROM risk_daily WHERE risk_date = %s",
                     (prev_date,),
                 )
-                prev_stops, prev_risk_state = prev_evaluation_maps(cur.fetchall())
+                prev_rows = cur.fetchall()
+            prev_stops, prev_risk_state = prev_evaluation_maps([r[:5] for r in prev_rows])
+            prev_rule_changed = {
+                (r[0], r[1], r[2]): (r[5] != STOP_RULE_VERSION) for r in prev_rows
+            }
 
         # symbol Yahoo instrumentu CENOWEGO (dla kontraktu: baza) — jeden
         # lookup per pozycja, dzielony przez STOP (§2) i M62.
@@ -2492,7 +2645,8 @@ def run_cycle(
         for row in risk_summary.rows:
             if not is_risk_budget_eligible(row.instrument_type, row.is_core):
                 continue
-            stop_prev = prev_stops.get((row.rachunek, row.instrument_id, row.settlement_currency))
+            stop_key = (row.rachunek, row.instrument_id, row.settlement_currency)
+            stop_prev = prev_stops.get(stop_key)
             base_symbol_label = price_source_symbols.get(row.instrument_id) if row.instrument_type == "future" else None
             stop_order_items.append(
                 (
@@ -2508,6 +2662,7 @@ def run_cycle(
                     row.below_stop,
                     row.stop_effective_prev_rule,
                     row.instrument_type == "future",
+                    prev_rule_changed.get(stop_key, False),  # B-80
                 )
             )
         state.stop_order_rows = build_stop_order_rows(stop_order_items)
@@ -2557,8 +2712,12 @@ def run_cycle(
             while sat_dir.exists():
                 sat_dir = reports_dir / f"{sat_base}_{n_dir}"
                 n_dir += 1
+            # B-73: kotwice M78 z katalogu; `AccountValuesError` -> DATA FAILURE jak kazdy
+            # wyjatek etapu satelity.
+            snapshots = load_account_values_dir(account_values_dir)
             state.satellite = satellite_fn(
-                conn, d, out_dir=sat_dir, run_at=run_started_at, write=True, check_ignored=check_ignored
+                conn, d, out_dir=sat_dir, run_at=run_started_at, write=True, check_ignored=check_ignored,
+                snapshots=snapshots,
             )
             if commit:
                 conn.commit()

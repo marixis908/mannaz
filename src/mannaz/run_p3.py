@@ -40,6 +40,7 @@ from mannaz.calendar_check import EXCHANGE_TO_CALENDAR_CODE, run_calendar_check
 from mannaz.corp_actions import run_corp_actions
 from mannaz.cycle import (
     DEFAULT_INCOMING_DIR,
+    DEFAULT_MANUAL_DIR,
     DEFAULT_RAW_ARCHIVE_DIR,
     DEFAULT_REPORTS_DIR,
     render_level1_by_name,
@@ -504,6 +505,7 @@ def cmd_cycle(args: argparse.Namespace) -> None:
             incoming_dir=args.incoming_dir,
             raw_archive_dir=args.raw_archive_dir,
             reports_dir=args.reports_dir,
+            account_values_dir=args.account_values_dir,
             today=args.today,
         )
     finally:
@@ -614,6 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cycle.add_argument("--incoming-dir", type=Path, default=DEFAULT_INCOMING_DIR)
     p_cycle.add_argument("--raw-archive-dir", type=Path, default=DEFAULT_RAW_ARCHIVE_DIR)
     p_cycle.add_argument("--reports-dir", type=Path, default=DEFAULT_REPORTS_DIR)
+    # B-73: katalog kotwic M78 (`account_values_RRRR-MM-DD.csv`).
+    p_cycle.add_argument("--account-values-dir", type=Path, default=DEFAULT_MANUAL_DIR)
     p_cycle.add_argument("--today", type=_parse_date, default=None)
     p_cycle.set_defaults(func=cmd_cycle)
 

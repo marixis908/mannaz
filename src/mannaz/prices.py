@@ -63,9 +63,13 @@ chcemy cicho pomijać logowania T12)."""
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
+import io
+import logging
 import math
+import re
 import time
 import warnings
 from collections.abc import Callable
@@ -492,7 +496,160 @@ def session_closed(calendar_code: str | None, price_date: date, now_utc: datetim
     return _session_closed_ex(calendar_code, price_date, now_utc)[0]
 
 
-def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# B-81: komunikaty dostawcy (yfinance) — przechwycenie zamiast gubienia na konsoli
+# ---------------------------------------------------------------------------
+
+_PROVIDER_SYMBOL_RE = re.compile(r"^\$?([A-Za-z0-9.^=\-]+):")
+
+
+@dataclass(frozen=True)
+class ProviderMessage:
+    """B-81: jedna linia komunikatu dostawcy (np. `$SHO.WA: Data doesn't exist...`);
+    `symbol` z tresci wg `_PROVIDER_SYMBOL_RE` (wtedy `text` bez tego prefiksu),
+    inaczej "?" i cala linia."""
+
+    symbol: str
+    text: str
+
+
+def _provider_message(line: str) -> ProviderMessage | None:
+    text = line.strip()
+    if not text:
+        return None
+    m = _PROVIDER_SYMBOL_RE.match(text)
+    if m is None:
+        return ProviderMessage("?", text)
+    # tresc bez prefiksu `$SYMBOL:` (symbol jest w osobnym polu; HEARTBEAT: "<symbol>: <tresc>")
+    return ProviderMessage(m.group(1), text[m.end():].strip() or text)
+
+
+class _ProviderLogHandler(logging.Handler):
+    def __init__(self, sink: list[ProviderMessage]) -> None:
+        super().__init__(level=logging.WARNING)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = record.getMessage()
+        except Exception:  # noqa: BLE001 — komunikat dostawcy nigdy nie przerywa etapu
+            return
+        for line in text.splitlines():
+            msg = _provider_message(line)
+            if msg is not None:
+                self._sink.append(msg)
+
+
+class _ProviderStderr(io.TextIOBase):
+    """Bufor stderr dzielony na linie; niepelna ostatnia linia trafia do listy przy `close_buffer`."""
+
+    def __init__(self, sink: list[ProviderMessage]) -> None:
+        self._sink = sink
+        self._partial = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        self._partial += text
+        *lines, self._partial = self._partial.split("\n")
+        for line in lines:
+            msg = _provider_message(line)
+            if msg is not None:
+                self._sink.append(msg)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def close_buffer(self) -> None:
+        msg = _provider_message(self._partial)
+        self._partial = ""
+        if msg is not None:
+            self._sink.append(msg)
+
+
+class ProviderMessageCapture:
+    """B-81: menedzer kontekstu z `capture_provider_messages()`. Na czas bloku:
+    handler (poziom >= WARNING) na loggerze `yfinance` z `propagate=False` oraz
+    `contextlib.redirect_stderr` do bufora; po wyjsciu (takze przy wyjatku)
+    stan loggera przywrocony. Wynik: `messages` (kolejnosc wystapienia).
+    Komunikat to nie wyjatek — nic nie przerywa."""
+
+    def __init__(self) -> None:
+        self.messages: list[ProviderMessage] = []
+        self._logger = logging.getLogger("yfinance")
+        self._handler = _ProviderLogHandler(self.messages)
+        self._stderr = _ProviderStderr(self.messages)
+        self._redirect = contextlib.redirect_stderr(self._stderr)
+        self._saved: tuple[bool, int] | None = None
+
+    def __enter__(self) -> "ProviderMessageCapture":
+        self._saved = (self._logger.propagate, self._logger.level)
+        self._logger.propagate = False
+        if self._logger.getEffectiveLevel() > logging.WARNING:
+            self._logger.setLevel(logging.WARNING)
+        self._logger.addHandler(self._handler)
+        self._redirect.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self._redirect.__exit__(exc_type, exc, tb)
+        finally:
+            self._stderr.close_buffer()
+            self._logger.removeHandler(self._handler)
+            if self._saved is not None:
+                self._logger.propagate = self._saved[0]
+                self._logger.setLevel(self._saved[1])
+                self._saved = None
+        return None
+
+
+def capture_provider_messages() -> ProviderMessageCapture:
+    """B-81: `with capture_provider_messages() as cap: ...; cap.messages`."""
+    return ProviderMessageCapture()
+
+
+def _positions_window_ids(
+    cur: psycopg.Cursor, today: date
+) -> tuple[list[int], list[str]] | None:
+    """B-70: instrumenty z pozycją (satelita lub rdzeń) otwartą w DOWOLNYM dniu
+    kalendarzowym przedziału [`prev_D`, `today`], `prev_D` = `MAX(risk_date)` z
+    `risk_daily`. Pozycje wyłącznie przez `mannaz.risk.open_positions_as_of`
+    (zero własnej definicji „pozycji otwartej”). Zwraca (id instrumentów,
+    `base_symbol` kontraktów futures) albo None, gdy przedział jest pusty
+    (`risk_daily` pusta albo `prev_D > today`) — wtedy obowiązuje dotychczasowe
+    zapytanie."""
+    from mannaz.risk import open_positions_as_of  # lokalnie: unikamy cyklu importów
+
+    cur.execute("SELECT MAX(risk_date) FROM risk_daily")
+    prev_d = cur.fetchone()[0]
+    if prev_d is None or prev_d > today:
+        return None
+    ids: set[int] = set()
+    bases: set[str] = set()
+    d = prev_d
+    while d <= today:
+        for p in open_positions_as_of(cur, d):
+            ids.add(p["instrument_id"])
+            if p["instrument_type"] == "future" and p["base_symbol"]:
+                bases.add(p["base_symbol"])
+        d += timedelta(days=1)
+    return sorted(ids), sorted(bases)
+
+
+def _mapped_instruments(
+    cur: psycopg.Cursor,
+    instrument_ids: list[int] | None,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Zbiór instrumentów do pobrania cen. Z jawną listą `instrument_ids` — ta
+    lista. Bez niej: dotychczasowe zapytanie (rdzeń, pozycje w `positions_fifo`,
+    bazy otwartych futures, benchmarki) ∪ (B-70) instrumenty z pozycją otwartą
+    w dowolnym dniu przedziału [`prev_D`, `today`] wraz z bazami futures —
+    żeby pozycja otwarta i zamknięta między ocenami miała ceny. `today` None
+    albo `risk_daily` pusta -> dokładnie dotychczasowe zachowanie."""
     if instrument_ids:
         cur.execute(
             """
@@ -503,6 +660,8 @@ def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -
             (instrument_ids,),
         )
     else:
+        window = _positions_window_ids(cur, today) if today is not None else None
+        win_ids, win_bases = window if window is not None else ([], [])
         cur.execute(
             """
             SELECT i.id, i.yahoo_symbol, i.currency, i.exchange FROM instruments i
@@ -514,9 +673,12 @@ def _mapped_instruments(cur: psycopg.Cursor, instrument_ids: list[int] | None) -
                   SELECT f.base_symbol FROM instruments f
                   JOIN positions_fifo p ON p.instrument_id = f.id
                   WHERE f.instrument_type = 'future'
-              ) OR i.is_benchmark)
+              ) OR i.is_benchmark
+                -- B-70: pozycje otwarte w oknie [prev_D, today] i bazy ich futures
+                OR i.id = ANY(%s) OR i.yahoo_symbol = ANY(%s))
             ORDER BY i.id
-            """
+            """,
+            (win_ids, win_bases),
         )
     cols = ("id", "yahoo_symbol", "currency", "exchange")
     return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -627,7 +789,7 @@ def run_prices_fetch(
     with conn.cursor() as cur:
         _ensure_ingest_errors_table(cur)  # I5 — przed jakimkolwiek zapisem cen
 
-        instruments = _mapped_instruments(cur, instrument_ids)
+        instruments = _mapped_instruments(cur, instrument_ids, today=end)
 
         for inst in instruments:
             instrument_id = inst["id"]
