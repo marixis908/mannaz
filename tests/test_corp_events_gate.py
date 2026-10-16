@@ -302,3 +302,47 @@ def test_detect_new_events_date_drift_not_in_saved(db_conn, monkeypatch):
         assert _count_events(conn) == before
     finally:
         conn.rollback()
+
+
+# --- B-71: blad instrumentu i pominiete zamkniecia w cyklu -----------------------
+
+
+@pytest.mark.db
+def test_b71_instrument_error_is_data_failure_and_stops_before_fifo(db_conn, tmp_path):
+    conn = db_conn
+    try:
+        risk_spy = _Spy(RiskSummary(risk_date=date(1990, 1, 1)))
+        det = _Spy(
+            CorpEventsClassification(
+                instrument_errors=[corp_actions.InstrumentError("BBB", "BBB.WA", "RuntimeError")]
+            )
+        )
+        result = run_cycle(**_cycle_kwargs(tmp_path, conn, det, risk_spy=risk_spy))
+        assert result.exit_code == 2
+        assert "detektor: błąd instrumentu BBB: RuntimeError" in result.state.import_failures
+        assert {STAGE_FIFO, STAGE_RISK} <= result.state.stage_not_executed
+        assert risk_spy.calls == 0
+        text = result.report_path.read_text(encoding="utf-8")
+        assert "detektor: błąd instrumentu BBB: RuntimeError" in text
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.db
+def test_b71_skipped_closes_do_not_stop_cycle_and_are_reported(db_conn, tmp_path):
+    conn = db_conn
+    try:
+        det = _Spy(
+            CorpEventsClassification(
+                skipped_closes=[corp_actions.SkippedCloses("VRC", "VRC.WA", [date(1990, 3, 9)])]
+            )
+        )
+        result = run_cycle(**_cycle_kwargs(tmp_path, conn, det))
+        assert len(result.state.corp_events_skipped_closes) == 1
+        assert result.state.corp_events_review == []
+        assert STAGE_FIFO not in result.state.stage_not_executed
+        assert not any("detektor" in f for f in result.state.import_failures)
+        text = result.report_path.read_text(encoding="utf-8")
+        assert "informacja: detektor: pominięte zamknięcia Yahoo (NaN/≤0): VRC 1 (daty: 1990-03-09)" in text
+    finally:
+        conn.rollback()

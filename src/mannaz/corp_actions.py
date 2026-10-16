@@ -36,7 +36,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from statistics import median
 from typing import Any, Literal
 
@@ -101,8 +101,24 @@ def yahoo_symbol_for(*, broker_ticker: str, currency: str, rachunek: str, is_cor
 # ---------------------------------------------------------------------------
 
 
-def fetch_close_series(symbol: str, start: date, end: date) -> dict[date, Decimal]:
-    """Historia close (auto_adjust=False) dla symbolu, w oknie [start, end+bufor]."""
+def _usable_close(close: Any) -> Decimal | None:
+    """B-71: zamknięcie Yahoo jako Decimal albo None, gdy nie jest próbką
+    (NaN, ±inf, wartość nieliczbowa albo <= 0)."""
+    try:
+        value = Decimal(str(close))
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    return value
+
+
+def fetch_close_series(
+    symbol: str, start: date, end: date, skipped: list[date] | None = None
+) -> dict[date, Decimal]:
+    """Historia close (auto_adjust=False) dla symbolu, w oknie [start, end+bufor].
+    B-71: wiersze z zamknięciem NaN/±inf/<=0 są pomijane (bez wyjątku); ich
+    daty trafiają do `skipped`, gdy podano listę."""
     ticker = yf.Ticker(symbol)
     hist = ticker.history(
         start=start.isoformat(),
@@ -115,8 +131,14 @@ def fetch_close_series(symbol: str, start: date, end: date) -> dict[date, Decima
     for idx, row in hist.iterrows():
         d = idx.date() if hasattr(idx, "date") else idx
         close = row.get("Close")
-        if close is not None:
-            out[d] = Decimal(str(close))
+        if close is None:
+            continue
+        value = _usable_close(close)
+        if value is None:
+            if skipped is not None:
+                skipped.append(d)
+            continue
+        out[d] = value
     return out
 
 
@@ -255,10 +277,44 @@ class DriftEvent:
 
 
 @dataclass
+class SkippedCloses:
+    """B-71: zamknięcia Yahoo pominięte (NaN/±inf/<=0) dla instrumentu —
+    informacja, nie DATA FAILURE."""
+
+    broker_ticker: str
+    symbol: str
+    dates: list[date]
+
+
+@dataclass
+class InstrumentError:
+    """B-71: wyjątek detektora dla jednego instrumentu — kontrola niewykonana
+    dla tego papieru (DATA FAILURE z tickerem); pozostałe instrumenty ocenione."""
+
+    broker_ticker: str
+    symbol: str | None
+    exc_type: str
+
+
+class CorpActionsInstrumentError(RuntimeError):
+    """B-71: ścieżka zapisu (`run_corp_actions`) — detektor nie ocenił
+    instrumentów z listy; komunikat z tickerami i typem wyjątku."""
+
+    def __init__(self, errors: list[InstrumentError]) -> None:
+        self.errors = list(errors)
+        super().__init__(
+            "detektor: błąd instrumentu " + ", ".join(f"{e.broker_ticker}: {e.exc_type}" for e in self.errors)
+        )
+
+
+@dataclass
 class CorpEventsClassification:
     saved: list[DetectedEvent] = field(default_factory=list)
     known: list[DetectedEvent] = field(default_factory=list)
     date_drift: list[DriftEvent] = field(default_factory=list)
+    # B-71: przenoszone z CorpActionsSummary (kolektor) do etapu cyklu.
+    skipped_closes: list[SkippedCloses] = field(default_factory=list)
+    instrument_errors: list[InstrumentError] = field(default_factory=list)
 
 
 @dataclass
@@ -276,6 +332,22 @@ class CorpActionsSummary:
     ratio_detector_evaluated: int = 0
     ratio_detector_hit_tickers: list[str] = field(default_factory=list)
     ratio_detector_clean_tickers: list[str] = field(default_factory=list)
+    # B-71
+    skipped_closes: list[SkippedCloses] = field(default_factory=list)
+    instrument_errors: list[InstrumentError] = field(default_factory=list)
+
+    def merge(self, other: CorpActionsSummary) -> None:
+        self.yfinance_splits_imported.extend(other.yfinance_splits_imported)
+        self.price_ratio_detected.extend(other.price_ratio_detected)
+        self.candidates.extend(other.candidates)
+        self.instruments_checked += other.instruments_checked
+        self.instruments_skipped_no_symbol += other.instruments_skipped_no_symbol
+        self.instruments_no_data += other.instruments_no_data
+        self.ratio_detector_evaluated += other.ratio_detector_evaluated
+        self.ratio_detector_hit_tickers.extend(other.ratio_detector_hit_tickers)
+        self.ratio_detector_clean_tickers.extend(other.ratio_detector_clean_tickers)
+        self.skipped_closes.extend(other.skipped_closes)
+        self.instrument_errors.extend(other.instrument_errors)
 
 
 def _owned_instruments(cur: psycopg.Cursor) -> list[dict[str, Any]]:
@@ -409,14 +481,13 @@ def collect_corp_action_candidates(conn: psycopg.Connection) -> CorpActionsSumma
         instruments = _owned_instruments(cur)
 
         for inst in instruments:
-            broker_ticker = inst["broker_ticker"]
             rachunek = inst["rachunek"]
             currency = inst["currency"]
             if rachunek is None or currency is None:
                 continue
 
             symbol = yahoo_symbol_for(
-                broker_ticker=broker_ticker,
+                broker_ticker=inst["broker_ticker"],
                 currency=currency,
                 rachunek=rachunek,
                 is_core=bool(inst["is_core"]),
@@ -425,97 +496,116 @@ def collect_corp_action_candidates(conn: psycopg.Connection) -> CorpActionsSumma
                 summary.instruments_skipped_no_symbol += 1
                 continue
 
-            summary.instruments_checked += 1
-
-            txns = _instrument_transactions(cur, inst["id"], currency)
-            if not txns:
-                summary.instruments_no_data += 1
-                continue
-
-            min_date = min(d for d, _ in txns)
-            max_date = max(d for d, _ in txns)
-
-            # --- Źródło 1: import bezpośredni z yfinance Ticker.splits ---
-            yf_splits_full = fetch_yfinance_splits(symbol)
-            yf_splits_recent = [
-                (d, r) for d, r in yf_splits_full if d >= YFINANCE_SPLITS_IMPORT_START
-            ]
-            for d, ratio in yf_splits_recent:
-                event_type = "split" if ratio >= 1 else "reverse_split"
-                title_raw = (
-                    f"[auto] yfinance_splits: {broker_ticker} ({symbol}) "
-                    f"{event_type} ratio={ratio} date={d.isoformat()}"
+            # B-71: wyjątek jednego instrumentu nie przerywa pozostałych; wynik
+            # instrumentu dołączany tylko w całości (bez połowy kandydatów).
+            part = CorpActionsSummary()
+            try:
+                _collect_instrument(cur, inst, symbol, currency, part)
+            except Exception as exc:  # noqa: BLE001 — trafia do instrument_errors (DATA FAILURE w cyklu)
+                summary.instrument_errors.append(
+                    InstrumentError(broker_ticker=inst["broker_ticker"], symbol=symbol, exc_type=type(exc).__name__)
                 )
-                ev = DetectedEvent(
-                    broker_ticker=broker_ticker,
-                    instrument_id=inst["id"],
-                    event_type=event_type,
-                    ratio=ratio,
-                    event_date=d,
-                    date_source="yfinance_splits",
-                    source="yfinance_splits",
-                    n_samples=0,
-                    median_ratio=ratio,
-                    title_raw=title_raw,
-                    first_txn_date=min_date,
-                )
-                summary.yfinance_splits_imported.append(ev)
-                summary.candidates.append(ev)
-
-            # --- Źródło 2: detektor z ilorazu ceny (kontrolka dodatnia/ujemna) ---
-            close_series = fetch_close_series(symbol, min_date, max_date)
-            if not close_series:
-                summary.instruments_no_data += 1
                 continue
-
-            factor = _pence_adjustment_factor(symbol, currency)
-            samples: list[RatioSample] = []
-            for tdate, price in txns:
-                close = closest_prior_close(close_series, tdate)
-                if close is None or close == 0:
-                    continue
-                close_adj = close * factor
-                if close_adj == 0:
-                    continue
-                samples.append(RatioSample(transaction_date=tdate, ratio=price / close_adj))
-
-            if not samples:
-                summary.instruments_no_data += 1
-                continue
-
-            med_ratio = median(s.ratio for s in samples)
-            decision = classify_ratio(med_ratio)
-            summary.ratio_detector_evaluated += 1
-
-            if decision is None:
-                summary.ratio_detector_clean_tickers.append(broker_ticker)
-                continue
-
-            summary.ratio_detector_hit_tickers.append(broker_ticker)
-            event_type, ratio_final = decision
-            event_date, date_source = resolve_event_date(samples, ratio_final, yf_splits_full)
-
-            title_raw = (
-                f"[auto] price_ratio_detector: {broker_ticker} ({symbol}) {event_type} "
-                f"median_ratio={med_ratio:.4f} n={len(samples)} date_source={date_source}"
-            )
-            ev = DetectedEvent(
-                broker_ticker=broker_ticker,
-                instrument_id=inst["id"],
-                event_type=event_type,
-                ratio=ratio_final,
-                event_date=event_date,
-                date_source=date_source,
-                source="price_ratio_detector",
-                n_samples=len(samples),
-                median_ratio=med_ratio,
-                title_raw=title_raw,
-                first_txn_date=min_date,
-            )
-            summary.price_ratio_detected.append(ev)
-            summary.candidates.append(ev)
+            summary.merge(part)
 
     return summary
+
+
+def _collect_instrument(
+    cur: psycopg.Cursor, inst: dict[str, Any], symbol: str, currency: str, summary: CorpActionsSummary
+) -> None:
+    """Kandydaci jednego instrumentu (oba źródła) do `summary`."""
+    broker_ticker = inst["broker_ticker"]
+    summary.instruments_checked += 1
+
+    txns = _instrument_transactions(cur, inst["id"], currency)
+    if not txns:
+        summary.instruments_no_data += 1
+        return
+
+    min_date = min(d for d, _ in txns)
+    max_date = max(d for d, _ in txns)
+
+    # --- Źródło 1: import bezpośredni z yfinance Ticker.splits ---
+    yf_splits_full = fetch_yfinance_splits(symbol)
+    yf_splits_recent = [(d, r) for d, r in yf_splits_full if d >= YFINANCE_SPLITS_IMPORT_START]
+    for d, ratio in yf_splits_recent:
+        event_type = "split" if ratio >= 1 else "reverse_split"
+        title_raw = (
+            f"[auto] yfinance_splits: {broker_ticker} ({symbol}) "
+            f"{event_type} ratio={ratio} date={d.isoformat()}"
+        )
+        ev = DetectedEvent(
+            broker_ticker=broker_ticker,
+            instrument_id=inst["id"],
+            event_type=event_type,
+            ratio=ratio,
+            event_date=d,
+            date_source="yfinance_splits",
+            source="yfinance_splits",
+            n_samples=0,
+            median_ratio=ratio,
+            title_raw=title_raw,
+            first_txn_date=min_date,
+        )
+        summary.yfinance_splits_imported.append(ev)
+        summary.candidates.append(ev)
+
+    # --- Źródło 2: detektor z ilorazu ceny (kontrolka dodatnia/ujemna) ---
+    skipped: list[date] = []
+    close_series = fetch_close_series(symbol, min_date, max_date, skipped)
+    if skipped:
+        summary.skipped_closes.append(SkippedCloses(broker_ticker=broker_ticker, symbol=symbol, dates=sorted(skipped)))
+    if not close_series:
+        summary.instruments_no_data += 1
+        return
+
+    factor = _pence_adjustment_factor(symbol, currency)
+    samples: list[RatioSample] = []
+    for tdate, price in txns:
+        close = closest_prior_close(close_series, tdate)
+        if close is None or close == 0:
+            continue
+        close_adj = close * factor
+        if close_adj == 0:
+            continue
+        samples.append(RatioSample(transaction_date=tdate, ratio=price / close_adj))
+
+    if not samples:
+        summary.instruments_no_data += 1
+        return
+
+    med_ratio = median(s.ratio for s in samples)
+    decision = classify_ratio(med_ratio)
+    summary.ratio_detector_evaluated += 1
+
+    if decision is None:
+        summary.ratio_detector_clean_tickers.append(broker_ticker)
+        return
+
+    summary.ratio_detector_hit_tickers.append(broker_ticker)
+    event_type, ratio_final = decision
+    event_date, date_source = resolve_event_date(samples, ratio_final, yf_splits_full)
+
+    title_raw = (
+        f"[auto] price_ratio_detector: {broker_ticker} ({symbol}) {event_type} "
+        f"median_ratio={med_ratio:.4f} n={len(samples)} date_source={date_source}"
+    )
+    ev = DetectedEvent(
+        broker_ticker=broker_ticker,
+        instrument_id=inst["id"],
+        event_type=event_type,
+        ratio=ratio_final,
+        event_date=event_date,
+        date_source=date_source,
+        source="price_ratio_detector",
+        n_samples=len(samples),
+        median_ratio=med_ratio,
+        title_raw=title_raw,
+        first_txn_date=min_date,
+    )
+    summary.price_ratio_detected.append(ev)
+    summary.candidates.append(ev)
 
 
 def apply_candidates(cur: psycopg.Cursor, candidates: list[DetectedEvent]) -> CorpEventsClassification:
@@ -551,8 +641,12 @@ def apply_candidates(cur: psycopg.Cursor, candidates: list[DetectedEvent]) -> Co
 
 def run_corp_actions(conn: psycopg.Connection, *, dry_run: bool) -> CorpEventsClassification:
     """B-45: collect -> apply w `conn.transaction()`; dry_run -> Rollback
-    (zero zapisu), inaczej commit (`run_p3 corp-actions`)."""
+    (zero zapisu), inaczej commit (`run_p3 corp-actions`).
+    B-71: błąd instrumentu przerywa zapis przed transakcją (z tickerem) —
+    zapis nie może pominąć papieru po cichu."""
     summary = collect_corp_action_candidates(conn)
+    if summary.instrument_errors:
+        raise CorpActionsInstrumentError(summary.instrument_errors)
     with conn.transaction() as tx:
         with conn.cursor() as cur:
             result = apply_candidates(cur, summary.candidates)
@@ -572,11 +666,14 @@ def detect_new_corporate_events(conn: psycopg.Connection) -> CorpEventsClassific
     (`psycopg.Rollback`) — baza po wywołaniu bez zmian. `saved` = zdarzenia nowe
     do potwierdzenia (bramka), `known` = już zapisane, `date_drift` = ratio
     zgodne z zapisanym zdarzeniem, inna data (informacja, bez bramki).
-    Detektor sam pobiera dane z Yahoo (sieć)."""
+    Detektor sam pobiera dane z Yahoo (sieć).
+    B-71: `skipped_closes` i `instrument_errors` przeniesione z kolektora."""
     summary = collect_corp_action_candidates(conn)
     result = CorpEventsClassification()
     with conn.transaction() as tx:
         with conn.cursor() as cur:
             result = apply_candidates(cur, summary.candidates)
         raise psycopg.Rollback(tx)
+    result.skipped_closes = list(summary.skipped_closes)
+    result.instrument_errors = list(summary.instrument_errors)
     return result

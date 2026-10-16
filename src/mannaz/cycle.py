@@ -1145,6 +1145,9 @@ class ReportState:
     # price_ratio z ratio zgodnym z zapisanym zdarzeniem, ale inną datą;
     # elementy: corp_actions.DriftEvent.
     corp_events_date_drift: list = field(default_factory=list)
+    # B-71: informacja (NIE DATA FAILURE): zamknięcia Yahoo NaN/±inf/<=0
+    # pominięte przez detektor; elementy: corp_actions.SkippedCloses.
+    corp_events_skipped_closes: list = field(default_factory=list)
     price_ingest_errors: list[str] = field(default_factory=list)
     fx_failures: list[str] = field(default_factory=list)
     date_incomplete_items: list[IncompleteRiskItem] = field(default_factory=list)
@@ -1287,6 +1290,12 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
         lines.append(
             f"- informacja (date_drift): {ev.broker_ticker} {ev.event_type} ratio={ev.ratio}: "
             f"zapisane {_fmt_date(dr.stored_date)}, wykryte {_fmt_date(ev.event_date)}, bez zapisu"
+        )
+    # B-71: informacja o pominiętych zamknięciach Yahoo (bez wpływu na bramkę).
+    for sk in state.corp_events_skipped_closes:
+        lines.append(
+            f"- informacja: detektor: pominięte zamknięcia Yahoo (NaN/≤0): {sk.broker_ticker} {len(sk.dates)} "
+            f"(daty: {', '.join(_fmt_date(d) for d in sk.dates)})"
         )
 
     lines.append("")
@@ -2149,8 +2158,14 @@ def run_cycle(
             state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
             raise _StageStop() from exc
         state.corp_events_date_drift = list(corp_result.date_drift)  # B-45: informacja, ZAWSZE
+        state.corp_events_skipped_closes = list(corp_result.skipped_closes)  # B-71: informacja, ZAWSZE
+        # B-71: kontrola niewykonana dla instrumentu -> DATA FAILURE z tickerem
+        # (split tego papieru mógłby przejść niezauważony).
+        for err in corp_result.instrument_errors:
+            state.import_failures.append(f"detektor: błąd instrumentu {err.broker_ticker}: {err.exc_type}")
         if corp_result.saved:
             state.corp_events_review = list(corp_result.saved)
+        if corp_result.saved or corp_result.instrument_errors:
             state.stage_not_executed.update({STAGE_FIFO, STAGE_REGISTRATION, STAGE_PRICES_FX, STAGE_RISK})
             raise _StageStop()
 
