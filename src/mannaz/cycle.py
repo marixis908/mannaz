@@ -1784,13 +1784,14 @@ def _render_position_changes_section(state: ReportState) -> list[str]:
         lines.append("brak poprzedniej oceny")
     else:
         lines.append(f"względem poprzedniej oceny ({state.position_changes_prev_date.isoformat()})")
+        # B74.2: druga linia sekcji (Codex R1 MINOR-3), przed listą zmian.
+        between = ", ".join(state.position_changes_between) if state.position_changes_between else "brak"
+        lines.append(f"otwarte i zamknięte między ocenami: {between}")
         if not state.position_changes:
             lines.append("brak")
         else:
             for c in state.position_changes:
                 lines.append(f"- {c.broker_ticker} ({account_label(c.rachunek)}): {c.rodzaj}")
-        between = ", ".join(state.position_changes_between) if state.position_changes_between else "brak"
-        lines.append(f"otwarte i zamknięte między ocenami: {between}")
     lines.append("")
     if state.archetype_missing:
         lines.append(f"Do rejestracji (§12): brak archetypu: {', '.join(state.archetype_missing)}")

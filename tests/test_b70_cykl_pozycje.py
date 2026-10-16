@@ -186,6 +186,21 @@ def test_t3_unparsable_file_raises_with_file_name(tmp_path):
     assert str(ei.value).startswith("account_values_2024-01-05.csv")
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "2024-01-05\n",  # wiersz bez pol account/currency (Codex R1 MINOR-2)
+        f"2024-01-05,{ACC_AKCYJNY}\n",  # brak waluty
+    ],
+    ids=["tylko-data", "bez-waluty"],
+)
+def test_t3_short_row_raises_account_values_error_with_file_name(tmp_path, body):
+    _w(tmp_path, "account_values_2024-01-05.csv", body)
+    with pytest.raises(AccountValuesError) as ei:
+        load_account_values_dir(tmp_path)
+    assert str(ei.value).startswith("account_values_2024-01-05.csv")
+
+
 def test_t3_empty_and_missing_directory_give_empty_list(tmp_path):
     empty = tmp_path / "pusty"
     empty.mkdir()
@@ -354,6 +369,8 @@ def test_t4_render_changes_new_closed_up_down_with_first_line_and_between():
     sec = _section(render_report(state), "## Zmiany pozycji")
     lines = [ln for ln in sec.split("\n") if ln.strip()]
     assert lines[0] == "względem poprzedniej oceny (1990-03-05)"
+    # B74.2 (Codex R1 MINOR-3): druga linia sekcji, przed lista zmian
+    assert lines[1] == "otwarte i zamknięte między ocenami: EEE, FFF"
     assert "- AAA (AKCYJNY): nowa" in lines
     assert "- BBB (AKCYJNY): zamknięta" in lines
     assert "- CCC (AKCYJNY): zmiana ilości ↑" in lines
@@ -369,8 +386,8 @@ def test_t4_render_no_changes_and_no_between_says_brak_twice():
     sec = _section(render_report(state), "## Zmiany pozycji")
     lines = [ln for ln in sec.split("\n") if ln.strip()]
     assert lines[0] == "względem poprzedniej oceny (1990-03-05)"
-    assert lines[1] == "brak"
-    assert lines[2] == "otwarte i zamknięte między ocenami: brak"
+    assert lines[1] == "otwarte i zamknięte między ocenami: brak"
+    assert lines[2] == "brak"
 
 
 def test_t4_render_no_previous_evaluation():

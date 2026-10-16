@@ -1440,7 +1440,9 @@ def load_account_values_dir(directory: Path | str) -> list[AccountValue]:
         try:
             file_date = date.fromisoformat(_ACCOUNT_VALUES_FILE_RE.match(f.name).group(1))
             rows = load_account_values(f)
-        except (ValueError, KeyError, OSError, csv.Error) as exc:
+        # AttributeError/TypeError: wiersz bez wymaganych pol (DictReader daje None,
+        # `.strip()` na None) — Codex R1 MINOR-2; nazwa pliku zawsze w tresci.
+        except (ValueError, KeyError, OSError, csv.Error, AttributeError, TypeError) as exc:
             raise AccountValuesError(f"{f.name}: blad parsowania pliku: {type(exc).__name__}: {exc}") from exc
         for r in rows:
             if r.date != file_date:
