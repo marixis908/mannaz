@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.19 · 2026-10-16**
+**Rewizja 4.20 · 2026-10-16**
 
 ---
 
@@ -43,7 +43,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.16 | 2026-10-14 | M85 doprecyzowanie: jedna wycena z NAV, tożsamość dzienna bez korekty, składnik transakcje dnia, koszty przy emitencie, gotówka i KONTRAKTOWY w atrybucji (decyzja ownera 2026-10-14, brief CC-B38A) |
 | 4.17 | 2026-10-14 | T42 = 2026-09-30; M81 progi w `prices_daily` (instrument `is_benchmark`, cena = TR dla ETF akumulujących); M89 rejestr zdarzeń i naruszeń tylko do dopisywania (trigger), raport: nowe / zapisane / nieodtworzone; §8 dwie tabele i kolumna `is_benchmark` (decyzje ownera 2026-10-14, brief CC-B38B) |
 | 4.18 | 2026-10-15 | M85 doprecyzowanie: opłata za wymianę waluty (`oplata_wymiana_waluty`) w linii „opłaty” rachunku, spread przewalutowania w linii gotówki rachunku i waluty (B-63, brief CC-FX) |
-| **4.19** | **2026-10-16** | **§19.1 M23, §19.3: Chandelier okresu posiadania (okno od sesji po wejściu, zapadka od max(e+1, RATCHET_START)), A8 kontekst trendu i flaga wejścia wbrew trendowi (w raporcie tylko nowe wejścia), adnotacja zmiany reguły i M69 „wyłącznie zmiana reguły”; §19.4: kotwica 2N kontraktów = zamknięcie bazy z sesji każdego lota (także zapadka 2N); §26: O-51 B2 odrzucony (brak notowań kontraktów); decyzja: owner 2026-10-16 (brief CC-CH2, pomiar CC-CH, recenzja Codexa, ocena zewnętrzna)** |
+| 4.19 | 2026-10-16 | §19.1 M23, §19.3: Chandelier okresu posiadania (okno od sesji po wejściu, zapadka od max(e+1, RATCHET_START)), A8 kontekst trendu i flaga wejścia wbrew trendowi (w raporcie tylko nowe wejścia), adnotacja zmiany reguły i M69 „wyłącznie zmiana reguły”; §19.4: kotwica 2N kontraktów = zamknięcie bazy z sesji każdego lota (także zapadka 2N); §26: O-51 B2 odrzucony (brak notowań kontraktów); decyzja: owner 2026-10-16 (brief CC-CH2, pomiar CC-CH, recenzja Codexa, ocena zewnętrzna) |
+| **4.20** | **2026-10-16** | **M62: zapadka nie przechodzi przez zmianę reguły stopu, liczona od pierwszej oceny nową regułą (B-80); M69: sekcja „Zmiany pozycji” porównuje pozycje otwarte z poprzednią oceną (B-74); M78: cykl czyta kotwice `account_values` z `data\manual` (B-73); decyzja: owner 2026-10-16 (ocena cyklu 2026-10-15_1747, brief CC-B70)** |
 
 ### 0.3 Oznaczenia
 
@@ -1121,6 +1122,8 @@ Decyzje ownera z 2026-10-02 po dwóch rundach recenzji zewnętrznej (`tmp/ocena-
 
 Bramka: na każdą datę migawki brokera wartość trzech rachunków = NAV satelity + NAV rdzenia. Różnica niewyjaśniona zdarzeniem ani udokumentowanym zaokrągleniem (T39) daje pomiarowi status „niezweryfikowany”.
 
+Kotwice w cyklu (rew. 4.20, B-73): etap satelity cyklu wczytuje wszystkie pliki `data\manual\account_values_RRRR-MM-DD.csv` (katalog danych ręcznych repo, jak bilans otwarcia) i łączy je w jedną listę kotwic bramki. Data każdego wiersza musi być równa dacie z nazwy pliku; rozjazd, duplikat klucza (data, rachunek, waluta) między plikami albo błąd parsowania daje DATA FAILURE z nazwą pliku. Kotwica spoza [S, D] jest pomijana z informacją „kotwica poza zakresem: <data>”. Brak plików oznacza brak bramki („nie podano account_values”). Sekcja „Satelita (§21.6)” raportu cyklu pokazuje dla każdej kotwicy składniki zgodne, niezgodne (z % rozjazdu) i bez danych, bez kwot.
+
 **M79. Mandat.** Celem satelity jest zwrot z kapitału wyższy niż oba progi z M81. Mandat jest wzrostowy, nie ochronny: niższe ryzyko nie kompensuje niższego wyniku. Kapitał z zamkniętych pozycji pozostaje w satelicie; satelita nie zasila rdzenia (decyzja ownera 2026-10-02).
 
 **M80. Miara decyzyjna: nadwyżka majątku ΔW w PLN.** Dla okna od `a` do `T`, NAV satelity `V`, wpłat przez granicę `C_t`, wypłat `D_t` i indeksu total return progu `B` (w PLN):
@@ -1261,6 +1264,8 @@ Redukcje wg drabiny z §21.2. Wyjścia reżimowe i tezowe — jednorazowo, bez d
 
 **T38.** Próg istotności zmiany zlecenia stop: 0,25 × ATR22. [S] Przegląd po F6 (shadow mode).
 
+**Zapadka zlecenia a zmiana reguły stopu (rew. 4.20, B-80).** Zapadka tabeli M62 („nie (zapadka: zostaw poprzedni poziom)”) nie przechodzi przez zmianę reguły stopu: gdy poprzednia ocena była liczona inną regułą (`risk_daily.stop_rule` na dacie poprzedniej oceny różny od bieżącego; brak wartości liczy się jako inna reguła), a zmiana reguły na D jest poluzowaniem, decyzja brzmi „tak (zmiana reguły rew. <wersja>)”. Stan HIGH, „nowa pozycja” i próg T38 bez zmian. Po zmianie reguły zapadkę liczy się od pierwszej oceny nową regułą.
+
 ---
 
 # CZĘŚĆ VI — OPERACJE
@@ -1320,6 +1325,8 @@ Etap lokalny (do przeniesienia na VPS): przebieg główny uruchamia owner ręczn
 | 🔴 **EVENT** | STOP, TRAP, ROTACJA, **DATA FAILURE** | wymaga działania |
 | 🟡 **STATE CHANGE** | zmiana któregokolwiek z czterech stanów | informacyjny |
 | 🟢 **HEARTBEAT** | system żyje, pokrycie n/N, alertów 0 | tygodniowy |
+
+**Zmiany pozycji (rew. 4.20, B-74).** Sekcja raportu cyklu porównuje pozycje otwarte na dacie poprzedniej oceny (ta sama data co w M62) z pozycjami otwartymi na D, obie liczone punktowo na koniec dnia (§19, M77), po kluczu (rachunek, instrument, waluta rozliczenia). Rodzaje: nowa, zamknięta, zmiana ilości ↑/↓ (porównanie wartości bezwzględnej ilości, tylko kierunek, bez liczb). Pierwsza linia: „względem poprzedniej oceny (<data>)”; druga: „otwarte i zamknięte między ocenami: <tickery> | brak” dla pozycji, których okres posiadania mieści się w całości w (data poprzedniej oceny, D]. Brak poprzedniej oceny → „brak poprzedniej oceny”. Różnica stanu FIFO sprzed i po bieżącym przebiegu nie jest sekcją raportu.
 
 **M70. DATA FAILURE ma najwyższy priorytet.** „Spółka złamała regułę" i „API nie odpowiedziało" to dwie różne rzeczy, a druga jest groźniejsza, bo maskuje pierwszą.
 
