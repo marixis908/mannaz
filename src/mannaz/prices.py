@@ -1047,11 +1047,9 @@ def run_prices_fetch(
                         else:
                             result.filler_kept += 1
                             summary.filler_kept_total += 1
-                        # B-84: wypełniacz na korekcie ręcznej też liczy konflikt.
-                        if _is_manual_row(stored):
-                            conflict = _manual_conflict(symbol, row, stored)
-                            if conflict is not None:
-                                summary.manual_conflicts.append(conflict)
+                        # B-84: wypełniacz na korekcie ręcznej NIE daje konfliktu — wypełniacz
+                        # nie jest notowaniem (B-76); K4(ii) 2026-10-17: 37 fałszywych konfliktów
+                        # na 43 wierszach tradingview_manual_b76, dla których Yahoo nadal zwraca wypełniacz.
                     else:
                         _log_ingest_error(
                             cur,

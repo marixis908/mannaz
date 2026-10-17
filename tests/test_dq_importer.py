@@ -211,12 +211,23 @@ def test_k2b_notrade_row_with_provider_filler_not_written(monkeypatch):
     assert summary.manual_conflicts == []
 
 
-def test_k2b_notrade_row_with_provider_filler_different_close_conflict_counted(monkeypatch):
+def test_k2b_notrade_row_with_provider_filler_different_close_no_conflict(monkeypatch):
+    # wypelniacz nie jest notowaniem (B-76) -> bez konfliktu, bez zapisu
     stored = [_stored("7", "7", "7", "7", conv=NOTRADE, v="0")]
     summary, cur, errors = _run(monkeypatch, stored, [_row("7.5", "7.5", "7.5", "7.5", v="0")])
     assert cur.writes == []
     assert errors == []
-    assert len(summary.manual_conflicts) == 1
+    assert summary.manual_conflicts == []
+
+
+def test_k2b_b76_manual_row_with_provider_filler_no_conflict(monkeypatch):
+    # przypadek K4(ii): korekta TV (sesja z obrotem), Yahoo nadal zwraca wypelniacz z close poprzedniej sesji
+    stored = [_stored("149", "150", "145", "149.58", conv="tradingview_manual_b76", v="1189780")]
+    summary, cur, errors = _run(monkeypatch, stored, [_row("144", "144", "144", "144", v="0")])
+    assert cur.writes == []
+    assert errors == []
+    assert summary.manual_conflicts == []
+    assert summary.results[0].filler_kept == 1
 
 
 # --- B-77: wypelniacz vs zapisany wiersz ------------------------------------------
