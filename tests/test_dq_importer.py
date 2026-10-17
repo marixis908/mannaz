@@ -70,8 +70,11 @@ def _row(o, h, l, c, v="1000", day=D1):
     )
 
 
-def _stored(o, h, l, c, conv=YAHOO, v="1000", day=D1):
-    return (day, D(o) if o is not None else None, D(h), D(l), D(c), conv, D(v) if v is not None else None)
+def _stored(o, h, l, c, conv=YAHOO, v="1000", day=D1, raw=None):
+    # raw: (o, h, l, c) zapisane *_raw; domyslnie = split_adj (instrument bez zdarzen)
+    ohlc = tuple(D(x) if x is not None else None for x in (o, h, l, c))
+    raw_vals = ohlc if raw is None else tuple(D(x) if x is not None else None for x in raw)
+    return (day, *ohlc, conv, D(v) if v is not None else None, *raw_vals)
 
 
 def _run(monkeypatch, stored, fetched, split_events=()):
@@ -142,8 +145,32 @@ def test_k2a_other_convention_within_tolerance_update_without_revision(monkeypat
     assert _revisions(errors) == []
 
 
+def test_k2a_same_convention_new_split_event_updates_raw(monkeypatch):
+    # Codex R1 M1: kolejny split dopisany do corporate_events przy tej samej konwencji
+    # raw_reconstructed... -> zapisane raw (ze starym zestawem zdarzen) nieaktualne -> UPDATE raw
+    conv = "raw_reconstructed_from_corporate_events"
+    old_events = [(date(1989, 1, 1), D("2"))]  # przed sesja D1 -> raw = split_adj
+    new_events = old_events + [(D1 + timedelta(days=1), D("4"))]  # po sesji D1 -> raw x4
+    stored = [_stored("10", "11", "9", "10.5", conv=conv)]  # raw = split_adj (stary zestaw)
+    summary, cur, errors = _run(monkeypatch, stored, [_row("10", "11", "9", "10.5")], new_events)
+    assert len(cur.writes) == 1
+    assert _revisions(errors) == []
+    assert summary.results[0].rows_unchanged == 0
+    # kontrolka: ten sam zestaw zdarzen co przy zapisie -> bez UPDATE
+    summary, cur, errors = _run(monkeypatch, stored, [_row("10", "11", "9", "10.5")], old_events)
+    assert cur.writes == []
+    assert summary.results[0].rows_unchanged == 1
+
+
+def test_k2a_stored_null_raw_updates(monkeypatch):
+    stored = [_stored("10", "11", "9", "10.5", raw=("10", "11", "9", None))]
+    summary, cur, errors = _run(monkeypatch, stored, [_row("10", "11", "9", "10.5")])
+    assert len(cur.writes) == 1
+    assert _revisions(errors) == []
+
+
 def test_k2a_stored_null_column_update_without_revision(monkeypatch):
-    stored = [(D1, D("10"), D("11"), D("9"), None, YAHOO, D("1000"))]
+    stored = [(D1, D("10"), D("11"), D("9"), None, YAHOO, D("1000"), D("10"), D("11"), D("9"), None)]
     summary, cur, errors = _run(monkeypatch, stored, [_row("10", "11", "9", "10.5")])
     assert len(cur.writes) == 1
     assert _revisions(errors) == []
@@ -250,7 +277,7 @@ def test_b77_stored_filler_volume0_vs_provider_filler_is_identical(monkeypatch):
 
 
 def test_b77_stored_null_volume_vs_provider_filler_is_kept(monkeypatch):
-    stored = [(D1, D("7"), D("7"), D("7"), D("7"), YAHOO, None)]
+    stored = [(D1, D("7"), D("7"), D("7"), D("7"), YAHOO, None, D("7"), D("7"), D("7"), D("7"))]
     summary, cur, _ = _run(monkeypatch, stored, [_row("7", "7", "7", "7", v="0")])
     assert summary.results[0].filler_kept == 1
 

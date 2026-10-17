@@ -471,14 +471,29 @@ def _format_revision_detail(
     return "; ".join(parts) if parts else None
 
 
-def _row_unchanged(stored: dict[str, Decimal | None], row: "OhlcRow", adjustment_convention: str) -> bool:
+_RAW_COLUMNS = ("open_raw", "high_raw", "low_raw", "close_raw")
+
+
+def _row_unchanged(
+    stored: dict[str, Decimal | None],
+    row: "OhlcRow",
+    adjustment_convention: str,
+    events: list[tuple[date, Decimal]],
+) -> bool:
     """B-84: wiersz bez zmian = wszystkie 4 kolumny OHLC split_adj zapisane i nowe
-    nie-NULL, każda różnica w tolerancji ORAZ zapisana konwencja == wyliczona.
-    Wtedy importer nie robi UPDATE (konwencja, fetched_at, volume bez zmian)."""
+    nie-NULL, każda różnica w tolerancji, zapisana konwencja == wyliczona ORAZ
+    zapisane OHLC raw == rekonstrukcja z zapisanego split_adj i BIEŻĄCYCH zdarzeń
+    (Codex R1 M1: kolejny split dopisany do `corporate_events` nie zmienia nazwy
+    konwencji, a zmienia raw; porównanie dokładne — `reconstruct_raw` to iloczyn
+    Decimal, deterministyczny dla tego samego wejścia). Wtedy importer nie robi
+    UPDATE (konwencja, fetched_at, volume bez zmian)."""
     if stored.get("adjustment_convention") != adjustment_convention:
         return False
     for col in _REVISION_COLUMNS:
         if stored.get(col) is None or getattr(row, col) is None:
+            return False
+    for adj_col, raw_col in zip(_REVISION_COLUMNS, _RAW_COLUMNS):
+        if stored.get(raw_col) != reconstruct_raw(stored[adj_col], row.price_date, events):
             return False
     return _format_revision_detail(stored, row) is None
 
@@ -1002,7 +1017,8 @@ def run_prices_fetch(
                 cur.execute(
                     """
                     SELECT price_date, open_split_adj, high_split_adj, low_split_adj, close_split_adj,
-                           adjustment_convention, volume_split_adj
+                           adjustment_convention, volume_split_adj,
+                           open_raw, high_raw, low_raw, close_raw
                     FROM prices_daily
                     WHERE instrument_id = %s AND source = 'yahoo'
                       AND price_date BETWEEN %s AND %s
@@ -1013,7 +1029,7 @@ def run_prices_fetch(
                         max(r.price_date for r in valid_rows),
                     ),
                 )
-                for pd_, o_, h_, l_, c_, conv_, v_ in cur.fetchall():
+                for pd_, o_, h_, l_, c_, conv_, v_, ro_, rh_, rl_, rc_ in cur.fetchall():
                     stored_by_date[pd_] = {
                         "open_split_adj": o_,
                         "high_split_adj": h_,
@@ -1021,6 +1037,10 @@ def run_prices_fetch(
                         "close_split_adj": c_,
                         "adjustment_convention": conv_,
                         "volume_split_adj": v_,
+                        "open_raw": ro_,
+                        "high_raw": rh_,
+                        "low_raw": rl_,
+                        "close_raw": rc_,
                     }
 
             inserted = 0
@@ -1073,7 +1093,7 @@ def run_prices_fetch(
                     continue
                 if stored is not None:
                     revision_detail = _format_revision_detail(stored, row)
-                    if revision_detail is None and _row_unchanged(stored, row, adjustment_convention):
+                    if revision_detail is None and _row_unchanged(stored, row, adjustment_convention, events):
                         # B-84: w tolerancji i ta sama konwencja -> wiersz bez zmian
                         # (bez UPDATE: konwencja, fetched_at i volume zostają).
                         result.rows_unchanged += 1
