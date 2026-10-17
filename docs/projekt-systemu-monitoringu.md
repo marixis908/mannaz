@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.20 · 2026-10-16**
+**Rewizja 4.21 · 2026-10-17**
 
 ---
 
@@ -44,7 +44,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.17 | 2026-10-14 | T42 = 2026-09-30; M81 progi w `prices_daily` (instrument `is_benchmark`, cena = TR dla ETF akumulujących); M89 rejestr zdarzeń i naruszeń tylko do dopisywania (trigger), raport: nowe / zapisane / nieodtworzone; §8 dwie tabele i kolumna `is_benchmark` (decyzje ownera 2026-10-14, brief CC-B38B) |
 | 4.18 | 2026-10-15 | M85 doprecyzowanie: opłata za wymianę waluty (`oplata_wymiana_waluty`) w linii „opłaty” rachunku, spread przewalutowania w linii gotówki rachunku i waluty (B-63, brief CC-FX) |
 | 4.19 | 2026-10-16 | §19.1 M23, §19.3: Chandelier okresu posiadania (okno od sesji po wejściu, zapadka od max(e+1, RATCHET_START)), A8 kontekst trendu i flaga wejścia wbrew trendowi (w raporcie tylko nowe wejścia), adnotacja zmiany reguły i M69 „wyłącznie zmiana reguły”; §19.4: kotwica 2N kontraktów = zamknięcie bazy z sesji każdego lota (także zapadka 2N); §26: O-51 B2 odrzucony (brak notowań kontraktów); decyzja: owner 2026-10-16 (brief CC-CH2, pomiar CC-CH, recenzja Codexa, ocena zewnętrzna) |
-| **4.20** | **2026-10-16** | **M62: zapadka nie przechodzi przez zmianę reguły stopu, liczona od pierwszej oceny nową regułą (B-80); M69: sekcja „Zmiany pozycji” porównuje pozycje otwarte z poprzednią oceną (B-74); M78: cykl czyta kotwice `account_values` z `data\manual` (B-73); decyzja: owner 2026-10-16 (ocena cyklu 2026-10-15_1747, brief CC-B70)** |
+| 4.20 | 2026-10-16 | M62: zapadka nie przechodzi przez zmianę reguły stopu, liczona od pierwszej oceny nową regułą (B-80); M69: sekcja „Zmiany pozycji” porównuje pozycje otwarte z poprzednią oceną (B-74); M78: cykl czyta kotwice `account_values` z `data\manual` (B-73); decyzja: owner 2026-10-16 (ocena cyklu 2026-10-15_1747, brief CC-B70) |
+| **4.21** | **2026-10-17** | **T12: wiersz bez ceny z datą po D = informacja w HEARTBEAT (B-83); M67: tolerancja rewizji 1e-6 względnie, ochrona korekty ręcznej (`tradingview_manual_*`), podsekcja „Konflikty z korektą ręczną” (B-84); §9.6: brak obrotu potwierdzony w TradingView (`tradingview_manual_notrade`, B-78); decyzja: planista 2026-10-17 (brief CC-DQ)** |
 
 ### 0.3 Oznaczenia
 
@@ -249,7 +250,7 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 
 **T11.** Przed każdym pomiarem mogącym zwrócić zero — **kontrolka dodatnia na tym samym typie wejścia**. Zielona kontrolka na innych danych jest kontrolką wadliwą, nawet gdy świeci.
 
-**T12.** Cache dyskowy z TTL 12–24 h dla źródeł bez SLA. **Circuit breaker**: zero wierszy albo same NaN → nie zapisuj, zaloguj do `ingest_errors`; zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie, według T27.
+**T12.** Cache dyskowy z TTL 12–24 h dla źródeł bez SLA. **Circuit breaker**: zero wierszy albo same NaN → nie zapisuj, zaloguj do `ingest_errors`; zastępowanie ceną z poprzedniej sesji wyłącznie przy odczycie, według T27. Wiersz bez ceny z datą późniejszą niż D wybrane w przebiegu jest informacją w HEARTBEAT, nie DATA FAILURE; dla dat ≤ D bez zmian (K1).
 
 **T13.** Throttling: SEC ≤ 10 req/s (twardy, z nagłówkiem User-Agent zawierającym kontakt), yfinance ~1 req/s z jitterem (token bucket), NBP z chunkowaniem po 93 dni.
 
@@ -583,6 +584,7 @@ Pozostałe kanały:
 3. Split bez rekordu u dostawcy wykrywa detektor z ilorazu cena brokera / close Yahoo — etap cyklu przed FIFO z potwierdzeniem ownera (§19, akapit po M77).
 4. Ryzyko (stopy, ATR, Chandelier, cena zamknięcia na D) liczy się w warstwie `*_split_adj` (T6). Ilość i cenę wejścia z brokera przenosi się do tej warstwy czynnikiem ze zdarzeń w `corporate_events`. Brak zdarzenia przy cenach już skorygowanych przez Yahoo daje błąd rzędu ratio — dlatego detektor jest etapem cyklu, a nie kontrolą okazjonalną.
 5. Wartości historyczne zmieniają się między pobraniami także bez splitu — rewizje dostawcy (M67).
+6. Brak obrotu potwierdzony w TradingView zapisuje się jako `tradingview_manual_notrade`; detektor wypełniaczy pomija takie wiersze (B-78).
 
 ## 10. Wielowalutowość, FX i konwencje
 
@@ -1310,7 +1312,7 @@ Etap lokalny (do przeniesienia na VPS): przebieg główny uruchamia owner ręczn
 
 **M66.** Godzina 04:30 UTC omija zmierzoną anomalię obciążenia VPS o 06:00 UTC (§7.1). Przebieg sobotni o 07:00 UTC działa na domkniętym tygodniu wszystkich giełd.
 
-**M67.** Dane sesji D są **odświeżane w oknie D−5** przy każdym przebiegu, a rozbieżności logowane do `ingest_errors`. Dostawcy doprecyzowują sesje i nakładają korekty korporacyjne po fakcie. Rewizja dostawcy to zmiana zapisanej, kompletnej wartości `open/high/low/close_split_adj` przy ponownym pobraniu; porównanie dokładne. Importer zapisuje ją do `ingest_errors` (`error_type = provider_revision`, stara i nowa wartość) przed nadpisaniem. Raport cyklu pokazuje rewizje z przebiegu oraz zmianę `risk_daily` dla przeliczanego D wobec poprzedniego zapisu (stany ryzyka, suma `risk_pln`, heat). Rewizja nie zatrzymuje cyklu. Wolumen i warstwa total return są poza porównaniem (B-05).
+**M67.** Dane sesji D są **odświeżane w oknie D−5** przy każdym przebiegu, a rozbieżności logowane do `ingest_errors`. Dostawcy doprecyzowują sesje i nakładają korekty korporacyjne po fakcie. Rewizja dostawcy to zmiana zapisanej, kompletnej wartości `open/high/low/close_split_adj` przy ponownym pobraniu. Importer zapisuje ją do `ingest_errors` (`error_type = provider_revision`, stara i nowa wartość) przed nadpisaniem. Raport cyklu pokazuje rewizje z przebiegu oraz zmianę `risk_daily` dla przeliczanego D wobec poprzedniego zapisu (stany ryzyka, suma `risk_pln`, heat). Rewizja nie zatrzymuje cyklu. Wolumen i warstwa total return są poza porównaniem (B-05). Rewizją dostawcy jest zmiana O/H/L/C o więcej niż 1e-6 względnie; mniejsza różnica nie nadpisuje wiersza i nie jest zapisywana. Wiersz z korektą ręczną (`tradingview_manual_*`) nie jest nadpisywany przez importer; różnica zamknięcia ponad 0,5% trafia do podsekcji „Konflikty z korektą ręczną” jako informacja (K2).
 
 ### 23.3 Dead-man switch
 
