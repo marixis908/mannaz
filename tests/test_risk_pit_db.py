@@ -373,8 +373,13 @@ def test_u5_2026_09_24_regression_capital_and_risk_pct_unchanged(db_conn, monkey
         assert abs(summary.capital_satelite_positions_pln - ref_capital_positions) < Decimal("0.01")
         assert abs(summary.kontraktowy_account_value_pln - ref_kontraktowy) < Decimal("0.01")
         # suma Decimal (28 cyfr) w innej kolejnosci niz run_risk (kolejnosc
-        # wierszy risk_daily zmienia sie po przeliczeniu D) — roznica do 1e-27
-        assert abs(summary.total_risk_pct_satellite_capital - ref_total_risk_pct) < Decimal("1e-20")
+        # wierszy risk_daily zmienia sie po przeliczeniu D) — roznica do 1e-27.
+        # Prog 1e-12 (decyzja planisty 2026-10-17, brief CC-DQ): referencja = zapisany
+        # risk_daily 2026-09-24 liczony stara regula; N1 B-78 (2026-10-17) zamienil
+        # CPR.WA 2025-05-05..06-02 z 1,0049999952316284 (float32 Yahoo) na 1,005 (TV),
+        # roznica ryzyka 2,16e-16 = szum. risk_daily NIE przeliczany (przeliczenie
+        # biezacym kodem zapisaloby regule 4.19 i zlamalo zalozenie RULE_PREV testu).
+        assert abs(summary.total_risk_pct_satellite_capital - ref_total_risk_pct) < Decimal("1e-12")
 
         # Rew. 4.19: regula biezaca — kapital i wiersze bez zmian (stop nie wchodzi do kapitalu).
         summary_419 = run_risk(conn, as_of=d, commit=False)
