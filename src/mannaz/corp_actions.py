@@ -34,6 +34,9 @@ core ETF Xetra `.DE`); wszystko inne jest pomijane i zliczane jako
 from __future__ import annotations
 
 import re
+import time
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -42,6 +45,9 @@ from typing import Any, Literal
 
 import psycopg
 import yfinance as yf
+from yfinance.exceptions import YFException, YFRateLimitError
+
+from mannaz.prices import YAHOO_RETRYABLE_ERRORS, call_with_network_retry
 
 # ---------------------------------------------------------------------------
 # Progi detekcji (brief CC-P, poprawka P2.3/P2.5)
@@ -118,13 +124,25 @@ def fetch_close_series(
 ) -> dict[date, Decimal]:
     """Historia close (auto_adjust=False) dla symbolu, w oknie [start, end+bufor].
     B-71: wiersze z zamknięciem NaN/±inf/<=0 są pomijane (bez wyjątku); ich
-    daty trafiają do `skipped`, gdy podano listę."""
+    daty trafiają do `skipped`, gdy podano listę.
+    B-72: `raise_errors=True` (jak `prices.fetch_ohlc`; yfinance domyślnie połyka
+    wyjątki GET), żeby błąd sieci / limit zapytań dotarł do ponowienia w
+    `_collect_instrument`. YFRateLimitError propaguje, pozostałe YFException ->
+    pusta seria (jak dotąd: brak danych)."""
     ticker = yf.Ticker(symbol)
-    hist = ticker.history(
-        start=start.isoformat(),
-        end=(end + timedelta(days=7)).isoformat(),
-        auto_adjust=False,
-    )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            hist = ticker.history(
+                start=start.isoformat(),
+                end=(end + timedelta(days=7)).isoformat(),
+                auto_adjust=False,
+                raise_errors=True,
+            )
+    except YFRateLimitError:
+        raise
+    except YFException:
+        return {}
     out: dict[date, Decimal] = {}
     if hist is None or hist.empty:
         return out
@@ -471,10 +489,15 @@ def classify_against_existing(
     return "date_drift", min(matching)
 
 
-def collect_corp_action_candidates(conn: psycopg.Connection) -> CorpActionsSummary:
+def collect_corp_action_candidates(
+    conn: psycopg.Connection, sleep: Callable[[float], None] = time.sleep
+) -> CorpActionsSummary:
     """B-45: zbiera kandydatów z obu źródeł BEZ zapisu (tylko SELECT do bazy +
     sieć Yahoo). Kolejność: per instrument najpierw yfinance_splits, potem
-    price_ratio_detector."""
+    price_ratio_detector.
+    B-72: zapytania do Yahoo (splity, seria close) ponawiane raz po
+    `NETWORK_RETRY_SLEEP_SECONDS` przy błędzie sieci / limicie zapytań (`sleep`
+    wstrzykiwalne, jak B-49); druga porażka -> `instrument_errors` (DATA FAILURE)."""
     summary = CorpActionsSummary()
 
     with conn.cursor() as cur:
@@ -500,7 +523,7 @@ def collect_corp_action_candidates(conn: psycopg.Connection) -> CorpActionsSumma
             # instrumentu dołączany tylko w całości (bez połowy kandydatów).
             part = CorpActionsSummary()
             try:
-                _collect_instrument(cur, inst, symbol, currency, part)
+                _collect_instrument(cur, inst, symbol, currency, part, sleep)
             except Exception as exc:  # noqa: BLE001 — trafia do instrument_errors (DATA FAILURE w cyklu)
                 summary.instrument_errors.append(
                     InstrumentError(broker_ticker=inst["broker_ticker"], symbol=symbol, exc_type=type(exc).__name__)
@@ -512,7 +535,12 @@ def collect_corp_action_candidates(conn: psycopg.Connection) -> CorpActionsSumma
 
 
 def _collect_instrument(
-    cur: psycopg.Cursor, inst: dict[str, Any], symbol: str, currency: str, summary: CorpActionsSummary
+    cur: psycopg.Cursor,
+    inst: dict[str, Any],
+    symbol: str,
+    currency: str,
+    summary: CorpActionsSummary,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Kandydaci jednego instrumentu (oba źródła) do `summary`."""
     broker_ticker = inst["broker_ticker"]
@@ -527,7 +555,9 @@ def _collect_instrument(
     max_date = max(d for d, _ in txns)
 
     # --- Źródło 1: import bezpośredni z yfinance Ticker.splits ---
-    yf_splits_full = fetch_yfinance_splits(symbol)
+    yf_splits_full = call_with_network_retry(
+        lambda: fetch_yfinance_splits(symbol), sleep, YAHOO_RETRYABLE_ERRORS
+    )
     yf_splits_recent = [(d, r) for d, r in yf_splits_full if d >= YFINANCE_SPLITS_IMPORT_START]
     for d, ratio in yf_splits_recent:
         event_type = "split" if ratio >= 1 else "reverse_split"
@@ -553,7 +583,9 @@ def _collect_instrument(
 
     # --- Źródło 2: detektor z ilorazu ceny (kontrolka dodatnia/ujemna) ---
     skipped: list[date] = []
-    close_series = fetch_close_series(symbol, min_date, max_date, skipped)
+    close_series = call_with_network_retry(
+        lambda: fetch_close_series(symbol, min_date, max_date, skipped), sleep, YAHOO_RETRYABLE_ERRORS
+    )
     if skipped:
         summary.skipped_closes.append(SkippedCloses(broker_ticker=broker_ticker, symbol=symbol, dates=sorted(skipped)))
     if not close_series:
@@ -639,12 +671,14 @@ def apply_candidates(cur: psycopg.Cursor, candidates: list[DetectedEvent]) -> Co
     return result
 
 
-def run_corp_actions(conn: psycopg.Connection, *, dry_run: bool) -> CorpEventsClassification:
+def run_corp_actions(
+    conn: psycopg.Connection, *, dry_run: bool, sleep: Callable[[float], None] = time.sleep
+) -> CorpEventsClassification:
     """B-45: collect -> apply w `conn.transaction()`; dry_run -> Rollback
     (zero zapisu), inaczej commit (`run_p3 corp-actions`).
     B-71: błąd instrumentu przerywa zapis przed transakcją (z tickerem) —
     zapis nie może pominąć papieru po cichu."""
-    summary = collect_corp_action_candidates(conn)
+    summary = collect_corp_action_candidates(conn, sleep)
     if summary.instrument_errors:
         raise CorpActionsInstrumentError(summary.instrument_errors)
     with conn.transaction() as tx:
@@ -657,7 +691,9 @@ def run_corp_actions(conn: psycopg.Connection, *, dry_run: bool) -> CorpEventsCl
     return result
 
 
-def detect_new_corporate_events(conn: psycopg.Connection) -> CorpEventsClassification:
+def detect_new_corporate_events(
+    conn: psycopg.Connection, sleep: Callable[[float], None] = time.sleep
+) -> CorpEventsClassification:
     """B-29/B-45: etap cyklu tygodniowego PRZED FIFO — klasyfikuje kandydatów
     względem `corporate_events` bez ZAPISU (zapis dopiero po potwierdzeniu
     ownera: `python -m mannaz.run_p3 corp-actions`).
@@ -668,7 +704,7 @@ def detect_new_corporate_events(conn: psycopg.Connection) -> CorpEventsClassific
     zgodne z zapisanym zdarzeniem, inna data (informacja, bez bramki).
     Detektor sam pobiera dane z Yahoo (sieć).
     B-71: `skipped_closes` i `instrument_errors` przeniesione z kolektora."""
-    summary = collect_corp_action_candidates(conn)
+    summary = collect_corp_action_candidates(conn, sleep)
     result = CorpEventsClassification()
     with conn.transaction() as tx:
         with conn.cursor() as cur:

@@ -2847,10 +2847,16 @@ def compute_satellite(
         if not w["complete"]:
             reasons.append(f"okno {w['from']}..{w['to']} zawiera dzien niepelny")
     missing_summary: dict[str, int] = {}
+    # B-82: szczegoly brakow pozycji (ticker, data ISO, przyczyna) obok agregatu
+    # `missing_summary` (zgodnosc); KONTRAKTOWY zostaje tylko w agregacie.
+    missing_detail: list[tuple[str, str, str]] = []
     for d in axis:
         for tick, why in daily.navs[d].missing:
             k = f"{tick if tick == KONTRAKTOWY_GROUP else 'pozycja'}:{why}"
             missing_summary[k] = missing_summary.get(k, 0) + 1
+            if tick != KONTRAKTOWY_GROUP:
+                missing_detail.append((tick, d.isoformat(), why))
+    missing_detail.sort(key=lambda t: (t[1], t[0], t[2]))
     modelled = {inp.instruments[i].ticker for i in inp.model_curves}
     unpriced = [t for t in inp.no_price_tickers if t not in modelled]
     if unpriced:
@@ -2913,6 +2919,7 @@ def compute_satellite(
         "data_unverified_reasons": sorted(set(reasons)),
         "unknown_row_types": daily.unknown_row_types,
         "missing_summary": missing_summary,
+        "missing_detail": missing_detail,
         "no_price_tickers": inp.no_price_tickers,
         "warnings": inp.warnings,
         "p3_control": p3_control,

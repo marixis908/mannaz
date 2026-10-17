@@ -604,7 +604,9 @@ def test_b05_volume_only_change_is_not_a_revision(db_conn, test_instrument, monk
         again = _run_with_rows(conn, inst, monkeypatch, [changed])
         assert again.revisions_total == 0
         assert _revisions(conn, inst["id"]) == []
-        assert _stored(conn, inst["id"], D0)[4] == Decimal("2000")  # nadpisanie jak dzis
+        # B-84 (K2a): OHLC w tolerancji i ta sama konwencja -> brak UPDATE, volume zostaje
+        # (wczesniej: nadpisanie volume bez rewizji).
+        assert _stored(conn, inst["id"], D0)[4] == Decimal("1000")
     finally:
         conn.rollback()
 

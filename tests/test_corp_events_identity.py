@@ -180,7 +180,7 @@ def test_run_corp_actions_dry_run_writes_nothing(conn, monkeypatch):
     inst, t = _free_instrument(conn)
     s = CorpActionsSummary()
     s.candidates = [_cand(inst, t, date(1990, 8, 6), "4", "yfinance_splits", n=0)]
-    monkeypatch.setattr(corp_actions, "collect_corp_action_candidates", lambda c: s)
+    monkeypatch.setattr(corp_actions, "collect_corp_action_candidates", lambda c, sleep=None: s)  # B-72: parametr sleep
     before = _count(conn)
     res = run_corp_actions(conn, dry_run=True)
     assert len(res.saved) == 1  # zaklasyfikowane jako do zapisu

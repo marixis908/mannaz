@@ -242,7 +242,7 @@ def _stored(conn, inst_id, ticker, d, ratio="4", source="price_ratio_detector", 
 def _stub_collect(monkeypatch, candidates):
     s = CorpActionsSummary()
     s.candidates = list(candidates)
-    monkeypatch.setattr(corp_actions, "collect_corp_action_candidates", lambda c: s)
+    monkeypatch.setattr(corp_actions, "collect_corp_action_candidates", lambda c, sleep=None: s)  # B-72: parametr sleep
 
 
 @pytest.mark.db

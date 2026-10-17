@@ -7,7 +7,7 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 calendar
     python -m mannaz.run_p3 corp-actions
     python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
-    python -m mannaz.run_p3 prices-correct --file CSV [--dry-run] [--convention TEKST]
+    python -m mannaz.run_p3 prices-correct --file CSV [--dry-run] [--convention TEKST | --notrade]
     python -m mannaz.run_p3 satellite --from YYYY-MM-DD --to YYYY-MM-DD --out DIR [--account-values CSV] [--symbol-map CSV]
 
 Bez argumentów `--instrument-ids`/`--currencies`/`--start`/`--end`, `prices` i
@@ -459,10 +459,17 @@ def _read_correction_csv(path: Path) -> tuple[list[tuple], list[tuple[str, date 
 
 
 def cmd_prices_correct(args: argparse.Namespace) -> None:
-    """B-76 (N1): `prices-correct --file CSV [--dry-run] [--convention TEKST]`.
+    """B-76 (N1): `prices-correct --file CSV [--dry-run] [--convention TEKST | --notrade]`.
+    B-78: `--notrade` (na caly plik) = brak obrotu potwierdzony w TV: konwencja
+    `tradingview_manual_notrade`, wejscie O=H=L=C>0 i volume 0; laczone z
+    `--convention` konczy sie kodem 2 (bez dotykania bazy).
     Wydruk (R6): sha256 pliku, liczności, per symbol liczba i zakres dat, lista
     odrzuconych (symbol, data, powód), PASS/FAIL — bez wartości cen. Kod wyjścia
     != 0 przy odrzuconych."""
+    notrade = bool(getattr(args, "notrade", False))
+    if notrade and args.convention is not None:
+        print("prices-correct: --notrade wymusza konwencje tradingview_manual_notrade; nie laczyc z --convention")
+        sys.exit(2)
     path = Path(args.file)
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     rows, parse_bad = _read_correction_csv(path)
@@ -472,7 +479,8 @@ def cmd_prices_correct(args: argparse.Namespace) -> None:
         try:
             summary = apply_manual_corrections(
                 # wszystko albo nic: blad parsowania CSV wymusza walidacje bez zapisu
-                conn, rows, convention=args.convention, dry_run=bool(args.dry_run) or bool(parse_bad)
+                conn, rows, convention=args.convention, dry_run=bool(args.dry_run) or bool(parse_bad),
+                notrade=notrade,
             )
         except ManualCorrectionRejectedError as exc:
             summary = exc.summary
@@ -607,7 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_corr.add_argument("--file", required=True, help="CSV: yahoo_symbol,date,open,high,low,close,volume")
     p_corr.add_argument("--dry-run", action="store_true", help="walidacja bez zapisu (rollback)")
-    p_corr.add_argument("--convention", default="tradingview_manual_b76")
+    p_corr.add_argument("--convention", default=None, help="domyslnie tradingview_manual_b76")
+    p_corr.add_argument(
+        "--notrade", action="store_true",
+        help="B-78: brak obrotu potwierdzony w TV (O=H=L=C>0, volume 0), konwencja tradingview_manual_notrade",
+    )
     p_corr.set_defaults(func=cmd_prices_correct)
 
     p_cycle = sub.add_parser(

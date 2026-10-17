@@ -368,6 +368,21 @@ class SymbolPricesResult:
     filler_identical: int = 0  # zapisany wiersz identyczny na OHLC -> pominięty
     filler_kept: int = 0  # zapisany wiersz inny -> NIE nadpisany
     filler_missing: int = 0  # brak zapisanego wiersza -> niezapisany + wpis provider_filler
+    # B-84: wiersze bez zmian (OHLC w tolerancji, ta sama konwencja) -> bez UPDATE.
+    rows_unchanged: int = 0
+    # B-84: wiersze korekty ręcznej (tradingview_manual*) pominięte przez importer.
+    rows_manual_protected: int = 0
+
+
+# B-84: konflikt korekty ręcznej z close dostawcy (informacja, NIE DATA FAILURE).
+# delta_pct = (provider_close - stored_close) / stored_close * 100 (znak: kierunek dostawcy).
+@dataclass
+class ManualConflict:
+    yahoo_symbol: str
+    price_date: date
+    stored_close: Decimal
+    provider_close: Decimal
+    delta_pct: Decimal
 
 
 @dataclass
@@ -398,6 +413,8 @@ class PricesSummary:
     filler_kept_total: int = 0
     instruments_filler_kept: int = 0
     filler_missing_total: int = 0
+    # B-84: konflikty z korektą ręczną (close dostawcy vs zapisany > MANUAL_CONFLICT_REL).
+    manual_conflicts: list[ManualConflict] = field(default_factory=list)
 
 
 # B-76: wypełniacz dostawcy. Yahoo dla brakujących notowań zwraca O=H=L=C =
@@ -415,24 +432,79 @@ def is_provider_filler(open_: Any, high: Any, low: Any, close: Any, volume: Any)
 _REVISION_COLUMNS = ("open_split_adj", "high_split_adj", "low_split_adj", "close_split_adj")
 
 
-def _format_revision_detail(stored: dict[str, Decimal | None], row: "OhlcRow") -> str | None:
+# B-84: tolerancja rewizji — zmiana O/H/L/C split_adj o <= 1e-6 względnie
+# (|new-old|/|old|) to szum zmiennoprzecinkowy dostawcy, nie rewizja.
+REVISION_REL_TOLERANCE = Decimal("1e-6")
+# B-84: próg konfliktu korekty ręcznej z close dostawcy (względnie, 0,5%).
+MANUAL_CONFLICT_REL = Decimal("0.005")
+MANUAL_CONVENTION_PREFIX = "tradingview_manual"
+NOTRADE_CONVENTION = "tradingview_manual_notrade"  # B-78
+
+
+def _exceeds_tolerance(old: Decimal, new: Decimal, tolerance: Decimal) -> bool:
+    """B-84: |new-old| > tolerance * |old| (dla old = 0 każda różnica przekracza)."""
+    return abs(new - old) > tolerance * abs(old)
+
+
+def _format_revision_detail(
+    stored: dict[str, Decimal | None],
+    row: "OhlcRow",
+    tolerance: Decimal = REVISION_REL_TOLERANCE,
+) -> str | None:
     """B-05 (Y3): rewizja dostawcy = zmiana ZAPISANEJ, kompletnej (nie NULL)
     wartości którejkolwiek z kolumn OHLC split_adj przy ponownym pobraniu.
-    Porównanie dokładne (Decimal `!=`, bez kwantyzacji): kolumny NUMERIC w
-    `prices_daily` nie mają skali (sql/001_schema.sql), więc wartość z bazy
-    jest dokładnie tym Decimalem, który został zapisany; `Decimal('10.50') ==
-    Decimal('10.5')`, więc ponowny zapis identycznych wartości daje 0 rewizji.
+    B-84: zmiana liczy się, gdy przekracza `tolerance` względnie
+    (|new-old|/|old| > tolerance, domyślnie `REVISION_REL_TOLERANCE` = 1e-6);
+    `tolerance=0` daje porównanie dokładne. Decimal bez kwantyzacji: kolumny
+    NUMERIC w `prices_daily` nie mają skali (sql/001_schema.sql), więc wartość
+    z bazy jest dokładnie tym Decimalem, który został zapisany.
     Zwraca `detail` w stałym formacie `col=<kolumna> old=<x> new=<y>; ...`
-    (tylko kolumny zmienione) albo None, gdy rewizji nie ma."""
+    (tylko kolumny powyżej tolerancji) albo None, gdy rewizji nie ma."""
     parts: list[str] = []
     for col in _REVISION_COLUMNS:
         old = stored.get(col)
         new = getattr(row, col)
         if old is None or new is None:
             continue
-        if old != new:
+        if _exceeds_tolerance(old, new, tolerance):
             parts.append(f"col={col} old={old} new={new}")
     return "; ".join(parts) if parts else None
+
+
+def _row_unchanged(stored: dict[str, Decimal | None], row: "OhlcRow", adjustment_convention: str) -> bool:
+    """B-84: wiersz bez zmian = wszystkie 4 kolumny OHLC split_adj zapisane i nowe
+    nie-NULL, każda różnica w tolerancji ORAZ zapisana konwencja == wyliczona.
+    Wtedy importer nie robi UPDATE (konwencja, fetched_at, volume bez zmian)."""
+    if stored.get("adjustment_convention") != adjustment_convention:
+        return False
+    for col in _REVISION_COLUMNS:
+        if stored.get(col) is None or getattr(row, col) is None:
+            return False
+    return _format_revision_detail(stored, row) is None
+
+
+def _is_manual_row(stored: dict[str, Decimal | None] | None) -> bool:
+    """B-84: zapisany wiersz z korekty ręcznej (tradingview_manual*)."""
+    return stored is not None and str(stored.get("adjustment_convention") or "").startswith(
+        MANUAL_CONVENTION_PREFIX
+    )
+
+
+def _manual_conflict(symbol: str, row: "OhlcRow", stored: dict[str, Decimal | None]) -> ManualConflict | None:
+    """B-84: konflikt, gdy |close_dostawcy - close_zapisany| / |close_zapisany| > 0,5%."""
+    old = stored.get("close_split_adj")
+    new = row.close_split_adj
+    if old is None or new is None or old == 0:
+        return None
+    if not _exceeds_tolerance(old, new, MANUAL_CONFLICT_REL):
+        return None
+    return ManualConflict(
+        yahoo_symbol=symbol,
+        price_date=row.price_date,
+        stored_close=old,
+        provider_close=new,
+        delta_pct=(new - old) / abs(old) * 100,
+    )
 
 
 # B-48 (T46): świeca sesji niezamkniętej nie wchodzi do bazy.
@@ -777,7 +849,18 @@ def run_prices_fetch(
     `provider_revision`: (a) zapisany identyczny na OHLC -> pominięty po cichu;
     (b) zapisany inny -> zostaje bez zmian (`filler_kept`); (c) brak zapisanego
     -> niezapisany + wpis `ingest_errors` `provider_filler` (w cyklu to DATA
-    FAILURE). `rows_inserted` nie liczy pominiętych."""
+    FAILURE). `rows_inserted` nie liczy pominiętych.
+
+    B-77: zapisany wiersz + wypełniacz = "identyczny" (a) tylko gdy OHLC w
+    tolerancji I zapisany volume == volume wypełniacza (0); zapisany płaski wiersz
+    z volume > 0 to (b) `filler_kept`.
+
+    B-84: rewizja = zmiana O/H/L/C split_adj o > `REVISION_REL_TOLERANCE` względnie.
+    Zapisany wiersz kompletny, w tolerancji i z konwencją == wyliczona -> bez
+    UPDATE i bez `provider_revision` (`rows_unchanged`; konwencja, fetched_at,
+    volume bez zmian); konwencja inna -> UPDATE bez rewizji. Wiersz z konwencją
+    `tradingview_manual*` NIGDY nie jest nadpisywany; close dostawcy rozjechany
+    o > 0,5% = wpis w `PricesSummary.manual_conflicts` (informacja, nie DATA FAILURE)."""
     if end is None:
         end = date.today()
 
@@ -918,7 +1001,8 @@ def run_prices_fetch(
             if valid_rows:
                 cur.execute(
                     """
-                    SELECT price_date, open_split_adj, high_split_adj, low_split_adj, close_split_adj
+                    SELECT price_date, open_split_adj, high_split_adj, low_split_adj, close_split_adj,
+                           adjustment_convention, volume_split_adj
                     FROM prices_daily
                     WHERE instrument_id = %s AND source = 'yahoo'
                       AND price_date BETWEEN %s AND %s
@@ -929,12 +1013,14 @@ def run_prices_fetch(
                         max(r.price_date for r in valid_rows),
                     ),
                 )
-                for pd_, o_, h_, l_, c_ in cur.fetchall():
+                for pd_, o_, h_, l_, c_, conv_, v_ in cur.fetchall():
                     stored_by_date[pd_] = {
                         "open_split_adj": o_,
                         "high_split_adj": h_,
                         "low_split_adj": l_,
                         "close_split_adj": c_,
+                        "adjustment_convention": conv_,
+                        "volume_split_adj": v_,
                     }
 
             inserted = 0
@@ -950,11 +1036,22 @@ def run_prices_fetch(
                     row.volume_split_adj,
                 ):
                     if stored is not None:
-                        if _format_revision_detail(stored, row) is None:
+                        # B-77: "identyczny" tylko gdy OHLC w tolerancji I zapisany
+                        # volume == volume wypełniacza (0); zapisany płaski wiersz
+                        # z volume > 0 (albo NULL) to "zapisany inny".
+                        if (
+                            _format_revision_detail(stored, row) is None
+                            and stored.get("volume_split_adj") == row.volume_split_adj
+                        ):
                             result.filler_identical += 1
                         else:
                             result.filler_kept += 1
                             summary.filler_kept_total += 1
+                        # B-84: wypełniacz na korekcie ręcznej też liczy konflikt.
+                        if _is_manual_row(stored):
+                            conflict = _manual_conflict(symbol, row, stored)
+                            if conflict is not None:
+                                summary.manual_conflicts.append(conflict)
                     else:
                         _log_ingest_error(
                             cur,
@@ -968,8 +1065,21 @@ def run_prices_fetch(
                         result.filler_missing += 1
                         summary.filler_missing_total += 1
                     continue
+                if _is_manual_row(stored):
+                    # B-84: korekta ręczna nigdy nie jest nadpisywana przez importer
+                    # (ani UPDATE, ani provider_revision); rozjazd close > 0,5% = konflikt.
+                    result.rows_manual_protected += 1
+                    conflict = _manual_conflict(symbol, row, stored)
+                    if conflict is not None:
+                        summary.manual_conflicts.append(conflict)
+                    continue
                 if stored is not None:
                     revision_detail = _format_revision_detail(stored, row)
+                    if revision_detail is None and _row_unchanged(stored, row, adjustment_convention):
+                        # B-84: w tolerancji i ta sama konwencja -> wiersz bez zmian
+                        # (bez UPDATE: konwencja, fetched_at i volume zostają).
+                        result.rows_unchanged += 1
+                        continue
                     if revision_detail is not None:
                         _log_ingest_error(
                             cur,
@@ -1061,17 +1171,25 @@ def run_prices_fetch(
 
 def find_window_fillers(rows: Any, d: date, window: int = 22) -> list[tuple[str, str | None, date]]:
     """B-76: czysty detektor. `rows` = iterowalne krotki (symbol, exchange,
-    price_date, open, high, low, close, volume). Okno liczone PER GIEŁDA
+    price_date, open, high, low, close, volume[, adjustment_convention]).
+    B-78: wiersz z konwencją `tradingview_manual_notrade` (brak obrotu
+    potwierdzony w TV) NIE jest zgłaszany, ale jego data nadal liczy się jako
+    sesja okna. Okno liczone PER GIEŁDA
     (exchange None = osobna grupa): ostatnie `window` RÓŻNYCH `price_date` <= d
     wśród wierszy tej giełdy (sesja = data z ceną, jak w risk.py). Zwraca
     (symbol, exchange, price_date) wierszy-wypełniaczy w oknie swojej giełdy,
     posortowane (symbol, data). Wiersze z datą > d są ignorowane."""
     by_exchange: dict[str | None, list[tuple[str, date, bool]]] = {}
-    for symbol, exchange, price_date, open_, high, low, close, volume in rows:
+    for symbol, exchange, price_date, open_, high, low, close, volume, *rest in rows:
         if price_date > d:
             continue
+        convention = rest[0] if rest else None
         by_exchange.setdefault(exchange, []).append(
-            (symbol, price_date, is_provider_filler(open_, high, low, close, volume))
+            (
+                symbol,
+                price_date,
+                is_provider_filler(open_, high, low, close, volume) and convention != NOTRADE_CONVENTION,
+            )
         )
     found: list[tuple[str, str | None, date]] = []
     for exchange, items in by_exchange.items():
@@ -1092,7 +1210,7 @@ def detect_window_fillers(cur: psycopg.Cursor, d: date, window: int = 22) -> lis
         """
         SELECT COALESCE(i.yahoo_symbol, i.broker_ticker), i.exchange, p.price_date,
                p.open_split_adj, p.high_split_adj, p.low_split_adj, p.close_split_adj,
-               p.volume_split_adj
+               p.volume_split_adj, p.adjustment_convention
         FROM prices_daily p
         JOIN instruments i ON i.id = p.instrument_id
         WHERE p.price_date <= %s AND p.price_date >= %s
@@ -1130,9 +1248,10 @@ def apply_manual_corrections(
     conn: psycopg.Connection,
     rows: list[tuple[str, date, Any, Any, Any, Any, Any]],
     *,
-    convention: str = "tradingview_manual_b76",
+    convention: str | None = None,
     dry_run: bool = True,
     now: datetime | None = None,
+    notrade: bool = False,
 ) -> ManualCorrectionSummary:
     """B-76 (N1): ręczna korekta WYŁĄCZNIE wierszy-wypełniaczy (`prices_daily`,
     source='yahoo'). `rows` = (yahoo_symbol, price_date, open, high, low, close,
@@ -1142,7 +1261,23 @@ def apply_manual_corrections(
     symbol+data dwa razy w wejściu). Wszystko albo nic: jedna transakcja;
     commit tylko gdy nie `dry_run` i 0 odrzuconych; `dry_run` -> rollback
     zawsze (zwraca podsumowanie, nic nie zapisuje); przy >0 odrzuconych i
-    `dry_run=False` -> rollback + `ManualCorrectionRejectedError`."""
+    `dry_run=False` -> rollback + `ManualCorrectionRejectedError`.
+
+    `convention=None` -> `tradingview_manual_b76` (B-76). B-78 `notrade=True`:
+    brak obrotu potwierdzony w TV — konwencja wymuszona `tradingview_manual_notrade`
+    (inna jawna `convention` -> `ValueError`), wejście musi mieć O=H=L=C > 0 i
+    volume == 0 (inaczej "ohlc"), zapisany wiersz musi być wypełniaczem (jak w
+    B-76), zapis O/H/L/C wg wejścia i volume_split_adj 0, `ingest_errors`
+    `manual_correction` z prefiksem "B-78:". Detektor wypełniaczy takich wierszy
+    nie zgłasza, a importer ich nie nadpisuje (reguła B-84)."""
+    if notrade:
+        if convention is not None and convention != NOTRADE_CONVENTION:
+            raise ValueError(f"notrade wymusza konwencje {NOTRADE_CONVENTION}, podano {convention}")
+        convention = NOTRADE_CONVENTION
+        tag = "B-78"
+    else:
+        convention = convention or "tradingview_manual_b76"
+        tag = "B-76"
     run_started_at = now if now is not None else datetime.now(timezone.utc)
     summary = ManualCorrectionSummary(rows_input=len(rows))
     planned: list[tuple[int, str, date, tuple[Any, ...], tuple[Any, ...]]] = []
@@ -1179,9 +1314,10 @@ def apply_manual_corrections(
                 vals = (o_, h_, l_, c_, v_)
                 if (
                     any(x is None for x in vals)
-                    or any(x <= 0 for x in vals)
+                    or any(x <= 0 for x in (vals[:4] if notrade else vals))
                     or l_ > min(o_, c_)
                     or h_ < max(o_, c_)
+                    or (notrade and not (o_ == h_ == l_ == c_ and v_ == 0))
                 ):
                     summary.rejected.append((symbol, price_date, "ohlc"))
                     continue
@@ -1222,7 +1358,7 @@ def apply_manual_corrections(
                         price_date=price_date,
                         error_type="manual_correction",
                         detail=(
-                            "B-76: old O/H/L/C/V="
+                            f"{tag}: old O/H/L/C/V="
                             + "/".join(str(x) for x in stored)
                             + " new="
                             + "/".join(str(x) for x in (o_, h_, l_, c_, v_))

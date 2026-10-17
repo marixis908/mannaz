@@ -1259,6 +1259,12 @@ class ReportState:
     # pominięte przez detektor; elementy: corp_actions.SkippedCloses.
     corp_events_skipped_closes: list = field(default_factory=list)
     price_ingest_errors: list[str] = field(default_factory=list)
+    # B-83 (K1): te same wpisy strukturalnie (source, symbol, price_date, error_type,
+    # detail), równolegle do `price_ingest_errors` (tekst do renderu); po ustaleniu D
+    # `row_missing_price` z datą > D przechodzi do `rows_without_price_after_d`.
+    price_ingest_entries: list[tuple[str, str | None, date | None, str, str]] = field(default_factory=list)
+    # B-83: (symbol, price_date) wierszy bez ceny po D (T12) — HEARTBEAT, nie DATA FAILURE.
+    rows_without_price_after_d: list[tuple[str, date]] = field(default_factory=list)
     # B-76 (K1): świece-wypełniacze dostawcy (O=H=L=C, volume 0) w oknie 22
     # sesji do D: (symbol, exchange, price_date). Niepusta => DATA FAILURE.
     window_fillers: list[tuple[str, str | None, date]] = field(default_factory=list)
@@ -1318,6 +1324,10 @@ class ReportState:
     # B-76: informacja: wypełniacze dostawcy pominięte (zapisany wiersz inny).
     filler_kept_rows: int = 0
     filler_kept_instruments: int = 0
+    # B-84: informacja (NIE DATA FAILURE): wiersze korekty ręcznej (tradingview_manual*),
+    # których close dostawcy rozjechał się o > 0,5% z zapisanym; elementy:
+    # prices.ManualConflict. Importer ich nie nadpisuje.
+    manual_conflicts: list = field(default_factory=list)
     # B-48 (D2 rew. 3): świece ocenione regułą daty zamiast kalendarza.
     calendar_fallback_rows: int = 0
     calendar_fallback_instruments: int = 0
@@ -1470,6 +1480,14 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
     lines.append("")
     lines.append("### D niekompletne")
     note = stage_note(STAGE_RISK)
+    # B-82: braki ceny pozycji otwartej na dniach NAV satelity — ticker i data
+    # (informacja, NIE DATA FAILURE; etap satelity działa przed renderem).
+    sat_info: list[str] = []
+    if state.satellite is not None:
+        for tick, day, why in sorted(
+            state.satellite.report.get("missing_detail", []), key=lambda t: (t[1], t[0])
+        ):
+            sat_info.append(f"- informacja: NAV satelity {day}: {tick} · {why}")
     # B-70 (B70.2): pozycje niekompletne na D wymienione tickerem ZAWSZE — także gdy
     # `IncompleteRiskDateError` zatrzymał etap ryzyka (wcześniej notatka etapu je ukrywała).
     if state.date_incomplete_items or state.d_resolution_failure:
@@ -1481,8 +1499,9 @@ def _render_data_failure_section(state: ReportState) -> list[str]:
             )
     elif note:
         lines.append(note)
-    else:
+    elif not sat_info:
         lines.append("brak")
+    lines.extend(sat_info)
 
     lines.append("")
     lines.append("### Świeżość cen (T28)")
@@ -1693,6 +1712,22 @@ def _render_risk_section(state: ReportState) -> list[str]:
     return lines
 
 
+def _render_manual_conflicts(state: ReportState) -> list[str]:
+    """B-84: podsekcja informacyjna — korekta ręczna vs close dostawcy (> 0,5%)."""
+    lines = ["", "### Konflikty z korektą ręczną"]
+    if not state.manual_conflicts:
+        lines.append("brak")
+        return lines
+    lines.append("| ticker | data | zapisane | dostawca | delta |")
+    lines.append("|---|---|---|---|---|")
+    for c in sorted(state.manual_conflicts, key=lambda c: (c.yahoo_symbol, c.price_date)):
+        lines.append(
+            f"| {c.yahoo_symbol} | {_fmt_date(c.price_date)} | {c.stored_close} | {c.provider_close} | "
+            f"{format_pct(c.delta_pct.quantize(Decimal('0.01')))} |"
+        )
+    return lines
+
+
 def _render_provider_revisions_section(state: ReportState) -> list[str]:
     """B-05 (Y4): sekcja informacyjna (poza DATA FAILURE), po sekcji Ryzyko."""
     lines = ["## Rewizje cen dostawcy"]
@@ -1712,6 +1747,10 @@ def _render_provider_revisions_section(state: ReportState) -> list[str]:
     if not revs:
         lines.append("brak")
         lines.extend(filler_lines)
+        # Pusta sekcja zostaje samym "brak" (zgodność układu); podsekcja konfliktów
+        # pojawia się, gdy są konflikty.
+        if state.manual_conflicts:
+            lines.extend(_render_manual_conflicts(state))
         return lines
     dates = [r.price_date for r in revs if r.price_date is not None]
     n_inst = len({(r.instrument_id, r.ticker) for r in revs})
@@ -1746,6 +1785,7 @@ def _render_provider_revisions_section(state: ReportState) -> list[str]:
         else:
             lines.append("brak")
     lines.extend(filler_lines)
+    lines.extend(_render_manual_conflicts(state))
     return lines
 
 
@@ -1828,6 +1868,28 @@ def _call_capturing_provider_messages(state: ReportState, fn: Callable[..., Any]
         state.provider_messages.extend(cap.messages)
 
 
+def _format_ingest_error(source: str, symbol: str | None, price_date: date | None, error_type: str, detail: str) -> str:
+    return f"{source} {symbol or 'brak'} data={_fmt_date(price_date)} {error_type}: {detail}"
+
+
+def reclassify_rows_after_d(state: ReportState, d: date) -> None:
+    """B-83 (K1): po ustaleniu D wpisy `row_missing_price` z `price_date` > D (świece
+    sesji po D, bez ceny — T12) przechodzą z DATA FAILURE do HEARTBEAT. Wszystko
+    inne (inne `error_type`, `price_date` <= D, brak daty) zostaje DATA FAILURE.
+    Bez wywołania (D nieustalone / etap zatrzymany przed C6) wszystkie wpisy
+    zostają DATA FAILURE."""
+    keep: list[str] = []
+    moved: list[tuple[str, date]] = []
+    for entry in state.price_ingest_entries:
+        source, symbol, price_date, error_type, detail = entry
+        if error_type == "row_missing_price" and price_date is not None and price_date > d:
+            moved.append((symbol or "brak", price_date))
+        else:
+            keep.append(_format_ingest_error(*entry))
+    state.price_ingest_errors = keep
+    state.rows_without_price_after_d = moved
+
+
 def _render_heartbeat_section(state: ReportState) -> list[str]:
     lines = ["## 🟢 HEARTBEAT"]
     lines.append(f"- pokrycie ceną na D: {state.heartbeat_covered}/{state.heartbeat_total}")
@@ -1841,6 +1903,17 @@ def _render_heartbeat_section(state: ReportState) -> list[str]:
         f"(instrumentów: {state.calendar_fallback_instruments})"
     )
     lines.append(_provider_messages_line(state.provider_messages))
+    # B-83 (K1): wiersze bez ceny po D (T12), zgrupowane per data (liczba + tickery).
+    lines.append("- wiersze bez ceny po D (T12):")
+    if state.rows_without_price_after_d:
+        by_date: dict[date, list[str]] = {}
+        for sym, day in state.rows_without_price_after_d:
+            by_date.setdefault(day, []).append(sym)
+        for day in sorted(by_date):
+            syms = sorted(by_date[day])
+            lines.append(f"  - {_fmt_date(day)}: {len(syms)} ({', '.join(syms)})")
+    else:
+        lines.append("  - brak")
     lines.append("- pliki przetworzone:")
     if state.files_processed:
         for f in state.files_processed:
@@ -2462,6 +2535,7 @@ def run_cycle(
                 state.unclosed_session_instruments = prices_summary.instruments_unclosed_session
                 state.filler_kept_rows = prices_summary.filler_kept_total
                 state.filler_kept_instruments = prices_summary.instruments_filler_kept
+                state.manual_conflicts = list(prices_summary.manual_conflicts)
                 state.calendar_fallback_rows = prices_summary.rows_calendar_fallback_total
                 state.calendar_fallback_instruments = prices_summary.instruments_calendar_fallback
         except Exception as exc:  # noqa: BLE001 — zamiana na DATA FAILURE (brief C5/C8)
@@ -2490,8 +2564,9 @@ def run_cycle(
                 (run_started_at,),
             )
             for source, symbol, price_date, error_type, detail in cur.fetchall():
+                state.price_ingest_entries.append((source, symbol, price_date, error_type, detail))
                 state.price_ingest_errors.append(
-                    f"{source} {symbol or 'brak'} data={_fmt_date(price_date)} {error_type}: {detail}"
+                    _format_ingest_error(source, symbol, price_date, error_type, detail)
                 )
             # B-05: rewizja dostawcy NIE jest DATA FAILURE (wykluczona wyżej) —
             # trafia do osobnej sekcji informacyjnej raportu.
@@ -2524,6 +2599,8 @@ def run_cycle(
             state.stage_not_executed.add(STAGE_RISK)
             raise _StageStop()
         state.d = d
+        # B-83 (K1): row_missing_price z datą > D -> HEARTBEAT (reszta zostaje DATA FAILURE).
+        reclassify_rows_after_d(state, d)
 
         # B-76 (K1): wypełniacze dostawcy w oknie 22 sesji do D — DATA FAILURE,
         # bez zatrzymania cyklu.
