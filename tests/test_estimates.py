@@ -92,6 +92,9 @@ def test_e16_broken_yfinance_config_returns_error(monkeypatch):
     assert calls == [] and fr.body is None and fr.http_status is None
     assert "RuntimeError" in fr.error and "zepsuta konfiguracja" in fr.error
     assert fr.source_symbol == "SYN" and fr.fetched_at_utc == NOW
+    assert fr.library_version == "1.7.0"  # wersja odczytana przed bledem locale
+    assert fr.query_params == {}
+    assert fr.url == ""
 
 
 def test_e16_naive_now_utc_returns_error():

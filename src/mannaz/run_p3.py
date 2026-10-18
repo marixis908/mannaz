@@ -8,6 +8,7 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 corp-actions
     python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
     python -m mannaz.run_p3 prices-correct --file CSV [--dry-run] [--convention TEKST | --notrade]
+    python -m mannaz.run_p3 estimates [--instrument-ids ID [ID ...]] [--archive-root DIR]
     python -m mannaz.run_p3 satellite --from YYYY-MM-DD --to YYYY-MM-DD --out DIR [--account-values CSV] [--symbol-map CSV]
 
 Bez argumentów `--instrument-ids`/`--currencies`/`--start`/`--end`, `prices` i
@@ -47,7 +48,12 @@ from mannaz.cycle import (
     run_cycle,
     safe_print,
 )
-from mannaz.db import get_connection
+from mannaz.db import DEFAULT_ENV_PATH, get_connection
+from mannaz.estimates import (
+    missing_universe_ids,
+    run_estimates,
+    select_estimates_universe,
+)
 from mannaz.fx import DEFAULT_START as FX_DEFAULT_START
 from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
 from mannaz.instruments_map import run_instrument_mapping, run_instrument_mapping_from_file
@@ -505,6 +511,63 @@ def cmd_prices_correct(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _ascii(value) -> str:
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def cmd_estimates(args: argparse.Namespace) -> None:
+    """FPE-RUN: pobranie konsensusu Yahoo dla uniwersum (equity, nie core, nie
+    benchmark, pozycja otwarta) albo dla `--instrument-ids`. Kod wyjscia: 0 bez
+    bledow; 1 gdy jakikolwiek blad/429/pominiety; 2 puste uniwersum lub blad
+    bazy. Wydruk: wylacznie licznosci i statusy (bez ilosci/kosztow/kwot)."""
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="replace")
+    conn = None
+    try:
+        try:
+            conn = get_connection()
+            with conn.cursor() as cur:
+                universe = select_estimates_universe(cur, args.instrument_ids)
+            conn.rollback()
+        except Exception as exc:
+            print(f"FPE-RUN: blad bazy ({type(exc).__name__})")
+            sys.exit(2)
+        missing = missing_universe_ids(args.instrument_ids, universe) if args.instrument_ids else []
+        for missing_id in missing:
+            print(f"pominiete id={missing_id}: brak yahoo_symbol lub instrumentu")
+        if not universe:
+            print("FPE-RUN: puste uniwersum - brak pobran")
+            sys.exit(2)
+        summary = run_estimates(conn, universe, archive_root=args.archive_root)
+    finally:
+        if conn is not None:
+            conn.close()
+    sep = " \u00b7 "
+    print(
+        "FPE-RUN: "
+        + sep.join([
+            f"symbole {summary.symbols}", f"snapshoty {summary.snapshots}",
+            f"w bazie {summary.in_db}", f"tylko archiwum {summary.archive_only}",
+            f"bledy {summary.errors}", f"429 {summary.rate_limited}",
+            f"pominiete {summary.skipped + len(missing)}",
+        ])
+    )
+    for res in summary.results:
+        print(
+            _ascii(
+                f"  id={res.instrument_id} symbol={res.symbol} http_status={res.http_status} "
+                f"parse_status={res.parse_status} wiersze={res.rows} status={res.status}"
+            )
+        )
+    # R3: blad bazy (tez przy zapisie symbolu) = 2 i ma pierwszenstwo; pominiete id = 1.
+    if any(res.error is not None and res.error.startswith("baza:") for res in summary.results):
+        sys.exit(2)
+    if summary.errors or summary.rate_limited or summary.skipped or missing:
+        sys.exit(1)
+    sys.exit(0)
+
+
 def cmd_cycle(args: argparse.Namespace) -> None:
     conn = get_connection()
     try:
@@ -621,6 +684,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="B-78: brak obrotu potwierdzony w TV (O=H=L=C>0, volume 0), konwencja tradingview_manual_notrade",
     )
     p_corr.set_defaults(func=cmd_prices_correct)
+
+    # allow_abbrev=False: wrapper rozpoznaje tylko pelne --archive-root (recenzja Codex V3 r2).
+    p_est = sub.add_parser(
+        "estimates", help="FPE-RUN - pobranie konsensusu Yahoo (archiwum + estimate_snapshots/estimates)",
+        allow_abbrev=False,
+    )
+    p_est.add_argument(
+        "--instrument-ids", type=int, nargs="+", default=None,
+        help="podzbior zamiast uniwersum (equity, nie core, nie benchmark, pozycja otwarta)",
+    )
+    p_est.add_argument(
+        "--archive-root", type=Path,
+        default=Path(DEFAULT_ENV_PATH).parent / "data" / "estimates" / "raw",
+        help="katalog archiwum bajtow (domyslnie <repo>/data/estimates/raw)",
+    )
+    p_est.set_defaults(func=cmd_estimates)
 
     p_cycle = sub.add_parser(
         "cycle", help="C2-C7 — cykl tygodniowy: import -> FIFO -> bramka rejestracji -> ceny/FX -> ryzyko -> raport"

@@ -12,9 +12,12 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import time
 
 import yfinance
 from yfinance.exceptions import YFRateLimitError
+
+from mannaz.provenance import code_sha
 
 PINNED_VERSION = "1.7.0"
 SOURCE = "yahoo_quotesummary"
@@ -209,7 +212,11 @@ def _metric(data):
 
 
 def parse_quote_summary(body: bytes) -> ParsedSnapshot:
-    """Odczyt per okres i metryka; braki nigdy nie sa zastepowane zerem."""
+    """Odczyt per okres i metryka; braki nigdy nie sa zastepowane zerem.
+
+    [Z] revenueEstimate.revenueCurrency istnieje na bajtach (24/24 okresy, raport C2:
+    tmp/fpe-importer/raport-c2.md).
+    """
     try:
         doc = json.loads(body)
     except (ValueError, UnicodeError, TypeError) as exc:
@@ -303,3 +310,169 @@ def insert_snapshot(cur, instrument_id, entry: ArchiveEntry, parsed: ParsedSnaps
         cur.execute(f"INSERT INTO estimates (snapshot_id, {columns}) VALUES ({placeholders})",
                     (snapshot_id, *fields.values()))
     return InsertSummary(snapshot_id, len(parsed.rows))
+
+
+# ---------------------------------------------------------------------------
+# FPE-RUN: wybor uniwersum i przebieg (brief CC-P, R1/R2). Bez ilosci, kosztow
+# i kwot pozycji - tylko licznosci, statusy i sciezki archiwum.
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_PREFIX = "YFRateLimitError"
+SKIPPED_AFTER_429 = "pominiete po serii 429"
+# Decyzja planisty 2026-10-18, pkt 1: blad odczytu odpowiedzi (wczesne powroty
+# parse_quote_summary: JSON, format, quoteSummary/finance.error, brak lub zly result)
+# liczy sie do bledow. Stany danych (M93, brak/bledna data okresu, brak okresow
+# konsensusu, statusy walut) nie sa bledem przebiegu.
+READ_ERROR_PREFIXES = (
+    "bledny JSON", "nieprawidlowy format", "quoteSummary.error", "finance.error",
+    "brak wyniku dostawcy", "niejednoznaczny result",
+)
+
+
+def select_estimates_universe(cur, instrument_ids=None) -> list[tuple[int, str]]:
+    """R1: lista (id, yahoo_symbol) posortowana po id.
+
+    Bez instrument_ids: equity z yahoo_symbol, nie core, nie benchmark, z pozycja
+    otwarta (EXISTS w positions_fifo - ta sama semantyka co prices._mapped_instruments;
+    positions_fifo trzyma wylacznie pozycje otwarte). Z instrument_ids: tylko
+    wskazane, z yahoo_symbol IS NOT NULL; brakujace wskazuje missing_universe_ids.
+    """
+    if instrument_ids:
+        cur.execute(
+            "SELECT id, yahoo_symbol FROM instruments "
+            "WHERE id = ANY(%s) AND yahoo_symbol IS NOT NULL ORDER BY id",
+            (list(instrument_ids),),
+        )
+    else:
+        cur.execute(
+            "SELECT i.id, i.yahoo_symbol FROM instruments i "
+            "WHERE i.instrument_type = 'equity' AND i.yahoo_symbol IS NOT NULL "
+            "AND NOT i.is_core AND NOT i.is_benchmark "
+            "AND EXISTS (SELECT 1 FROM positions_fifo p WHERE p.instrument_id = i.id) "
+            "ORDER BY i.id"
+        )
+    return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def missing_universe_ids(instrument_ids, universe) -> list[int]:
+    """Wskazane id, ktorych nie ma w uniwersum (brak yahoo_symbol albo instrumentu)."""
+    present = {item[0] for item in universe}
+    return sorted({int(i) for i in (instrument_ids or ())} - present)
+
+
+@dataclass(frozen=True)
+class SymbolResult:
+    instrument_id: int
+    symbol: str
+    http_status: int | None = None
+    parse_status: str | None = None
+    rows: int = 0
+    status: str = "ok"  # ok | blad | 429 | pominiete po serii 429
+    error: str | None = None
+    raw_ref: str | None = None
+    meta_ref: str | None = None
+    in_db: bool = False
+    archived: bool = False
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """Wynik przebiegu: wylacznie licznosci, statusy i sciezki archiwum.
+
+    Decyzja o 'bledy': kazdy fr.error inny niz 429 (w tym HTTP 404 i inny status
+    != 200), blad archiwizacji albo blad bazy dla symbolu liczy sie do 'errors',
+    wiec nawet sam 404 daje kod wyjscia 1. Blad odczytu odpowiedzi HTTP 200
+    (READ_ERROR_PREFIXES) tez jest bledem; stany danych nie. Symbol z 429 liczy sie do 'rate_limited'
+    (i do bledow tylko gdy dodatkowo zawiodla archiwizacja albo baza).
+    'snapshots' = symbole zarchiwizowane bez bledu archiwizacji (w tym 404 i 429,
+    zgodnie z S1); 'in_db' = z wierszem w estimate_snapshots (po commit);
+    'archive_only' = zarchiwizowane, bez wiersza w bazie; 'skipped' = pominiete po
+    serii 429.
+    """
+    symbols: int
+    snapshots: int
+    in_db: int
+    archive_only: int
+    errors: int
+    rate_limited: int
+    skipped: int
+    archive_root: str
+    results: tuple = ()
+
+
+def run_estimates(conn, universe, *, archive_root, http_get=None, sleep=time.sleep,
+                  pause_s=1.5, max_consecutive_429=3) -> RunSummary:
+    """R2: pobierz -> zarchiwizuj -> sparsuj -> wpisz -> commit, per symbol."""
+    root = Path(archive_root)
+    sha = code_sha()
+    results: list[SymbolResult] = []
+    consecutive = 0
+    fetched_any = False
+    stopped = False
+    for instrument_id, symbol in universe:
+        if stopped:
+            results.append(SymbolResult(instrument_id, symbol, status=SKIPPED_AFTER_429))
+            continue
+        if fetched_any:
+            sleep(pause_s)
+        fetched_any = True
+        fr = fetch_quote_summary(symbol, http_get=http_get)
+        is_429 = fr.error is not None and fr.error.startswith(RATE_LIMIT_PREFIX)
+        consecutive = consecutive + 1 if is_429 else 0
+        entry = None
+        parsed = ParsedSnapshot(status=None)
+        error = None
+        in_db = False
+        rows = 0
+        try:
+            entry = archive_snapshot(root, fr)
+            if fr.body is not None:
+                parsed = parse_quote_summary(fr.body)
+            if entry.error is not None:
+                conn.rollback()
+                error = f"archiwizacja: {entry.error}"
+            else:
+                summary = _insert_commit(conn, instrument_id, entry, parsed, sha)
+                in_db = summary.snapshot_id is not None
+                rows = summary.inserted_rows
+        except Exception as exc:  # blad jednego symbolu nie cofa poprzednich
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            in_db, rows = False, 0
+            error = f"baza: {type(exc).__name__}"
+        archived = entry is not None and entry.error is None
+        if error is None and fr.error is not None and not is_429:
+            error = fr.error
+        if (error is None and fr.error is None and parsed.status is not None
+                and parsed.status.startswith(READ_ERROR_PREFIXES)):
+            error = f"odczyt: {parsed.status}"
+        status = "429" if is_429 else ("blad" if error is not None else "ok")
+        results.append(SymbolResult(
+            instrument_id, symbol, fr.http_status, parsed.status, rows, status, error,
+            entry.raw_ref if entry else None, entry.meta_ref if entry else None,
+            in_db, archived,
+        ))
+        if consecutive >= max_consecutive_429:
+            stopped = True
+    snapshots = sum(1 for r in results if r.archived)
+    in_db_count = sum(1 for r in results if r.in_db)
+    return RunSummary(
+        symbols=len(results),
+        snapshots=snapshots,
+        in_db=in_db_count,
+        archive_only=snapshots - in_db_count,
+        errors=sum(1 for r in results if r.error is not None),
+        rate_limited=sum(1 for r in results if r.status == "429"),
+        skipped=sum(1 for r in results if r.status == SKIPPED_AFTER_429),
+        archive_root=str(root),
+        results=tuple(results),
+    )
+
+
+def _insert_commit(conn, instrument_id, entry, parsed, sha):
+    with conn.cursor() as cur:
+        summary = insert_snapshot(cur, instrument_id, entry, parsed, sha)
+    conn.commit()
+    return summary
