@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.21 · 2026-10-17**
+**Rewizja 4.22 · 2026-10-18**
 
 ---
 
@@ -45,7 +45,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.18 | 2026-10-15 | M85 doprecyzowanie: opłata za wymianę waluty (`oplata_wymiana_waluty`) w linii „opłaty” rachunku, spread przewalutowania w linii gotówki rachunku i waluty (B-63, brief CC-FX) |
 | 4.19 | 2026-10-16 | §19.1 M23, §19.3: Chandelier okresu posiadania (okno od sesji po wejściu, zapadka od max(e+1, RATCHET_START)), A8 kontekst trendu i flaga wejścia wbrew trendowi (w raporcie tylko nowe wejścia), adnotacja zmiany reguły i M69 „wyłącznie zmiana reguły”; §19.4: kotwica 2N kontraktów = zamknięcie bazy z sesji każdego lota (także zapadka 2N); §26: O-51 B2 odrzucony (brak notowań kontraktów); decyzja: owner 2026-10-16 (brief CC-CH2, pomiar CC-CH, recenzja Codexa, ocena zewnętrzna) |
 | 4.20 | 2026-10-16 | M62: zapadka nie przechodzi przez zmianę reguły stopu, liczona od pierwszej oceny nową regułą (B-80); M69: sekcja „Zmiany pozycji” porównuje pozycje otwarte z poprzednią oceną (B-74); M78: cykl czyta kotwice `account_values` z `data\manual` (B-73); decyzja: owner 2026-10-16 (ocena cyklu 2026-10-15_1747, brief CC-B70) |
-| **4.21** | **2026-10-17** | **T12: wiersz bez ceny z datą po D = informacja w HEARTBEAT (B-83); M67: tolerancja rewizji 1e-6 względnie, ochrona korekty ręcznej (`tradingview_manual_*`), podsekcja „Konflikty z korektą ręczną” (B-84); §9.6: brak obrotu potwierdzony w TradingView (`tradingview_manual_notrade`, B-78); decyzja: planista 2026-10-17 (brief CC-DQ)** |
+| 4.21 | 2026-10-17 | T12: wiersz bez ceny z datą po D = informacja w HEARTBEAT (B-83); M67: tolerancja rewizji 1e-6 względnie, ochrona korekty ręcznej (`tradingview_manual_*`), podsekcja „Konflikty z korektą ręczną” (B-84); §9.6: brak obrotu potwierdzony w TradingView (`tradingview_manual_notrade`, B-78); decyzja: planista 2026-10-17 (brief CC-DQ) |
+| **4.22** | **2026-10-18** | **§16.5 mnożniki z konsensusu: P/E NTM — przybliżenie z konsensusu rocznego (M90), rewizja dla stałego okresu (M91), agregat E/P części akcyjnej (M92), pokrycie konsensusu (M93), kwalifikacja mnożnika do RVS i jawna zmiana mnożnika (M94) — zmiany merytoryczne; T47 progi dopasowania okresu i flag, T48 kontrakt archiwum konsensusu; §8.2 `estimate_snapshots` i `estimates` per okres; M28 i O-13 doprecyzowane (konsensus jako wejście mnożników relatywnych i bramek, zakaz alertów dotyczy reverse DCF) — zmiana redakcyjna bez zmiany intencji; M15, M40 odwołanie do M91; P-13–P-17; O-52, O-53; decyzja: owner 2026-10-18 (pilotaż `docs/pomiary/forward-pe-pilot-r1.md`, brief CC-R422)** |
 
 ### 0.3 Oznaczenia
 
@@ -177,7 +178,7 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 
 **M14.** Sygnał wymaga **histerezy**: próg wejścia i wyjścia są różne (−0,25 wejście, −0,10 wyjście). Bez tego sygnał oscylujący wokół jednego progu generuje alert w każdym przebiegu.
 
-**M15.** **Bramka jakości jest specyficzna dla archetypu.** Jedna uniwersalna bramka („rewizje NTM ≥ 0 ∧ marża brutto nie spada ∧ runway > 8 kwartałów") jest bramką SaaS-ową i zastosowana do banku, kopalni bitcoinów czy spółki farmaceutycznej popełnia ten sam błąd kategorii, który M4 zarzuca mnożnikom.
+**M15.** **Bramka jakości jest specyficzna dla archetypu.** Jedna uniwersalna bramka („rewizje NTM ≥ 0 ∧ marża brutto nie spada ∧ runway > 8 kwartałów") jest bramką SaaS-ową i zastosowana do banku, kopalni bitcoinów czy spółki farmaceutycznej popełnia ten sam błąd kategorii, który M4 zarzuca mnożnikom. Rewizje w bramkach rozumiane są zgodnie z M91 (rew. 4.22).
 
 **M16.** Bramka ma **logikę trójwartościową**: PASS / FAIL / **UNKNOWN**. Zlanie UNKNOWN z FAIL daje spam pułapkowy; zlanie z PASS każe kupować pułapki. Obie ścieżki wyglądają wiarygodnie i żadna nie rzuca wyjątku.
 
@@ -209,7 +210,7 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 
 ### 3.5 O wycenie absolutnej
 
-**M28.** Reverse DCF **nie generuje alertów**. Uzasadnienie empiryczne: implied cost of capital oparte na modelu statystycznym predykuje przekrojowe zwroty (spread decylowy 10,62–12,03%, t = 3,77–5,39), ale oparte **na prognozach analityków — nie predykuje** (3,91–4,86%, wszystkie t < 1,40). Konsensus w tym systemie pochodzi z yfinance z flagą jakości `low`, czyli z gorszej gałęzi.
+**M28.** Reverse DCF **nie generuje alertów** i pozostaje narzędziem opisowym. Uzasadnienie empiryczne: implied cost of capital oparte na modelu statystycznym predykuje przekrojowe zwroty (spread decylowy 10,62–12,03%, t = 3,77–5,39), ale oparte **na prognozach analityków — nie predykuje** (3,91–4,86%, wszystkie t < 1,40). Konsensus w tym systemie pochodzi z yfinance z flagą jakości `low`, czyli z gorszej gałęzi. Konsensus może stanowić wejście do mnożników relatywnych RVS (§16.1), archetypowych bramek QUALITY (§14, M15) i porównania rewizji w sygnale ROTACJA (M40), pod warunkiem zgodności danych z regułami metody (M90–M94). Flaga jakości `low` jest przenoszona do `states.data_quality`; nie zastępuje weryfikacji porównywalności ani obsługi UNKNOWN.
 
 **M29.** Wartość rezydualna w reverse DCF to **perpetuity bez wzrostu** (`NOPAT/WACC`). Exit multiple jest cyrkularny — mnożnik wyjścia bierze się od peerów, a pytanie brzmi, czy cena jest wymagająca; przy przewartościowanym sektorze model nigdy nie powie „drogo".
 
@@ -257,6 +258,10 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 **T14.** Korekta splitów dla danych fundamentalnych **as reported** żyje w jednej funkcji, wołanej w jednym miejscu. Mnożnik przed i po splicie bez tej korekty to dwa różne byty.
 
 **T46.** Świeca dzienna trafia do `prices_daily` dopiero po zamknięciu sesji jej giełdy: `teraz_UTC ≥ zamknięcie_sesji_UTC + 30 min` według kalendarza `exchange_calendars` giełdy instrumentu [S]. Instrument bez przypisanego kalendarza: zapisywane są wyłącznie sesje o dacie wcześniejszej niż bieżąca data UTC. Ta sama reguła daty obowiązuje, gdy kalendarza nie da się zastosować (nieznany kod, data poza zakresem kalendarza, data niebędąca sesją), z osobnym licznikiem w podsumowaniu przebiegu. Świeca sesji niezamkniętej nie jest błędem danych: nie trafia do `ingest_errors`, liczy się w podsumowaniu przebiegu. *Uzasadnienie: zmierzone 2026-10-05 — przebieg w godzinach sesji zapisał śródsesyjne ceny XAMS/XETR/XWAR, a następny przebieg zgłosił je jako 12 rewizji dostawcy; przebieg wieczorny dałby kompletne D na niezamkniętych świecach US.*
+
+**T47.** Progi operacyjne do kalibracji (M90–M93): dopasowanie okresu — zgodny typ okresu (roczny), rok obrotowy i data końca w tolerancji ±7 dni (lata 52/53-tygodniowe; [Z] pilotaż r1: MU, dostawca podaje koniec miesiąca); rozbieżność źródeł — `|kontrola − główne| / |główne| > 10%`, a przy `|główne| < 0,05` lub zmianie znaku status „baza bliska zeru / zmiana znaku” bez procentu; flaga „wysoki mnożnik / niska rentowność E/P” przy `P/E_NTM > 100`; iloraz EPS skorygowany / GAAP tylko przy GAAP > 0 i GAAP ≥ 0,1·|EPS skorygowany|, zawsze z obiema wartościami i różnicą; brak daty aktualizacji konsensusu → status „wiek konsensusu nieznany” ([Z] pilotaż r1, Z7).
+
+**T48.** Kontrakt archiwum konsensusu (M65): każdy snapshot zapisuje rzeczywiste bajty odpowiedzi HTTP (nie serializację DataFrame ani sparsowany JSON) i sha256 liczony z tych bajtów, symbol źródłowy, `fetched_at_utc`, źródło i moduły, parametry zapytania, bibliotekę z przypiętą wersją, status HTTP i błąd. Zapis wyłącznie dopisywany, bez nadpisywania; nieudane pobranie zostawia wpis z błędem. Surowe bajty pozostają poza gitem.
 
 ### 4.2 O obliczeniach
 
@@ -455,7 +460,8 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 | `corporate_actions` | instrument × data | typ (split/dywidenda/prawo poboru/scalenie), współczynnik, ex_date, source | append |
 | `fx_rates` | para × data × źródło | kurs, **fixing_id** (nbp_a / ecb_ref), source, fetched_at | append |
 | `fundamentals` | instrument × okres × **filed_at** | revenue, gross_profit, ebit, ebitda, fcf, sbc, shares_diluted, tbv, nopat, capex, wc, net_debt, **taxonomy**, **currency**, form_type, **available_at** | append |
-| `estimates` | instrument × data pobrania | eps_ntm, rev_ntm, target_mean, **currency**, quality_flag | append |
+| `estimate_snapshots` | instrument × źródło × fetched_at_utc | source_symbol, modules, library_version, http_status, error, raw_ref, raw_sha256, target_mean, **currency**, quality_flag (T48, rew. 4.22) | append |
+| `estimates` | snapshot × okres | period (etykieta dostawcy), period_type, fiscal_year, period_end, eps_avg/low/high, n_analysts_eps, rev_avg/low/high, n_analysts_rev, **eps_currency**, **rev_currency** (M90–M93, rew. 4.22) | append |
 | `peer_groups` | grupa | instrument, layer (core/statistical), **valid_from**, **valid_to**, **reason** | wersjonowany |
 | `derived_metrics` | instrument × data × metryka | wartość, **code_version (git SHA)**, inputs_hash | przeliczalne |
 | `states` | instrument × data | value_state, quality_state, trend_state, risk_state, **data_quality**, powody | przeliczalne |
@@ -842,9 +848,21 @@ RISK: CRITICAL przy naruszeniu twardego stopu albo przekroczeniu portfolio heat;
 
 **M39.** Kwarantanna po TRAP: 30 dni bez alertów wycenowych, **zdejmowana wcześniej przez zmianę stanu** (QUALITY wraca do STABLE albo lepiej), nie tylko przez upływ czasu. Pozycje w kwarantannie są **wypisywane w przeglądzie okresowym** — cicha kwarantanna to mechanizm, przez który psująca się pozycja znika z pola widzenia dokładnie wtedy, gdy wymaga decyzji. Reguły ryzyka działają w kwarantannie normalnie.
 
-**M40.** Sygnał ROTACJA (peer atrakcyjniejszy): `sygnał_posiadanej − sygnał_peera > 0,35`, utrzymane dwa przebiegi, peer przechodzi bramkę jakości swojego archetypu, peer nie ma gorszego trendu rewizji. Pasmo martwe: różnica < 0,20 wygasza.
+**M40.** Sygnał ROTACJA (peer atrakcyjniejszy): `sygnał_posiadanej − sygnał_peera > 0,35`, utrzymane dwa przebiegi, peer przechodzi bramkę jakości swojego archetypu, peer nie ma gorszego trendu rewizji (w rozumieniu M91). Pasmo martwe: różnica < 0,20 wygasza.
 
 **M41.** Silnik pracuje **symetrycznie** — ta sama regresja i te same progi produkują listę kandydatów do wejścia z grup peer, bez osobnego, luźniejszego procesu.
+
+### 16.5 Mnożniki z konsensusu: P/E NTM, rewizje, agregacja, kwalifikacja
+
+**M90. P/E NTM — przybliżenie z konsensusu rocznego.** `EPS_NTM = w·EPS_FY1 + (1−w)·EPS_FY2`, gdzie `w = clamp((koniec_FY1 − D) / (koniec_FY1 − koniec_FY0), 0, 1)` w dniach, a FY1 to pierwszy rok obrotowy bez opublikowanego raportu rocznego (etykieta `0y` dostawcy; [Z] pilotaż r1, Z1–Z2). Okresy identyfikowane są według M91 i T47, nigdy według samej etykiety. Sezonowość rozkładu zysku w roku jest znanym ograniczeniem przybliżenia (O-52). `P/E_NTM = cena / EPS_NTM` w walucie notowania; gdy waluta EPS (`earningsCurrency`) różni się od waluty notowania, EPS przeliczany jest kursem krzyżowym NBP A z ostatniej tabeli ≤ D (M77). Zgodnie z M7 przy `EPS_NTM ≤ 0` mnożnik nie istnieje — wyłącznie status. `EPS_NTM` i `P/E_NTM` są wielkościami pochodnymi (`derived_metrics`). Baza EPS konsensusu ma status według P-17; kwalifikacja do RVS — M94.
+
+**M91. Rewizja konsensusu.** Rewizją jest wyłącznie zmiana prognozy dla tego samego okresu obrotowego, zidentyfikowanego przez typ okresu, rok obrotowy i datę końca (T47). Wagi FY1/FY2 zamrażane są na początku okna porównania; oba odczyty muszą dotyczyć dokładnie tych samych okresów — brak któregokolwiek okresu oznacza „brak porównywalnej rewizji”, bez zastępowania go następnym rokiem. Rewizję liczy się w walucie EPS przed przeliczeniem na walutę notowania, po uzgodnieniu zdarzeń korporacyjnych (`corporate_actions`). Procent tylko przy dodatniej bazie; przy zerowej lub ujemnej — zmiana kwotowa i status. Zmiana kroczącego `EPS_NTM` zawiera przesunięcie horyzontu i jest prezentowana osobno, nigdy jako rewizja. Wartości historyczne dostawcy (`epsTrend`) mają status „rewizja dostawcy — porównywalność okresu niepotwierdzona” do zamknięcia P-13. Każda rewizja podaje rzeczywisty odstęp dni między odczytami.
+
+**M92. Agregat części akcyjnej.** Indywidualne P/E jest zdefiniowane wyłącznie przy dodatnim EPS (M7). Agregat powstaje przez sumowanie ważonych E/P z uwzględnieniem ujemnych EPS: `EP_akcje = Σ wᵢ·EPSᵢ/Pᵢ` przy wagach znormalizowanych w części akcyjnej; `PE_akcje = 1/EP_akcje` wyłącznie przy `EP_akcje > 0` i kompletnych danych, inaczej status „nieinterpretowalne (E/P ≤ 0)” albo „nieinterpretowalne (braki danych)”. Status braków wynika z istnienia pozycji o wadze > 0 w kategorii „brak danych” lub „wyłączenie metodologiczne”, nie z sum wag. Wyłączenie metodologiczne dotyczy pozycji spoza zakresu ustalonego przed obliczeniem (np. archetyp, dla którego M4 wyklucza P/E) i jest wykazywane osobno; pozycji należącej do zakresu nie usuwa się po zobaczeniu wyniku. Gotówka jest w rozbiciu wag, poza mianownikiem. Prezentacja: rozbicie wag (E/P > 0, E/P < 0, brak danych, wyłączenie, gotówka), E/P części z danymi, P/E części akcyjnej albo status. Forward P/E progów (§21.6) to zewnętrzny punkt odniesienia o ograniczonej porównywalności: metoda dostawcy (horyzont, baza EPS, traktowanie strat) nie jest uzgodniona z M90–M93.
+
+**M93. Pokrycie konsensusu.** Brak lub zerowa liczba analityków oznacza brak zweryfikowanego konsensusu dla danej metryki i okresu; nie unieważnia automatycznie innych metryk ani okresów. Wartość zero przy potwierdzonym pokryciu jest wartością; EPS równy zero oznacza niezdefiniowane P/E (M7). Liczebność analityków przechowywana jest osobno dla EPS i przychodów ([Z] pilotaż r1, Z9: CPR.WA — pola EPS puste, przychody z wartościami zero przy zerowej liczbie analityków).
+
+**M94. Kwalifikacja mnożnika do RVS.** Mnożnik z konsensusu kwalifikuje się do RVS, gdy (a) dane spełniają M90–M93 i T47, (b) dla mnożników opartych na EPS — baza EPS jest zgodna z M9, czyli P-17 daje status „GAAP” albo „inna niż GAAP z SBC”. Status „inna niż GAAP bez SBC” albo „baza nieustalona” oznacza mnożnik wyłącznie opisowy; flaga `low` nie uchyla M9, a sama niezgodność z GAAP nie dowodzi wyłączenia SBC. Dla A1 do czasu kwalifikacji mnożnikiem sygnałowym jest EV/EBIT z fundamentów GAAP. Kwalifikacja nie przełącza mnożnika automatycznie: zmiana mnożnika głównego (np. EV/EBIT → fwd P/E) jest jawną, datowaną decyzją ownera, obejmuje całą porównywalną grupę peer (M34) i otwiera nową historię RVS od zera tygodni (M36); historii RVS liczonych różnymi mnożnikami nie skleja się. EV/NTM Sales nie zależy od bazy EPS i podlega tylko warunkowi (a).
 
 ## 17. Reverse DCF i wymagalność założeń
 
@@ -1460,7 +1478,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 |---|---|---|---|
 | **O-11** | **Massive (Polygon) jako kręgosłup cenowy** | [Z] **Wyłącznie giełdy USA** — potwierdzone dwiema stronami dostawcy. Plan darmowy daje 2 lata historii, za mało na SMA200 + momentum + reżim RVS jednocześnie | Portfel wróciłby do wyłącznie amerykańskiego. Pozostaje **opcjonalnym źródłem wysokiej jakości dla części USA** |
 | **O-12** | **Stooq jako źródło importera (bezobsługowy fallback lub kontrola automatyczna)** | [Z] Pomiar 2026-09-25: żądanie skryptowe dostaje stronę JS proof-of-work zamiast CSV; ścieżka `get_apikey` nie wydaje klucza (§9.2) | Oficjalny, działający dostęp skryptowy (klucz albo API). Do tego czasu **źródło ręczne** i jedyne źródło maski korekt `o=` |
-| **O-13** | **Rezygnacja z forward P/E i konsensusu** | Amputowałaby EV/NTM Sales dla **NOW (największa pozycja, 9%)**, AXON, RBRK, RKLB, fwd P/E dla megacapów i NVO **oraz pierwszy człon bramki anty-pułapkowej** | Konsensus zostaje, z jawną flagą jakości `low` i **bez roli sygnałowej** (M28) |
+| **O-13** | **Rezygnacja z forward P/E i konsensusu** | Amputowałaby EV/NTM Sales dla **NOW (największa pozycja, 9%)**, AXON, RBRK, RKLB, fwd P/E dla megacapów i NVO **oraz pierwszy człon bramki anty-pułapkowej** | Konsensus zostaje jako wejście do mnożników relatywnych i bramek archetypowych, z jawną flagą jakości `low`. Zakaz generowania alertów dotyczy reverse DCF (M28). |
 | **O-14** | Twelve Data / EODHD / Alpha Vantage / FMP / Tiingo | [Z] Odpowiednio: 3 giełdy na free; 20 wywołań/dzień i rok historii; 25/dzień; kalendarz i peers płatne przy Basic ograniczonym do próbki symboli; fundamenty jako płatny dodatek | Budżet płatny — wtedy porównać tiery pod kątem **pokrycia spoza USA** |
 | **O-15** | Płatne API za 19–25 USD/mies. jako rozwiązanie problemu danych | Nie kupuje danych **point-in-time** — plany retailowe podają bieżącą wersję, nie stan z dnia X; prawdziwe PIT kosztuje tysiące. **Archiwum od dnia zero potrzebne tak samo przy 0 jak przy 25 USD** | Decyzja po pierwszym kwartale, na **zmierzonym** czasie wpisu ręcznego |
 | **O-16** | OpenBB jako warstwa dostępu | Abstrakcja, nie źródło — pod spodem ten sam yfinance i SEC; zdejmuje utrzymanie wrapperów, ale dokłada warstwę psującą się niezależnie i nie zmniejsza ryzyka zatrucia archiwum | Gdyby ktoś przejął utrzymanie normalizacji wielorynkowej |
@@ -1470,6 +1488,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 | **O-20** | FRED jako główne źródło FX | [Z] Brak dziennej serii dla złotego; aktualizacja tygodniowa | Zmiana waluty bazowej |
 | **O-21** | exchangerate.host / Wise / ExchangeRate-API | [Z] 100 zapytań/miesiąc; wymaga tokenu konta; brak szeregów historycznych | Nic |
 | **O-45** | S&P / Kensho (Capital IQ przez MCP) jako źródło danych fundamentalnych | Wymaga płatnego konta; brak konta (decyzja 2026-09-25) | Budżet na dane > 0 |
+| **O-52** | Suma prognoz czterech kolejnych kwartałów jako EPS_NTM | Bezpłatne źródło podaje prognozy kwartalne tylko dla `0q` i `+1q` ([Z] pilotaż r1); druga ścieżka obliczeń bez danych | Bezpłatne źródło prognoz dla czterech kolejnych kwartałów |
 
 ### 26.3 Model analityczny
 
@@ -1498,6 +1517,7 @@ Rejestr istnieje po to, żeby odrzucone opcje nie wracały co rundę bez nowego 
 | **O-49** | Zamrożony miks rdzenia (SPYI + V80A + V60A) jako benchmark decyzyjny | Kapitał satelity nie wraca do rdzenia (decyzja ownera 2026-10-02); owner wskazał SPYI jako próg | Zmiana przeznaczenia kapitału satelity |
 | **O-50** | EUR jako waluta oceny satelity | Werdykt nie zależy od waluty, gdy obie strony liczone są w tej samej (ΔW_EUR = ΔW_PLN / kurs EUR/PLN z dnia T); drugi widok bez nowej informacji | Nic |
 | **O-51** | Kotwica 2N kontraktu B2: cena kontraktu skorygowana o bazę (cena transakcji − (zamknięcie kontraktu − zamknięcie bazy) w sesji wejścia) | Odrzucona 2026-10-16: w danych brak zamknięć kontraktów (0 z 8 kontraktów, pomiar CC-CH); wymagałaby osobnego źródła notowań kontraktów. Przyjęto B1 (§19.4) | Tylko nowy argument z danych: dostępne zamknięcia kontraktów |
+| **O-53** | P/E portfela liczone z pominięciem pozycji stratnych lub bez danych | Daje pozorną taniość: połowa wagi z E/P +5% i połowa z E/P −5% to E/P 0, a po wyłączeniu stratnej połowy P/E 20× | Nic — agregat przez E/P (M92) |
 
 ### 26.4 Operacje
 
@@ -1549,6 +1569,11 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 | **P-10** | Efektywna liczba zakładów po korelacji | PCA na ≥120 zwrotach tygodniowych, shrinkage | HHI daje 21,5 **wg wag**; po korelacji będzie istotnie niżej. **Zmienia sizing** |
 | **P-11** | Realny czas wpisu ręcznego mianowników | Chronometraż pierwszego kwartału | Próg decyzji o płatnym API (O-15) |
 | **P-12** | Zapis symboli GPW na stooq.com | Wyszukiwarka symboli stooq.com dla PKN; porównanie szeregu ze stooq.pl | Rozstrzyga wiersz 3 checklisty §12 (pomiar 2026-09-25: `pkn.pl` nie istnieje) |
+| **P-13** | Semantyka `epsTrend` (wartości 7/30/60/90 dni wstecz) | Drugi przypadek przeskoku etykiety roku obrotowego po publikacji raportu rocznego (pilotaż r1: n = 1, MU); porównanie z zarchiwizowanym snapshotem sprzed przeskoku | Zdejmuje albo utrzymuje status „porównywalność okresu niepotwierdzona” (M91) |
+| **P-14** | Niezależna data końca okresu dla spółek spoza SEC (CSU, IFX) | Źródło inne niż dostawca konsensusu: TradingView `get_documents` (raporty roczne) albo raport emitenta | Do zamknięcia P/E NTM tych spółek ma status „data okresu niepotwierdzona niezależnie” |
+| **P-15** | Prawdziwość waluty EPS konsensusu (CSU: `earningsCurrency` USD przy cenie w CAD) | Rząd wielkości EPS konsensusu wobec EPS z raportu emitenta | Rozstrzyga przeliczenie walutowe w M90 |
+| **P-16** | Powtarzalność snapshotu konsensusu w dniu sesyjnym | Dwa pobrania w odstępie ≥ 10 min w dniu sesyjnym (pilotaż r1: wyłącznie niedziela) | Częstość zapisu i deduplikacja po sha256 (T48) |
+| **P-17** | Baza EPS konsensusu per spółka | Zrealizowany EPS dostawcy (`earningsHistory`) wobec GAAP diluted (XBRL) i uzgodnienia non-GAAP emitenta (8-K); status: GAAP / inna niż GAAP z SBC / inna niż GAAP bez SBC / baza nieustalona; brak dowodu = baza nieustalona; sama niezgodność z GAAP nie dowodzi wyłączenia SBC | Kwalifikacja do RVS (M94); pilotaż r1: RBRK inna niż GAAP (SBC nieustalone), MU nierozstrzygnięte |
 
 **Pytania otwarte, należące do właściciela:**
 
