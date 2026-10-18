@@ -19,6 +19,7 @@ STATUS_NO_REVISION = "brak porównywalnej rewizji"
 STATUS_RATIO_UNDEFINED = "iloraz nieokreślony"
 STATUS_DIVERGENCE_NA = "baza bliska zeru / zmiana znaku"
 STATUS_AGE_UNKNOWN = "wiek konsensusu nieznany"
+STATUS_PERIOD_TIE = "remis dopasowania okresu"
 
 POSITION_STATUSES = ("dane", "brak danych", "wyłączenie metodologiczne", "gotówka")
 
@@ -75,7 +76,7 @@ class Revision:
     status: str | None
 
 
-def _match_period(snap: Snapshot, period_end: date) -> PeriodEstimate | None:
+def _match_period(snap: Snapshot, period_end: date) -> PeriodEstimate | str | None:
     cands = [
         (abs((p.period_end - period_end).days), p)
         for p in snap.periods
@@ -85,7 +86,7 @@ def _match_period(snap: Snapshot, period_end: date) -> PeriodEstimate | None:
         return None
     cands.sort(key=lambda x: x[0])
     if len(cands) > 1 and cands[0][0] == cands[1][0]:
-        raise ValueError("remis dopasowania okresu po dacie konca")
+        return STATUS_PERIOD_TIE
     return cands[0][1]
 
 
@@ -93,6 +94,8 @@ def revision_fixed(snapshot_a: Snapshot, snapshot_b: Snapshot, period_end: date)
     days = (snapshot_b.taken_on - snapshot_a.taken_on).days
     pa = _match_period(snapshot_a, period_end)
     pb = _match_period(snapshot_b, period_end)
+    if pa == STATUS_PERIOD_TIE or pb == STATUS_PERIOD_TIE:
+        return Revision(rel=None, abs_change=None, days_between=days, status=STATUS_PERIOD_TIE)
     if pa is None or pb is None:
         return Revision(rel=None, abs_change=None, days_between=days, status=STATUS_NO_REVISION)
     rel = pb.eps_avg / pa.eps_avg - 1 if pa.eps_avg != 0 else None

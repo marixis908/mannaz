@@ -53,3 +53,11 @@ def test_b53_direct_requirements_pinned_in_constraints():
     missing = sorted(n for n in direct if not pinned.get(n))
     assert not missing, f"brak wersji w constraints.txt dla: {missing}"
     assert pinned["yfinance"] == "1.7.0"
+
+
+def test_e14_yfdata_get_signature():
+    """S1: domyslny klient uzywa url, params i timeout, zwraca odpowiedz HTTP."""
+    from yfinance.data import YfData
+
+    assert callable(YfData.get)
+    assert {"self", "url", "params", "timeout"} <= set(inspect.signature(YfData.get).parameters)

@@ -194,3 +194,19 @@ def test_s9_divergence():
         d = divergence(p, c)
         assert d.status == "baza bliska zeru / zmiana znaku"
         assert d.rel is None and d.flag is None
+
+
+@pytest.mark.parametrize("tied_snapshot", ["a", "b", "both"])
+def test_e13_period_match_tie_returns_status(tied_snapshot):
+    from datetime import timedelta
+    from mannaz.forward_pe import STATUS_PERIOD_TIE
+
+    target = date(2026, 12, 31)
+    tied = (PeriodEstimate("0y", target - timedelta(days=3), 10),
+            PeriodEstimate("+1y", target + timedelta(days=3), 12))
+    single = (PeriodEstimate("0y", target, 11),)
+    a = Snapshot(date(2026, 9, 1), tied if tied_snapshot in ("a", "both") else single)
+    b = Snapshot(date(2026, 10, 1), tied if tied_snapshot in ("b", "both") else single)
+    result = revision_fixed(a, b, target)
+    assert result.status == STATUS_PERIOD_TIE
+    assert result.rel is None and result.abs_change is None and result.days_between == 30
