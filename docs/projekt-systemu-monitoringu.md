@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.22 · 2026-10-18**
+**Rewizja 4.23 · 2026-10-18**
 
 ---
 
@@ -46,7 +46,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.19 | 2026-10-16 | §19.1 M23, §19.3: Chandelier okresu posiadania (okno od sesji po wejściu, zapadka od max(e+1, RATCHET_START)), A8 kontekst trendu i flaga wejścia wbrew trendowi (w raporcie tylko nowe wejścia), adnotacja zmiany reguły i M69 „wyłącznie zmiana reguły”; §19.4: kotwica 2N kontraktów = zamknięcie bazy z sesji każdego lota (także zapadka 2N); §26: O-51 B2 odrzucony (brak notowań kontraktów); decyzja: owner 2026-10-16 (brief CC-CH2, pomiar CC-CH, recenzja Codexa, ocena zewnętrzna) |
 | 4.20 | 2026-10-16 | M62: zapadka nie przechodzi przez zmianę reguły stopu, liczona od pierwszej oceny nową regułą (B-80); M69: sekcja „Zmiany pozycji” porównuje pozycje otwarte z poprzednią oceną (B-74); M78: cykl czyta kotwice `account_values` z `data\manual` (B-73); decyzja: owner 2026-10-16 (ocena cyklu 2026-10-15_1747, brief CC-B70) |
 | 4.21 | 2026-10-17 | T12: wiersz bez ceny z datą po D = informacja w HEARTBEAT (B-83); M67: tolerancja rewizji 1e-6 względnie, ochrona korekty ręcznej (`tradingview_manual_*`), podsekcja „Konflikty z korektą ręczną” (B-84); §9.6: brak obrotu potwierdzony w TradingView (`tradingview_manual_notrade`, B-78); decyzja: planista 2026-10-17 (brief CC-DQ) |
-| **4.22** | **2026-10-18** | **§16.5 mnożniki z konsensusu: P/E NTM — przybliżenie z konsensusu rocznego (M90), rewizja dla stałego okresu (M91), agregat E/P części akcyjnej (M92), pokrycie konsensusu (M93), kwalifikacja mnożnika do RVS i jawna zmiana mnożnika (M94) — zmiany merytoryczne; T47 progi dopasowania okresu i flag, T48 kontrakt archiwum konsensusu; §8.2 `estimate_snapshots` i `estimates` per okres; M28 i O-13 doprecyzowane (konsensus jako wejście mnożników relatywnych i bramek, zakaz alertów dotyczy reverse DCF) — zmiana redakcyjna bez zmiany intencji; M15, M40 odwołanie do M91; P-13–P-17; O-52, O-53; decyzja: owner 2026-10-18 (pilotaż `docs/pomiary/forward-pe-pilot-r1.md`, brief CC-R422)** |
+| 4.22 | 2026-10-18 | §16.5 mnożniki z konsensusu: P/E NTM — przybliżenie z konsensusu rocznego (M90), rewizja dla stałego okresu (M91), agregat E/P części akcyjnej (M92), pokrycie konsensusu (M93), kwalifikacja mnożnika do RVS i jawna zmiana mnożnika (M94) — zmiany merytoryczne; T47 progi dopasowania okresu i flag, T48 kontrakt archiwum konsensusu; §8.2 `estimate_snapshots` i `estimates` per okres; M28 i O-13 doprecyzowane (konsensus jako wejście mnożników relatywnych i bramek, zakaz alertów dotyczy reverse DCF) — zmiana redakcyjna bez zmiany intencji; M15, M40 odwołanie do M91; P-13–P-17; O-52, O-53; decyzja: owner 2026-10-18 (pilotaż `docs/pomiary/forward-pe-pilot-r1.md`, brief CC-R422) |
+| **4.23** | **2026-10-18** | **T48 doprecyzowany (archiwizacja odpowiedzi koncowej biblioteki, koncowe 429 jako nieudane pobranie, deduplikacja wylaczona do zamkniecia P-16); T49 harmonogram strumienia konsensusu na komputerze ownera z progiem przegladu (hybryda z VPS); §8.2 `estimate_snapshots` i `estimates` zgodne z migracja `sql/020_estimates.sql` (m.in. parse_status, skipped_labels, price_currency, instrument_id NOT NULL, fiscal_year jako konwencja Mannaz, pierwszenstwo statusu `bledna data okresu`); §5.4 wiersz snapshotow konsensusu zgodny z M65; P-16 zaktualizowany (C3 skreslony jako bramka); wyciag `docs/pomiary/fpe-importer-c2.md`, poprawka opisu 10-K w wyciagu pilotazu — doprecyzowania i zapis decyzji, bez nowych regul oceny; decyzja: owner 2026-10-18 (brief CC-R423)** |
 
 ### 0.3 Oznaczenia
 
@@ -261,7 +262,9 @@ sygnał = ln(RVS_dziś) − ln(mediana RVS z okna referencyjnego)
 
 **T47.** Progi operacyjne do kalibracji (M90–M93): dopasowanie okresu — zgodny typ okresu (roczny), rok obrotowy i data końca w tolerancji ±7 dni (lata 52/53-tygodniowe; [Z] pilotaż r1: MU, dostawca podaje koniec miesiąca); rozbieżność źródeł — `|kontrola − główne| / |główne| > 10%`, a przy `|główne| < 0,05` lub zmianie znaku status „baza bliska zeru / zmiana znaku” bez procentu; flaga „wysoki mnożnik / niska rentowność E/P” przy `P/E_NTM > 100`; iloraz EPS skorygowany / GAAP tylko przy GAAP > 0 i GAAP ≥ 0,1·|EPS skorygowany|, zawsze z obiema wartościami i różnicą; brak daty aktualizacji konsensusu → status „wiek konsensusu nieznany” ([Z] pilotaż r1, Z7).
 
-**T48.** Kontrakt archiwum konsensusu (M65): każdy snapshot zapisuje rzeczywiste bajty odpowiedzi HTTP (nie serializację DataFrame ani sparsowany JSON) i sha256 liczony z tych bajtów, symbol źródłowy, `fetched_at_utc`, źródło i moduły, parametry zapytania, bibliotekę z przypiętą wersją, status HTTP i błąd. Zapis wyłącznie dopisywany, bez nadpisywania; nieudane pobranie zostawia wpis z błędem. Surowe bajty pozostają poza gitem.
+**T48.** Kontrakt archiwum konsensusu (M65): każdy snapshot zapisuje rzeczywiste bajty odpowiedzi HTTP (nie serializację DataFrame ani sparsowany JSON) i sha256 liczony z tych bajtów, symbol źródłowy, `fetched_at_utc`, źródło i moduły, parametry zapytania, bibliotekę z przypiętą wersją, status HTTP i błąd. Bajty odpowiedzi to treść po zdjęciu kodowania transferu i kompresji (odpowiednik `response.content`), bez dekodowania tekstu; nagłówki `Content-Type` i `Content-Encoding` zapisywane są w metadanych. Archiwizowana jest odpowiedź końcowa zwrócona przez bibliotekę; odpowiedzi pośrednie z wewnętrznych ponowień biblioteki nie są dostępne i nie są archiwizowane ([Z] yfinance 1.7.0 `data.py:487-503`). Końcowe HTTP 429 sygnalizowane przez bibliotekę wyjątkiem bez treści odpowiedzi to nieudane pobranie: wpis z błędem, bez bajtów (`data.py:505-506`). Zapis wyłącznie dopisywany, bez nadpisywania; nieudane pobranie zostawia wpis z błędem. Deduplikacja snapshotów jest wyłączona do zamknięcia P-16: każdy przebieg zapisuje osobny snapshot, a równość sha256 całej odpowiedzi nie jest kryterium duplikatu, bo moduł `price` zawiera kurs bieżący. Surowe bajty pozostają poza gitem.
+
+**T49.** Harmonogram strumienia konsensusu (M65, T48): przebieg na komputerze ownera z Harmonogramu zadań Windows, wtorek i piątek 07:30 czasu lokalnego, z nadrabianiem przebiegu po włączeniu komputera; po każdym przebiegu kopia archiwum wyłącznie dopisująca na `D:\mannaz-backup\estimates-raw\` z weryfikacją sha256. Przebieg opóźniony nie traci snapshotu (konsensus to stan bieżący); przebieg pominięty tworzy nieodtwarzalną lukę. Przegląd lokalizacji harmonogramu — wariant hybrydowy: pobranie i archiwizacja na VPS, wczytanie do bazy na komputerze ownera — gdy w miesiącu kalendarzowym przepadną więcej niż dwa przebiegi albo przed nieobecnością dłuższą niż tydzień; pierwszy krok przeglądu: test, czy dostawca odpowiada z adresu VPS bez serii HTTP 429. Kopia na tym samym komputerze nie chroni przed awarią sprzętu ani utratą komputera.
 
 ### 4.2 O obliczeniach
 
@@ -338,7 +341,7 @@ Mitygacja niezależna od planu: ciężkie przeliczenia pod `nice`, rozłożenie 
 |---|---|---|
 | OHLC dzienne | ~151 000 | ~25 MB |
 | Fundamenty kwartalne | ~2 400 | ~3 MB |
-| Snapshoty konsensusu tygodniowe | ~31 000 | ~8 MB |
+| Snapshoty konsensusu 2× w tygodniu (M65) | ~62 000 | ~16 MB |
 | FX (8 par × 3 lata) | ~6 300 | ~1 MB |
 | Metryki pochodne | ~150–300 tys. | ~40–60 MB |
 | **Razem** | | **~80–150 MB** |
@@ -460,8 +463,8 @@ decisions            propozycje systemu + decyzje właściciela + wynik
 | `corporate_actions` | instrument × data | typ (split/dywidenda/prawo poboru/scalenie), współczynnik, ex_date, source | append |
 | `fx_rates` | para × data × źródło | kurs, **fixing_id** (nbp_a / ecb_ref), source, fetched_at | append |
 | `fundamentals` | instrument × okres × **filed_at** | revenue, gross_profit, ebit, ebitda, fcf, sbc, shares_diluted, tbv, nopat, capex, wc, net_debt, **taxonomy**, **currency**, form_type, **available_at** | append |
-| `estimate_snapshots` | instrument × źródło × fetched_at_utc | source_symbol, modules, library_version, http_status, error, raw_ref, raw_sha256, target_mean, **currency**, quality_flag (T48, rew. 4.22) | append |
-| `estimates` | snapshot × okres | period (etykieta dostawcy), period_type, fiscal_year, period_end, eps_avg/low/high, n_analysts_eps, rev_avg/low/high, n_analysts_rev, **eps_currency**, **rev_currency** (M90–M93, rew. 4.22) | append |
+| `estimate_snapshots` | instrument × źródło × fetched_at_utc | instrument_id (NOT NULL; symbol niezmapowany zostaje tylko w archiwum), source_symbol, modules, query_params, library, library_version, http_status, error, raw_ref, raw_sha256, byte_count, target_mean, **price_currency**, quality_flag (zawsze `low`, M28), parse_status (status snapshotu; `bledna data okresu` ma pierwszeństwo przed `brak daty okresu`), skipped_labels, code_sha (T48, rew. 4.23) | append |
+| `estimates` | snapshot × okres | period (etykieta dostawcy), period_type, fiscal_year (rok kalendarzowy period_end — konwencja Mannaz, nie etykieta emitenta), period_end, eps_avg/low/high, n_analysts_eps, rev_avg/low/high, n_analysts_rev, **eps_currency**, **rev_currency** ([Z] C2: `revenueEstimate.revenueCurrency` w 24/24 okresach), eps_status, rev_status, period_end_check, currency_check, status (M90–M93, rew. 4.23) | append |
 | `peer_groups` | grupa | instrument, layer (core/statistical), **valid_from**, **valid_to**, **reason** | wersjonowany |
 | `derived_metrics` | instrument × data × metryka | wartość, **code_version (git SHA)**, inputs_hash | przeliczalne |
 | `states` | instrument × data | value_state, quality_state, trend_state, risk_state, **data_quality**, powody | przeliczalne |
@@ -1572,7 +1575,7 @@ Każdy pomiar ma zdefiniowany test i konsekwencję wyniku. Wszystkie read-only.
 | **P-13** | Semantyka `epsTrend` (wartości 7/30/60/90 dni wstecz) | Drugi przypadek przeskoku etykiety roku obrotowego po publikacji raportu rocznego (pilotaż r1: n = 1, MU); porównanie z zarchiwizowanym snapshotem sprzed przeskoku | Zdejmuje albo utrzymuje status „porównywalność okresu niepotwierdzona” (M91) |
 | **P-14** | Niezależna data końca okresu dla spółek spoza SEC (CSU, IFX) | Źródło inne niż dostawca konsensusu: TradingView `get_documents` (raporty roczne) albo raport emitenta | Do zamknięcia P/E NTM tych spółek ma status „data okresu niepotwierdzona niezależnie” |
 | **P-15** | Prawdziwość waluty EPS konsensusu (CSU: `earningsCurrency` USD przy cenie w CAD) | Rząd wielkości EPS konsensusu wobec EPS z raportu emitenta | Rozstrzyga przeliczenie walutowe w M90 |
-| **P-16** | Powtarzalność snapshotu konsensusu w dniu sesyjnym | Dwa pobrania w odstępie ≥ 10 min w dniu sesyjnym (pilotaż r1: wyłącznie niedziela) | Częstość zapisu i deduplikacja po sha256 (T48) |
+| **P-16** | Powtarzalność snapshotu konsensusu w dniu sesyjnym | Dwa snapshoty tego samego symbolu w krótkim odstępie z archiwum produkcyjnego; porównanie modułów osobno (`earningsTrend` wobec `price`); pilotaż r1: wyłącznie niedziela; C3 skreślony jako bramka (owner 2026-10-18) | Kryterium deduplikacji (treść konsensusu, nie sha256 całej odpowiedzi); do zamknięcia brak deduplikacji (T48) |
 | **P-17** | Baza EPS konsensusu per spółka | Zrealizowany EPS dostawcy (`earningsHistory`) wobec GAAP diluted (XBRL) i uzgodnienia non-GAAP emitenta (8-K); status: GAAP / inna niż GAAP z SBC / inna niż GAAP bez SBC / baza nieustalona; brak dowodu = baza nieustalona; sama niezgodność z GAAP nie dowodzi wyłączenia SBC | Kwalifikacja do RVS (M94); pilotaż r1: RBRK inna niż GAAP (SBC nieustalone), MU nierozstrzygnięte |
 
 **Pytania otwarte, należące do właściciela:**
