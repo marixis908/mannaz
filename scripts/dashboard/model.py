@@ -810,9 +810,14 @@ def render_s3_html(sat: dict[str, Any]) -> str:
     c_pct = conv(CONV_KS_SHARE, "cena split_adj (close_d); NAV satelity z gotowka (B-17, M78)", "risk_daily", rd)
     lim = s3["limits"]
     stan = f"stan oceny ryzyka {iso_or_text(rd)}"
+    closed = s3.get("closed_since_risk")
+    closed_html = (brak_html("brak licznika pozycji zamknietych") if closed is None
+                   else num_html(str(closed), conv(CONV_COUNT, "bez warstwy", "risk_daily vs positions_as_of(D)", s3["d"])))
     parts: list[str] = [
         f'<div class="note">Sklad na D: {_e(iso_or_text(s3["d"]))}; ryzyko z ostatniej oceny &lt;= D: '
-        f'{_e(iso_or_text(rd))}. Agregaty ponizej ({_e(stan)}) czytane z oceny, nie przeliczane.</div>'
+        f'{_e(iso_or_text(rd))}. Agregaty ponizej ({_e(stan)}) czytane z oceny, nie przeliczane.</div>',
+        f'<div class="note" data-role="agg-scope">Agregaty: {_e(stan)}; pozycje budzetowe zamkniete od tej daty '
+        f'(w agregatach, poza wierszami): {closed_html}</div>',
     ]
     # poziom 3 + tematy
     kpis: list[str] = []
@@ -873,7 +878,8 @@ def render_s3_html(sat: dict[str, Any]) -> str:
     return _section(
         "sec-s3", title, "".join(parts),
         f"% kapitalu satelity (mianownik: NAV satelity z gotowka, B-17/M78) w walucie PLN; warstwa cena split_adj (close_d); "
-        f"zrodlo risk_daily + mannaz.risk.level1_by_name; data oceny {iso_or_text(rd)}",
+        f"zrodlo risk_daily + mannaz.risk.level1_by_name; data oceny {iso_or_text(rd)}; "
+        f"agregaty = stan oceny ryzyka {iso_or_text(rd)}, pozycje zamkniete od tej daty: {iso_or_text(closed)}",
     )
 
 
@@ -975,7 +981,11 @@ def render_s5a_html(sat: dict[str, Any]) -> str:
             rng = f'<span class="date">{_e(iso_or_text(v["window_start_min"]))}</span> .. <span class="date">{_e(iso_or_text(v["window_end_max"]))}</span>'
             rows.append("<tr>" + _txt(_COMPONENT_LABELS[comp]) + _td(lim_cell) + _td(n_cell, "txt") + _td(rng, "txt") + _txt(v["data_status"]) +
                         _td(f'<span class="date">{_e(iso_or_text(v["first_seen_max"]))[:19]}</span>', "txt") + "</tr>")
+    ends = [v["window_end_max"] for v in viol["by_component"].values() if v.get("window_end_max") is not None]
+    scope = (f"pelne tygodnie do {iso_or_text(max(ends))}" if ends else "brak okien z naruszeniem w rejestrze 1")
     parts.append(f'<div class="note">Stan rejestru na D = {_e(iso_or_text(d))} (wiersze z window_end / event_date &lt;= D); rejestr tylko do dopisywania.</div>')
+    parts.append(f'<div class="note" data-role="violations-scope">Zakres liczenia naruszen: {_e(scope)} '
+                 "(rejestr 1 zapisuje okna konczace sie na pelnych tygodniach; biezacy tydzien poza rejestrem - zob. S5b).</div>")
     parts.append("<h3>Naruszenia mandatu (okna 24 m. konczace sie w window_end)</h3>")
     parts.append(_table(["Komponent", "Limit", "Okna z naruszeniem", "Zakres okien (window_start min .. window_end max)", "data_status", "max(first_seen_run_at)"], rows))
     # zdarzenia
@@ -1006,7 +1016,8 @@ def render_s5a_html(sat: dict[str, Any]) -> str:
     return _section(
         "sec-s5a", title, "".join(parts),
         f"obsuniecia jako udzial (%), bez waluty; warstwa TWR z NAV satelity (ceny split_adj); zrodlo tabele registry=1 "
-        f"(satellite_mandate_violations, satellite_mandate_events); limity L_MAX/L_REL z mannaz.satellite; data D {iso_or_text(d)}",
+        f"(satellite_mandate_violations, satellite_mandate_events); limity L_MAX/L_REL z mannaz.satellite; data D {iso_or_text(d)}; "
+        f"zakres liczenia naruszen: {scope}",
     )
 
 
@@ -1040,7 +1051,11 @@ def render_s5b_html(sat: dict[str, Any]) -> str:
         banner += "<ul class=\"plain\">" + "".join(f"<li>{_e(r)}</li>" for r in reasons) + "</ul>"
     banner += "</div>"
     parts: list[str] = [banner]
-    parts.append(f'<div class="note">D = {_e(iso_or_text(d))} (to samo D co sklad). Raport nie niesie I_sat: pokazany TWR okna od S do D.</div>')
+    s_date = iso_or_text(s5b.get("S"))
+    parts.append(f'<div class="note">D = {_e(iso_or_text(d))} (to samo D co sklad). '
+                 f'<span data-role="twr-label">TWR od S = {_e(s_date)}</span> (okno od_S: {_e(s_date)} .. {_e(iso_or_text(d))}).</div>')
+    parts.append(f'<div class="note" data-role="violations-scope">Zakres liczenia naruszen: z biezacym tygodniem do D = '
+                 f'{_e(iso_or_text(d))} (okna od_S i 24m konczace sie w D; modul liczy na sucho, write=False).</div>')
     rows: list[str] = []
     for wname in ("od_S", "24m"):
         w = s5b["windows"].get(wname)
@@ -1086,6 +1101,7 @@ def render_s5b_html(sat: dict[str, Any]) -> str:
         f"{s5b['conventions_currency']}; warstwa {layer}; zrodlo {src}, progi: "
         + "; ".join(f"{k}: {v}" for k, v in s5b["benchmarks"].items())
         + f"; data D {iso_or_text(d)}; limity L_MAX={fmt_fraction(s5b['limits']['abs'], 0)}, L_REL={fmt_fraction(s5b['limits']['rel'], 0)}"
+        + f"; TWR od S = {iso_or_text(s5b.get('S'))}; zakres liczenia naruszen: z biezacym tygodniem do D = {iso_or_text(d)}"
     )
     return _section("sec-s5b", title, "".join(parts), conv_footer)
 

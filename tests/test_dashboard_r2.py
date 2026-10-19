@@ -130,6 +130,15 @@ def assert_no_zero_nums(p: Parsed, sec: str | None = None) -> None:
         assert not _ZERO_RE.match(t) and t not in _BAD_WORDS, f"brak pomiaru zapisany jako liczba: {t!r}"
 
 
+CLOSED_COUNT_SRC = "risk_daily vs positions_as_of(D)"
+
+
+def is_closed_count(r) -> bool:
+    """Licznik pozycji zamknietych od daty oceny (ocena planisty D2-r1 pkt 3): prawdziwy
+    pomiar (moze byc 0), nie "brak pomiaru" - wylaczony z asercji braku zer."""
+    return CLOSED_COUNT_SRC in (r["attrs"].get("data-conv") or "")
+
+
 class FakeConn:
     def __init__(self):
         self.rollbacks = 0
@@ -502,10 +511,11 @@ def test_s3_negative_empty_risk_rows_brak_no_zero(monkeypatch):
     s3, _, _, _ = s3s4(monkeypatch, risk_rows=[], open_positions=[], sum_open=None, themes={})
     assert s3["names"] == [] and s3["positions"] == []
     p = Parsed(model.render_s3_html(sat_of(s3=s3)))
-    assert p.nums("sec-s3") == []
+    other = [r for r in p.nums("sec-s3") if not is_closed_count(r)]
+    assert other == []
+    assert [Parsed.txt(r) for r in p.nums("sec-s3") if is_closed_count(r)] == ["0"]  # licznik zamknietych = 0 (pomiar)
     assert len(p.nas("sec-s3")) >= 3
     assert all(Parsed.txt(r).startswith("brak pomiaru") for r in p.nas("sec-s3"))
-    assert_no_zero_nums(p)
 
 
 def test_s3_negative_provenance_fail_brak_with_reason(monkeypatch):
@@ -618,7 +628,7 @@ def test_q1_negative_a_absent_in_positions_as_of_risk_date(monkeypatch):
         assert all(Parsed.txt(r) not in ("7,777%",) for r in p.nums(sec))
         # w wierszu pozycji nie ma liczb (stop/ryzyko): zadne 0 w miejscu stopu/ryzyka
         rows = [r for r in p.elems if r["tag"] == "tr" and "Beta Corp" in Parsed.txt(r)]
-        assert len(rows) == 1 and "0" not in [Parsed.txt(x) for x in p.nums(sec)]
+        assert len(rows) == 1 and "0" not in [Parsed.txt(x) for x in p.nums(sec) if not is_closed_count(x)]
 
 
 @pytest.mark.parametrize("row_type", list(fifo_mod._FIFO_ROW_TYPES))
@@ -1003,3 +1013,69 @@ def test_s9_generator_copies_module_values_does_not_compute(monkeypatch):
         assert expected in texts, expected
     assert "29,20" not in texts and "106,64" not in texts  # lokalny+fx i total-fx nie wystepuja
     assert assert_nums_have_conv(p, "sec-s9") >= 12
+
+
+# ---------------------------------------------------------------------------
+# Ocena planisty D2-r1 (2026-10-19): zakres liczenia naruszen (S5a/S5b),
+# agregaty S3 ze stanem oceny i licznikiem zamknietych, etykieta TWR od S.
+# ---------------------------------------------------------------------------
+
+
+def test_s5a_scope_label_full_weeks_to_max_window_end():
+    cur = registry_cur(
+        3, 1,
+        viol=[("abs", 2, date(2025, 1, 2), date(2026, 9, 30), "niezweryfikowane", datetime(2026, 10, 1, 7, 0)),
+              ("rel_spyi", 1, date(2025, 3, 3), date(2026, 10, 9), "niezweryfikowane", datetime(2026, 10, 1, 7, 0))],
+    )
+    s5a = generate._fetch_registry1(cur, D)
+    h = model.render_s5a_html(sat_of(s5a=s5a))
+    p = Parsed(h)
+    scope = Parsed.txt(p.role("sec-s5a", "violations-scope")[0])
+    assert "pelne tygodnie do 2026-10-09" in scope  # max window_end ze wszystkich komponentow
+    footer = Parsed.txt(p.role("sec-s5a", "conv-footer")[0])
+    assert "zakres liczenia naruszen: pelne tygodnie do 2026-10-09" in footer
+    assert "z biezacym tygodniem" not in h
+
+
+def test_s5a_scope_label_without_windows_is_not_a_date():
+    s5a = generate._fetch_registry1(registry_cur(5, 5), D)
+    p = Parsed(model.render_s5a_html(sat_of(s5a=s5a)))
+    scope = Parsed.txt(p.role("sec-s5a", "violations-scope")[0])
+    assert "brak okien z naruszeniem w rejestrze 1" in scope and "pelne tygodnie do" not in scope
+
+
+def test_s5b_scope_and_twr_from_s_label(monkeypatch):
+    patch_stage(monkeypatch, report=make_report())
+    s5b, _ = generate._build_s5b_s9(FakeDbConn(), D, None)
+    h = model.render_s5b_html(sat_of(s5b=s5b))
+    p = Parsed(h)
+    assert Parsed.txt(p.role("sec-s5b", "twr-label")[0]) == "TWR od S = 2026-03-02"
+    scope = Parsed.txt(p.role("sec-s5b", "violations-scope")[0])
+    assert "z biezacym tygodniem do D = 2026-10-19" in scope
+    footer = Parsed.txt(p.role("sec-s5b", "conv-footer")[0])
+    assert "TWR od S = 2026-03-02" in footer and "z biezacym tygodniem do D = 2026-10-19" in footer
+    sec = p.sec_text("sec-s5b").lower()
+    assert "indeks" not in sec and "i_sat" not in sec and "pelne tygodnie" not in sec
+
+
+def test_s3_aggregates_state_and_closed_since_risk_count(monkeypatch):
+    # ZZZ zamknieta po ocenie (wiersz oceny, brak na D); CCC rdzen - nie budzetowa, nie liczona
+    rr = [make_rr(1, "AAA"), make_rr(9, "ZZZ"), make_rr(7, "CCC", instrument_type="etf", is_core=True)]
+    s3, _, _, _ = s3s4(monkeypatch, risk_rows=rr, open_positions=[make_pos(1, "AAA")])
+    assert s3["closed_since_risk"] == 1
+    p = Parsed(model.render_s3_html(sat_of(s3=s3)))
+    scope = p.role("sec-s3", "agg-scope")[0]
+    t = Parsed.txt(scope)
+    assert "stan oceny ryzyka 2026-10-16" in t and "zamkniete od tej daty" in t
+    nums = [r for r in p.nums("sec-s3") if Parsed.txt(r) == "1" and "risk_daily vs positions_as_of(D)" in r["attrs"]["data-conv"]]
+    assert len(nums) == 1
+    footer = Parsed.txt(p.role("sec-s3", "conv-footer")[0])
+    assert "agregaty = stan oceny ryzyka 2026-10-16, pozycje zamkniete od tej daty: 1" in footer
+    assert_nums_have_conv(p, "sec-s3")
+
+
+def test_s3_closed_since_risk_zero_when_all_open(monkeypatch):
+    s3, _, _, _ = s3s4(monkeypatch, risk_rows=[make_rr(1, "AAA")], open_positions=[make_pos(1, "AAA")])
+    assert s3["closed_since_risk"] == 0
+    p = Parsed(model.render_s3_html(sat_of(s3=s3)))
+    assert "pozycje zamkniete od tej daty: 0" in Parsed.txt(p.role("sec-s3", "conv-footer")[0])

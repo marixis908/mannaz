@@ -563,8 +563,16 @@ def _build_s3_s4(
             )
         pos_rows.append(row)
     pos_rows.sort(key=lambda r: (str(r["name"]), r["rachunek"]))
+    # Ocena planisty D2-r1 pkt 3: liczba pozycji z oceny ryzyka (budzetowych) zamknietych
+    # od daty oceny = pary (rachunek, instrument_id) z risk_daily na d_risk nieobecne na D
+    # (odczyt roznicy zbiorow kluczy, bez przeliczania agregatow).
+    open_keys = {(p["rachunek"], p["instrument_id"]) for p in open_positions}
+    closed_since_risk = len({
+        (rr["rachunek"], rr["instrument_id"]) for rr in risk_rows
+        if is_risk_budget_eligible(rr["instrument_type"], rr["is_core"])
+    } - open_keys)
     s3 = {
-        "status": "ok", "d": d, "risk_date": d_risk, "names": names,
+        "status": "ok", "d": d, "risk_date": d_risk, "names": names, "closed_since_risk": closed_since_risk,
         "sum_open_risk_pct": sum_open, "themes": themes or {},
         "limits": {"l1": LEVEL1_PCT, "l2": LEVEL2_PCT, "l3": LEVEL3_PCT},
         "positions": pos_rows,
