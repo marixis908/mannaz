@@ -35,6 +35,12 @@ Bezpieczeństwo (repo PUBLICZNE — patrz brief D4):
       ten string NIGDY nie opuszcza tego pliku poza `model.account_label()`
       (pierwsze słowo); nie trafia do payloadu ani do żadnego printu.
 
+Rewizja 2 (brief D2): `--date` i `--risk-date` opcjonalne. Domyslnie D =
+`mannaz.risk.resolve_default_risk_date` (B-36), D ryzyka = max(risk_date) <= D.
+Nowe sekcje (S1, S3-S9) renderuje statycznie `model.render_*_html` (kazda liczba
+z atrybutem `data-conv`), dane czytane z bazy/modulow mannaz, bez liczenia metryk.
+Kod wyjscia 0 takze przy braku daty D (HTML z `brak pomiaru`).
+
 Konwencja liczb w JSON osadzonym w HTML: KAŻDA wartość pochodząca z
 `Decimal` jest serializowana jako STRING (zachowanie precyzji, zero
 zaokrągleń niejawnych przez float) — patrz `_json_default`. JS w
@@ -65,9 +71,18 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 import model  # scripts/dashboard/model.py — czyste funkcje, bez DB
 
+from mannaz import fifo as fifo_mod  # _FIFO_ROW_TYPES: row_type zmieniajace ilosc (Q1)
+from mannaz.cycle import DEFAULT_MANUAL_DIR, load_buy_below_stop_events
 from mannaz.db import get_connection
 from mannaz.fifo import positions_as_of
+from mannaz.provenance import code_sha
+from mannaz.satellite import L_MAX, L_REL, load_account_values_dir, run_satellite_stage
 from mannaz.risk import (
+    LEVEL1_PCT,
+    LEVEL2_PCT,
+    LEVEL3_PCT,
+    level1_by_name,
+    resolve_default_risk_date,
     read_kontraktowy_rows,  # kontrakt §2: import i wywołanie wprost, bez zmian w kodzie
     open_positions_as_of,
     resolve_position_price_coverage,
@@ -429,7 +444,314 @@ def _fetch_risk_rows(cur, d_risk: date) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any], dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Rewizja 2 (brief D2) - odczyty dla sekcji S1, S3-S9. Zasada nadrzedna:
+# dashboard CZYTA z tabel/widokow/funkcji mannaz.*, nie liczy metryk;
+# generator robi wylacznie agregacje (sumy) i przewalutowanie przy agregacji.
+# ---------------------------------------------------------------------------
+
+BRAK_NO_D = "brak pomiaru: brak daty D wg B-36 (brak kompletnej daty w cenach i KONTRAKTOWY)"
+BRAK_NO_ASSESSMENT = "brak pomiaru: brak oceny ryzyka <= D"
+S5B_WINDOWS = ("od_S", "24m")
+
+
+def _default_risk_date(cur, d: date) -> date | None:
+    cur.execute("SELECT max(risk_date) FROM risk_daily WHERE risk_date <= %s", (d,))
+    return cur.fetchone()[0]
+
+
+def _prev_risk_date(cur, d_risk: date) -> date | None:
+    """Okno zdarzen B-52: jak cycle.py (prev = max(risk_date) < data oceny)."""
+    cur.execute("SELECT max(risk_date) FROM risk_daily WHERE risk_date < %s", (d_risk,))
+    return cur.fetchone()[0]
+
+
+def _positions_newer_than_risk(cur, d: date, d_risk: date | None, open_keys: set[tuple]) -> set[tuple]:
+    """Q1: (rachunek, instrument_id) pozycji otwartych na D, ktore sa NOWSZE niz
+    ocena ryzyka: nieobecne w `positions_as_of(d_risk)` ALBO z wierszem
+    `transactions` w (d_risk, D] o typie zmieniajacym ilosc wg mannaz.fifo
+    (`_FIFO_ROW_TYPES`). Splity (corporate_events) nie sa wierszami transactions."""
+    if d_risk is None or not d_risk < d:
+        return set()
+    keys_risk = {(p["rachunek"], p["instrument_id"]) for p in positions_as_of(cur, d_risk)}
+    cur.execute(
+        "SELECT DISTINCT rachunek, instrument_id FROM transactions "
+        "WHERE transaction_date > %s AND transaction_date <= %s AND row_type = ANY(%s)",
+        (d_risk, d, list(fifo_mod._FIFO_ROW_TYPES)),
+    )
+    changed = {tuple(r) for r in cur.fetchall()}
+    return {k for k in open_keys if k not in keys_risk or k in changed}
+
+
+def _kontraktowy_status(cur, d: date, has_open_futures: bool) -> dict[str, Any]:
+    """Kompletnosc rozliczenia KONTRAKTOWY (M77): to samo wywolanie co w KS."""
+    try:
+        krows = read_kontraktowy_rows(cur, d)
+        max_date = max((r["transaction_date"] for r in krows), default=None)
+        check_kontraktowy_coverage(len(krows), max_date, has_open_futures, d)
+        return {"ok": True, "message": None}
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+def _risk_unavailable_reason(d_risk: date | None, provenance: model.ProvenanceResult) -> str | None:
+    if d_risk is None:
+        return BRAK_NO_ASSESSMENT
+    if not provenance.passed:
+        text = f"brak pomiaru: sekcja ryzyka, pochodzenie {provenance.overall_status}"
+        if provenance.failed_tests:
+            text += ": " + "; ".join(provenance.failed_tests)
+        if provenance.note:
+            text += f" ({provenance.note})"
+        return text
+    return None
+
+
+def _build_s3_s4(
+    cur, d: date, d_risk: date | None, provenance: model.ProvenanceResult,
+    risk_rows: list[dict[str, Any]], risk_by_key: dict[tuple, dict[str, Any]],
+    open_positions: list[dict[str, Any]], instruments: dict[int, dict[str, Any]],
+    newer_keys: set[tuple], sum_open: Decimal | None, themes: dict[str, Decimal] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    reason = _risk_unavailable_reason(d_risk, provenance)
+    if reason:
+        return {"status": "brak", "reason": reason}, {"status": "brak", "reason": reason}
+    assert d_risk is not None
+    labels = {rr["name_key"]: rr["name_label"] for rr in risk_rows if rr["name_key"] is not None and rr["name_label"]}
+    items = [
+        (rr["name_key"], is_risk_budget_eligible(rr["instrument_type"], rr["is_core"]), rr["broker_ticker"],
+         rr["settlement_currency"], rr["risk_pct_satellite_capital"], rr["name_risk_pct"], rr["level1_breach"])
+        for rr in risk_rows
+    ]
+    names = [
+        {"label": n.label, "pct": n.pct, "breach": n.breach, "incomplete": n.incomplete, "n_members": len(n.members)}
+        for n in level1_by_name(items, labels)
+    ]
+    prev = _prev_risk_date(cur, d_risk)
+    events: list[Any] | None = None
+    events_error: str | None = None
+    try:
+        events = load_buy_below_stop_events(cur, d_risk, prev)
+    except Exception as exc:  # noqa: BLE001 - sekcja ma byc "brak pomiaru", nie wyjatek
+        events_error = type(exc).__name__
+        cur.connection.rollback()
+    event_date_by_key: dict[tuple, date] = {}
+    for ev in events or []:
+        k = (ev.rachunek, ev.broker_ticker, ev.settlement_currency)
+        if k not in event_date_by_key or ev.txn_date > event_date_by_key[k]:
+            event_date_by_key[k] = ev.txn_date
+    newer_reason = f"brak pomiaru: pozycja nowsza niz ocena ryzyka {d_risk.isoformat()}"
+    pos_rows: list[dict[str, Any]] = []
+    for p in open_positions:
+        if not is_risk_budget_eligible(p["instrument_type"], p["is_core"]):
+            continue
+        instr = instruments.get(p["instrument_id"]) or {}
+        name = instr.get("name") or p["broker_ticker"]
+        label = f"{model.account_label(p['rachunek'])} ({p['settlement_currency']})"
+        row: dict[str, Any] = {"name": name, "rachunek": label}
+        rr = risk_by_key.get((p["rachunek"], p["instrument_id"], p["settlement_currency"]))
+        if (p["rachunek"], p["instrument_id"]) in newer_keys:
+            row.update(state="nowsza", reason=newer_reason)
+        elif rr is None:
+            row.update(state="brak_wiersza", reason=f"brak pomiaru: brak wiersza w ocenie ryzyka {d_risk.isoformat()}")
+        else:
+            row.update(
+                state="ok", reason=None,
+                risk_pct=rr["risk_pct_satellite_capital"], name_pct=rr["name_risk_pct"], breach=rr["level1_breach"],
+                stop_effective=rr["stop_effective"], stop_source=rr["stop_source"], quote_currency=rr["quote_currency"],
+                buy_below_stop_date=event_date_by_key.get((p["rachunek"], p["broker_ticker"], p["settlement_currency"])),
+            )
+        pos_rows.append(row)
+    pos_rows.sort(key=lambda r: (str(r["name"]), r["rachunek"]))
+    s3 = {
+        "status": "ok", "d": d, "risk_date": d_risk, "names": names,
+        "sum_open_risk_pct": sum_open, "themes": themes or {},
+        "limits": {"l1": LEVEL1_PCT, "l2": LEVEL2_PCT, "l3": LEVEL3_PCT},
+        "positions": pos_rows,
+    }
+    event_rows = None
+    if events is not None:
+        event_rows = [
+            {
+                "name": ev.broker_ticker, "rachunek": f"{model.account_label(ev.rachunek)} ({ev.settlement_currency})",
+                "txn_date": ev.txn_date, "price_quote": ev.price_quote, "quote_currency": ev.quote_currency,
+                "stop_before": ev.stop_before, "stop_before_date": ev.stop_before_date,
+            }
+            for ev in events
+        ]
+    s4 = {
+        "status": "ok", "d": d, "risk_date": d_risk, "prev": prev, "positions": pos_rows,
+        "events": event_rows, "events_error": events_error,
+    }
+    return s3, s4
+
+
+def _registry_block(cur, table: str, date_col: str, d: date, select_expr: str, cols: tuple[str, ...]) -> dict[str, Any]:
+    cur.execute(f"SELECT count(*) FROM {table}")
+    total = cur.fetchone()[0]
+    cur.execute(
+        f"SELECT component, {select_expr} FROM {table} WHERE registry = 1 AND {date_col} <= %s GROUP BY component",
+        (d,),
+    )
+    by_component = {row[0]: dict(zip(cols, row[1:])) for row in cur.fetchall()}
+    return {"table_rows_total": total, "by_component": by_component}
+
+
+def _fetch_registry1(cur, d: date) -> dict[str, Any]:
+    """S5a: rejestr 1 z bazy (tabele M89, tylko dopisywane), stan na D."""
+    try:
+        viol = _registry_block(
+            cur, "satellite_mandate_violations", "window_end", d,
+            "count(*), min(window_start), max(window_end), string_agg(DISTINCT data_status, ' / ' ORDER BY data_status), "
+            "max(first_seen_run_at)",
+            ("n", "window_start_min", "window_end_max", "data_status", "first_seen_max"),
+        )
+        ev = _registry_block(
+            cur, "satellite_mandate_events", "event_date", d,
+            "count(*) FILTER (WHERE level = 'ostrzezenie'), count(*) FILTER (WHERE level = 'alert'), "
+            "min(event_date), max(event_date), string_agg(DISTINCT data_status, ' / ' ORDER BY data_status), "
+            "max(first_seen_run_at)",
+            ("n_warn", "n_alert", "date_min", "date_max", "data_status", "first_seen_max"),
+        )
+        cur.execute(
+            "SELECT component, window_start, window_end, max_dd, limit_value, data_status "
+            "FROM satellite_mandate_violations WHERE registry = 1 AND window_end <= %s "
+            "ORDER BY window_end DESC, component",
+            (d,),
+        )
+        viol["windows"] = [
+            dict(zip(("component", "window_start", "window_end", "max_dd", "limit_value", "data_status"), row))
+            for row in cur.fetchall()
+        ]
+    except Exception as exc:  # noqa: BLE001
+        cur.connection.rollback()
+        return {"status": "brak", "reason": f"brak pomiaru: odczyt rejestru 1 nieudany ({type(exc).__name__})"}
+    return {"status": "ok", "d": d, "limits": {"abs": L_MAX, "rel": L_REL}, "violations": viol, "events": ev}
+
+
+def _build_s5b_s9(conn, d: date, account_values_dir: Path | str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """S5b + S9 (Q2 = A): modul satelity na to samo D co S2; write=False, out_dir=None."""
+    try:
+        snapshots = load_account_values_dir(account_values_dir if account_values_dir is not None else DEFAULT_MANUAL_DIR)
+        report = run_satellite_stage(conn, d, out_dir=None, write=False, snapshots=snapshots).report
+    except Exception as exc:  # noqa: BLE001 - tresc wyjatku moze niesc dane; tylko nazwa klasy
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        reason = f"brak pomiaru: modul satelity: {type(exc).__name__}"
+        return {"status": "brak", "reason": reason}, {"status": "brak", "reason": reason}
+    windows: dict[str, Any] = {}
+    for wname in S5B_WINDOWS:
+        w = report["windows"].get(wname)
+        if w is None:
+            continue
+        windows[wname] = {
+            "from": w["from"], "to": w["to"], "twr": w["twr"], "max_dd_abs": w["abs"]["max_dd"],
+            "mandate": {"status": w["mandate"]["status"], "violations": list(w["mandate"]["violations"])},
+            "bench": {
+                k: {"delta_w_pln": b["delta_w_pln"], "infeasible": b["infeasible"], "max_dd_rel": b["max_dd_rel"]}
+                for k, b in w["bench"].items()
+            },
+        }
+    gate = report.get("gate")
+    s5b = {
+        "status": "ok", "d": d, "S": report.get("S"),
+        "data_verified": bool(report["data_verified"]),
+        "reasons": list(report.get("data_unverified_reasons") or []),
+        "gate": None if gate is None else {"result": gate.get("result"), "ok": gate.get("ok")},
+        "windows": windows,
+        "alerts": {
+            c: {"limit": a["limit"], "current_drawdown": a["current_drawdown"], "state": a["state"]}
+            for c, a in (report.get("alerts") or {}).items()
+        },
+        "limits": {"abs": L_MAX, "rel": L_REL},
+        "conventions_currency": report["conventions"]["currency"],
+        "benchmarks": {k: f"{v['symbol']} ({v['source']})" for k, v in report["conventions"]["benchmarks"].items()},
+    }
+    att = report.get("attribution")
+    if not att or not att.get("windows"):
+        return s5b, {"status": "brak", "reason": "brak pomiaru: modul nie zwrocil atrybucji"}
+    s9_windows: dict[str, Any] = {}
+    for wname in S5B_WINDOWS:
+        w = att["windows"].get(wname)
+        if w is None:
+            continue
+        acc = w["by_account"]
+        s9_windows[wname] = {
+            "from": w["from"], "to": w["to"], "complete": bool(w["control"]["complete"]),
+            "sum_lokalny": sum(r["lokalny"] for r in acc),
+            "sum_fx": sum(r["fx"] for r in acc),
+            "sum_total": sum(r["total"] for r in acc),
+            "by_currency": [
+                {"key": r["key"], "lokalny": r["lokalny"], "fx": r["fx"], "total": r["total"]}
+                for r in w["by_currency"]
+            ],
+        }
+    return s5b, {"status": "ok", "d": d, "windows": s9_windows, "conventions": att["conventions"]}
+
+
+def _build_s7(cur, d: date, open_positions: list[dict[str, Any]], instruments: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """S7: archetype_assignments aktywny na D (valid_from <= D, valid_to NULL lub > D)."""
+    ids = sorted({p["instrument_id"] for p in open_positions})
+    active: dict[int, list[tuple]] = {}
+    if ids:
+        cur.execute(
+            "SELECT instrument_id, archetype, archetype_key, key_version FROM archetype_assignments "
+            "WHERE instrument_id = ANY(%s) AND valid_from <= %s AND (valid_to IS NULL OR valid_to > %s)",
+            (ids, d, d),
+        )
+        for iid, arch, key, ver in cur.fetchall():
+            active.setdefault(iid, []).append((arch, key, ver))
+    rows: list[dict[str, Any]] = []
+    for iid in ids:
+        instr = instruments.get(iid) or {}
+        base = {"name": instr.get("name") or instr.get("broker_ticker") or str(iid), "theme": instr.get("theme")}
+        found = active.get(iid, [])
+        if not found:
+            rows.append({**base, "state": "brak", "reason": "brak pomiaru: brak przypisania archetypu",
+                         "archetype": None, "archetype_key": None, "key_version": None})
+        elif len(found) > 1:
+            rows.append({**base, "state": "brak", "reason": f"brak pomiaru: niejednoznaczne przypisanie archetypu ({len(found)} aktywnych wierszy)",
+                         "archetype": None, "archetype_key": None, "key_version": None})
+        else:
+            rows.append({**base, "state": "ok", "reason": None, "archetype": found[0][0],
+                         "archetype_key": found[0][1], "key_version": found[0][2]})
+    rows.sort(key=lambda r: str(r["name"]))
+    return {"status": "ok", "d": d, "rows": rows}
+
+
+def build_no_date_payload(conn, d_source: str = "brak") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Brak D wg B-36 (i brak --date): HTML renderowany, kazda sekcja `brak pomiaru`."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*), max(fetched_at), max(id) FROM source_runs")
+        n_runs, max_fetched, max_id = cur.fetchone()
+    satellites: dict[str, Any] = {
+        "no_d": BRAK_NO_D,
+        "s1": {
+            "d": None, "d_source": d_source, "d_risk": None, "risk_source": None, "price_n": None, "price_N": None,
+            "kontraktowy": None, "code_sha": code_sha(), "source_runs_n": n_runs, "source_runs_max_fetched_at": max_fetched,
+        },
+    }
+    payload: dict[str, Any] = {
+        "no_d": BRAK_NO_D,
+        "meta": {
+            "d_composition": None, "d_risk": None, "generated_at": datetime.now().astimezone(),
+            "pin": {"max_source_run_id": max_id, "risk_computed_at": None},
+        },
+        "satellites": satellites,
+    }
+    return payload, {"no_d": True, "brak_sections": model.brak_sections(satellites)}
+
+
+def build_dashboard_payload(
+    conn,
+    d: date,
+    d_risk: date | None,
+    d_source: str = "podane",
+    risk_source: str = "podane",
+    account_values_dir: Path | str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     with conn.cursor() as cur:
         open_positions = open_positions_as_of(cur, d)
         instrument_ids = sorted({p["instrument_id"] for p in open_positions})
@@ -457,7 +779,18 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
         # na jedną pozycję wejściową, bez pomijania), PRZED konsolidacją:
         # `consolidate_positions` tworzy NOWE dicty (kopie), więc klucz "risk"
         # dopisany później do `rows` nie trafiłby do wierszy skonsolidowanych. ---
-        provenance = _evaluate_provenance(cur, d_risk)
+        if d_risk is None:
+            provenance = model.ProvenanceResult(
+                passed=False, overall_status="BRAK OCENY", tests=[],
+                failed_tests=["brak oceny ryzyka <= D"], note="brak oceny ryzyka <= D",
+            )
+        else:
+            provenance = _evaluate_provenance(cur, d_risk)
+        # Q1 (decyzja planisty 2026-10-19): sklad na D, ryzyko z oceny <= D; pozycja
+        # nowsza niz ocena -> `brak pomiaru` (nie stary stop/ryzyko, nie 0).
+        newer_keys = _positions_newer_than_risk(
+            cur, d, d_risk, {(p["rachunek"], p["instrument_id"]) for p in open_positions}
+        )
         risk_rows: list[dict[str, Any]] = []
         risk_by_key: dict[tuple, dict[str, Any]] = {}
         sum_open_risk_pct = None
@@ -482,6 +815,8 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
             risk_row = risk_by_key.get((raw_rachunek, r["instrument_id"], r["settlement_currency"])) if provenance.passed else None
             if not provenance.passed:
                 r["risk"] = {"brak": "sekcja ryzyka: " + "; ".join(provenance.failed_tests)}
+            elif (raw_rachunek, r["instrument_id"]) in newer_keys:
+                r["risk"] = {"brak": f"brak pomiaru: pozycja nowsza niz ocena ryzyka {d_risk.isoformat()}"}
             elif risk_row is None:
                 r["risk"] = {"brak": "brak wiersza na D ryzyka"}
             else:
@@ -610,10 +945,35 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
         multiplier_missing = sum(1 for r in fut_rows if r["multiplier"] is None)
         theme_null = sum(1 for r in rows if r["instrument_type"] in ("equity", "etf") and not r["theme"])
         brak_wiersza_ryzyka = sum(1 for r in rows if r["risk"].get("brak") == "brak wiersza na D ryzyka")
+        nowsze_niz_ocena = sum(
+            1 for r in rows if str(r["risk"].get("brak") or "").startswith("brak pomiaru: pozycja nowsza niz ocena")
+        )
 
         scalenia_ok = sum(c.merge_count for c in consolidated.values())
         scalenia_niejednoznaczne = sum(c.ambiguous_count for c in consolidated.values())
         scalenia_mieszana_waluta = sum(c.mixed_currency_merge_count for c in consolidated.values())
+
+        # --- Rewizja 2 (D2): S1, S3-S9 (czytane z bazy / modulow mannaz) ---
+        cur.execute("SELECT count(*) FROM source_runs")
+        (source_runs_n,) = cur.fetchone()
+        s3, s4 = _build_s3_s4(
+            cur, d, d_risk, provenance, risk_rows, risk_by_key, open_positions, instruments,
+            newer_keys, sum_open_risk_pct, theme_budgets,
+        )
+        s5a = _fetch_registry1(cur, d)
+        s7 = _build_s7(cur, d, open_positions, instruments)
+        s5b, s9 = _build_s5b_s9(conn, d, account_values_dir)
+        satellites: dict[str, Any] = {
+            "no_d": None,
+            "s1": {
+                "d": d, "d_source": d_source, "d_risk": d_risk, "risk_source": risk_source if d_risk is not None else None,
+                "price_n": t27_ok + t27_stale, "price_N": len(rows),
+                "kontraktowy": _kontraktowy_status(cur, d, len(buckets["FUT"]) > 0),
+                "code_sha": code_sha(), "source_runs_n": source_runs_n,
+                "source_runs_max_fetched_at": max_source_run_fetched_at,
+            },
+            "s3": s3, "s4": s4, "s5a": s5a, "s5b": s5b, "s7": s7, "s9": s9,
+        }
 
         payload: dict[str, Any] = {
             "meta": {
@@ -645,6 +1005,7 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
                 "calosc": calosc,
                 "sat_share_of_calosc": sat_share,
             },
+            "satellites": satellites,
             "positions": {name: c.positions for name, c in consolidated.items()},
             "risk": {
                 "provenance": asdict(provenance),
@@ -677,6 +1038,7 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
                 "scalenia_mieszana_waluta": scalenia_mieszana_waluta,
                 "rynek_nieustalony": rynek_nieustalony,
                 "brak_wiersza_ryzyka": brak_wiersza_ryzyka,
+                "pozycje_nowsze_niz_ocena": nowsze_niz_ocena,
                 "multiplier_missing": multiplier_missing,
                 "theme_null": theme_null,
                 "risk_price_stale": {"n": risk_stale_n, "N": risk_stale_N} if provenance.passed else None,
@@ -709,6 +1071,10 @@ def build_dashboard_payload(conn, d: date, d_risk: date) -> tuple[dict[str, Any]
             "t27_ok": t27_ok,
             "t27_stale": t27_stale,
             "t27_incomplete": t27_incomplete,
+            "brak_sections": model.brak_sections(satellites),
+            "s5b_status": s5b.get("status"),
+            "s5b_data_verified": s5b.get("data_verified") if s5b.get("status") == "ok" else None,
+            "newer_positions": nowsze_niz_ocena,
         }
         return payload, counts_for_stdout
 
@@ -721,12 +1087,33 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"Nie umiem zserializowac typu {type(obj)!r} do JSON dashboardu")
 
 
+def _finite(obj: Any) -> Any:
+    """NaN/Infinity nie sa poprawnym JSON (JSON.parse w przegladarce padnie) -> None."""
+    if isinstance(obj, float):
+        return obj if obj == obj and obj not in (float("inf"), float("-inf")) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite(v) for v in obj]
+    return obj
+
+
+S1_PLACEHOLDER = "<!--MANNAZ-S1-->"
+SECTIONS_PLACEHOLDER = "<!--MANNAZ-SECTIONS-->"
+
+
 def render_template(payload: dict[str, Any]) -> str:
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     if JSON_PLACEHOLDER not in template:
         raise RuntimeError(f"template.html nie zawiera punktu wstrzyknięcia {JSON_PLACEHOLDER!r}")
-    json_str = json.dumps(payload, default=_json_default, ensure_ascii=False)
-    json_str_safe = json_str.replace("</", "<\\/")
+    for ph in (S1_PLACEHOLDER, SECTIONS_PLACEHOLDER):
+        if ph not in template:
+            raise RuntimeError(f"template.html nie zawiera punktu wstrzyknięcia {ph!r}")
+    # Sekcje rew. 2 (statyczny HTML z data-conv) - PRZED wstrzyknieciem JSON.
+    template = template.replace(S1_PLACEHOLDER, model.render_s1_html(payload["satellites"]))
+    template = template.replace(SECTIONS_PLACEHOLDER, model.render_sections_html(payload))
+    json_str = json.dumps(_finite(payload), default=_json_default, ensure_ascii=False)
+    json_str_safe = json_str.replace("</", "<\\/").replace("<!--", "<" + chr(92) + "u0021--")
     # Pin w statycznym HTML (nie tylko w JS) — D6/D7 czytają go bez uruchamiania skryptu.
     pin = payload["meta"]["pin"]
     risk_ca = pin["risk_computed_at"]
@@ -745,22 +1132,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Generator dashboardu portfela satelity (kontrakt: tmp/dashboard/kontrakt-danych.md)"
     )
-    p.add_argument("--date", required=True, help="D składu (YYYY-MM-DD), nigdy domyślny")
-    p.add_argument("--risk-date", required=True, help="D ryzyka (YYYY-MM-DD), nigdy domyślny")
+    p.add_argument("--date", default=None, help="D składu (YYYY-MM-DD); domyślnie mannaz.risk.resolve_default_risk_date (B-36)")
+    p.add_argument("--risk-date", default=None, help="D ryzyka (YYYY-MM-DD); domyślnie max(risk_date) <= D")
     p.add_argument("--out", required=True, help="Ścieżka pliku wyjściowego .html")
+    p.add_argument(
+        "--account-values-dir", default=str(DEFAULT_MANUAL_DIR),
+        help="Katalog kotwic M78 account_values_RRRR-MM-DD.csv (domyślnie mannaz.cycle.DEFAULT_MANUAL_DIR)",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    d = date.fromisoformat(args.date)
-    d_risk = date.fromisoformat(args.risk_date)
     out_path = Path(args.out)
 
     conn = get_connection()
     conn.read_only = True
     try:
-        payload, counts = build_dashboard_payload(conn, d, d_risk)
+        if args.date:
+            d: date | None = date.fromisoformat(args.date)
+            d_source = "podane"
+        else:
+            d = resolve_default_risk_date(conn)
+            d_source = "domyslne B-36"
+        if d is None:
+            payload, counts = build_no_date_payload(conn)
+            d_risk = None
+        else:
+            if args.risk_date:
+                d_risk = date.fromisoformat(args.risk_date)
+                risk_source = "podane"
+            else:
+                with conn.cursor() as cur:
+                    d_risk = _default_risk_date(cur, d)
+                risk_source = "domyslne: max(risk_date) <= D"
+            payload, counts = build_dashboard_payload(
+                conn, d, d_risk, d_source, risk_source, args.account_values_dir
+            )
     finally:
         conn.close()
 
@@ -772,8 +1180,14 @@ def main(argv: list[str] | None = None) -> int:
     out_path.write_bytes(data)
     sha = hashlib.sha256(data).hexdigest()
 
-    print(f"D skladu: {d.isoformat()}")
-    print(f"D ryzyka: {d_risk.isoformat()}")
+    print(f"D skladu: {d.isoformat() if d else 'brak (B-36)'} ({d_source})")
+    print(f"D ryzyka: {d_risk.isoformat() if d_risk else 'brak'}")
+    if counts.get("no_d"):
+        print("Brak daty D wg B-36: wszystkie sekcje brak pomiaru")
+        print(f"Sekcje brak pomiaru: {len(counts['brak_sections'])}")
+        print(f"Plik zapisany: {out_path}")
+        print(f"sha256: {sha}")
+        return 0
     print(f"Pozycje przed konsolidacja (wszystkie zbiory): {counts['before']}")
     print(f"Pozycje po konsolidacji (wszystkie zbiory): {counts['after']}")
     print(f"SAT po konsolidacji: {counts['sat']}  CORE: {counts['core']}  FUT: {counts['fut']}")
@@ -782,6 +1196,9 @@ def main(argv: list[str] | None = None) -> int:
         f"ok={counts['t27_ok']} stale={counts['t27_stale']} incomplete={counts['t27_incomplete']}"
     )
     print(f"Pochodzenie ryzyka (zbiorczo): {counts['provenance_overall']}")
+    print(f"Pozycje nowsze niz ocena ryzyka: {counts['newer_positions']}")
+    print(f"S5b modul satelity: {counts['s5b_status']}; dane zweryfikowane: {counts['s5b_data_verified']}")
+    print(f"Sekcje brak pomiaru (cale): {len(counts['brak_sections'])} ({', '.join(counts['brak_sections'])})")
     for name, status in counts["provenance_tests"]:
         print(f"  {name}: {status}")
     print(f"Plik zapisany: {out_path}")

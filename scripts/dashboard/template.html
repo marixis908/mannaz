@@ -134,6 +134,10 @@
   .risk-banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 0.9rem; }
   .risk-banner.ok { background: rgba(31,157,85,0.12); border: 1px solid var(--ok); }
   .risk-banner.bad { background: rgba(208,57,43,0.12); border: 1px solid var(--bad); }
+  .num { font-variant-numeric: tabular-nums; }
+  caption.note { text-align: left; caption-side: top; }
+  details > summary { cursor: pointer; margin: 8px 0; color: var(--text-dim); }
+  .kpi .value.small .nd { font-weight: 400; }
 </style>
 </head>
 <body>
@@ -142,33 +146,38 @@
 </div>
 <h1>Dashboard portfela satelity</h1>
 <div id="header-panel" class="panel"></div>
+<!--MANNAZ-S1-->
 
-<section id="sec-composition">
+<!-- Sekcje rew. 1 (JS): atrybut data-conv-default = konwencja liczb w sekcji (waluta|warstwa|zrodlo|data);
+     {D} i {DR} podstawiane w runtime (D skladu / data oceny ryzyka); JS nadaje go elementom liczbowym bez wlasnego data-conv. -->
+<section id="sec-composition" data-conv-default="PLN|cena close_raw, bez dywidend (T27)|prices_daily x NBP A|{D}">
   <h2>2. Skład</h2>
   <div id="composition-panel" class="panel"></div>
 </section>
 
-<section id="sec-concentration">
+<section id="sec-concentration" data-conv-default="udzial % BW|cena close_raw (T27)|prices_daily x NBP A, mianownik BW|{D}">
   <h2>3. Koncentracja</h2>
   <div id="concentration-panel" class="panel"></div>
 </section>
 
-<section id="sec-positions">
+<section id="sec-positions" data-conv-default="waluta wg kolumny (notowania / rozliczenia / PLN)|cena close_raw (T27), wynik bez dywidend; stop split_adj|prices_daily, transactions, risk_daily, NBP A|D skladu {D}; ocena ryzyka {DR}">
   <h2>4. Tabela pozycji</h2>
   <div id="positions-panel" class="panel"></div>
 </section>
 
-<section id="sec-risk">
+<section id="sec-risk" data-conv-default="% kapitalu satelity (KS)|cena split_adj (close_d)|risk_daily|{DR}">
   <h2>5. Ryzyko portfela</h2>
   <div id="risk-panel" class="panel"></div>
 </section>
 
-<section id="sec-contracts">
+<section id="sec-contracts" data-conv-default="PLN|nominal (qty x mnoznik x cena bazy)|prices_daily x NBP A, KONTRAKTOWY|{D}">
   <h2>6. Kontrakty</h2>
   <div id="contracts-panel" class="panel"></div>
 </section>
 
-<section id="sec-footer">
+<!--MANNAZ-SECTIONS-->
+
+<section id="sec-footer" data-conv-default="licznik (bez waluty)|bez warstwy|dane generatora|{D}">
   <h2>7. Stopka jakości danych</h2>
   <div id="footer-panel" class="panel"></div>
 </section>
@@ -874,7 +883,8 @@
     var banner = el("div", { cls: "risk-banner " + (overall === "PASS" ? "ok" : "bad") });
     var headline = overall === "PASS"
       ? "Pochodzenie: test zachowania, bez SHA w bazie — PASS"
-      : (overall === "NIEROZSTRZYGNIETY" ? "Pochodzenie: NIEROZSTRZYGNIETY" : "Pochodzenie: FAIL");
+      : (overall === "NIEROZSTRZYGNIETY" ? "Pochodzenie: NIEROZSTRZYGNIETY"
+        : (overall === "BRAK OCENY" ? "Ocena ryzyka: brak pomiaru: brak oceny ryzyka <= D" : "Pochodzenie: FAIL"));
     banner.appendChild(el("div", { text: headline }));
 
     var ul = el("ul", { cls: "plain" });
@@ -1077,6 +1087,7 @@
       ["Scalenia z mieszaną walutą rozliczenia", q.scalenia_mieszana_waluta],
       ["Rynek nieustalony", q.rynek_nieustalony],
       ["Pozycje bez wiersza ryzyka na D ryzyka", q.brak_wiersza_ryzyka],
+      ["Pozycje nowsze niz ocena ryzyka (brak pomiaru ryzyka i stopu)", q.pozycje_nowsze_niz_ocena],
       ["multiplier_missing (kontrakty)", q.multiplier_missing],
       ["theme NULL (equity/etf)", q.theme_null],
       ["VALUE/QUALITY/TREND bez pomiaru", q.value_quality_trend_brak_count],
@@ -1122,6 +1133,35 @@
   // =======================================================================
   // Start
   // =======================================================================
+  // Brak daty D wg B-36: sekcje rew. 1 = brak pomiaru z powodem (sekcje S1, S3-S9 sa statyczne).
+  function renderNoDate() {
+    ["header-panel", "composition-panel", "concentration-panel", "positions-panel", "risk-panel",
+     "contracts-panel", "footer-panel"].forEach(function (id) {
+      var p = document.getElementById(id);
+      p.textContent = "";
+      p.appendChild(el("span", { cls: "na", text: DATA.no_d, title: DATA.no_d }));
+    });
+    document.getElementById("app-footer").textContent = "Wygenerowano lokalnie, bez połączenia sieciowego. Dashboard prywatny — nie publikować.";
+  }
+
+  // Zasada 4: elementy liczbowe sekcji rew. 1 dostaja data-conv z data-conv-default sekcji
+  // (waluta|warstwa|zrodlo|data); sekcje statyczne (S1, S3-S9) maja wlasne data-conv w zrodle HTML.
+  function applyConvDefaults() {
+    var dStr = DATA.meta.d_composition || "brak";
+    var drStr = DATA.meta.d_risk || "brak";
+    document.querySelectorAll("section[data-conv-default]").forEach(function (sec) {
+      var conv = sec.getAttribute("data-conv-default").split("{DR}").join(drStr).split("{D}").join(dStr);
+      sec.querySelectorAll("td, .kpi .value, .bar-value, li").forEach(function (n) {
+        if (n.hasAttribute("data-conv") || !/\d/.test(n.textContent)) return;
+        n.setAttribute("data-conv", conv);
+      });
+    });
+  }
+
+  if (DATA.no_d) {
+    renderNoDate();
+    return;
+  }
   renderHeader();
   renderComposition();
   renderConcentration();
@@ -1129,6 +1169,7 @@
   renderRisk();
   renderContracts();
   renderFooter();
+  applyConvDefaults();
 })();
 </script>
 </body>
