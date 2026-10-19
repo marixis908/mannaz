@@ -326,6 +326,32 @@ def test_w8_emergency_run(monkeypatch, tmp_path, capsys, inserts):
            "tryb awaryjny tak" in out
 
 
+def test_w8b_select_error_logs_class_and_goes_emergency(monkeypatch, tmp_path, capsys, inserts):
+    # Decyzja planisty 1: blad SELECT uniwersum po udanym polaczeniu -> linia z nazwa
+    # klasy (bez tresci) i tryb awaryjny z pliku uniwersum.
+    import psycopg
+
+    make_universe_file(tmp_path)
+    raw = tmp_path / "raw"
+    conn = FakeConn()
+
+    def bad_select(cur, ids=None):
+        raise psycopg.ProgrammingError("tresc wyjatku nie moze trafic do logu")
+
+    monkeypatch.setattr(run_p3, "get_connection", lambda **kw: conn)
+    monkeypatch.setattr(run_p3, "select_estimates_universe", bad_select)
+    monkeypatch.setattr(run_p3, "run_estimates", functools.partial(
+        est.run_estimates, http_get=ok_get, sleep=lambda s: None))
+    with pytest.raises(SystemExit) as excinfo:
+        run_p3.main(["estimates", "--db-wait-s", "0", "--archive-root", str(raw)])
+    out = capsys.readouterr().out
+    assert "FPE-RUN: odczyt uniwersum nieudany (ProgrammingError)" in out.splitlines()
+    assert "tresc" not in out
+    assert conn.closed and inserts == []
+    assert "FPE-RUN: tryb awaryjny" in out and "tryb awaryjny tak" in out
+    assert excinfo.value.code == 4
+
+
 def test_w9_no_db_no_file_is_two(monkeypatch, tmp_path, capsys):
     raw = tmp_path / "raw"
     code = run_cli(monkeypatch, ["estimates", "--db-wait-s", "0", "--archive-root", str(raw)],

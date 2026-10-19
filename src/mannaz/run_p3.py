@@ -561,7 +561,8 @@ def cmd_estimates(args: argparse.Namespace) -> None:
                     universe = select_estimates_universe(cur, args.instrument_ids)
                 conn.rollback()
             except Exception as exc:
-                print(f"FPE-RUN: blad bazy ({type(exc).__name__})")
+                # Interpretacja 1 (planista): blad odczytu uniwersum = tryb awaryjny.
+                print(f"FPE-RUN: odczyt uniwersum nieudany ({type(exc).__name__})")
                 try:
                     conn.close()
                 except Exception:
