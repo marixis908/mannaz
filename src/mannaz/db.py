@@ -27,7 +27,7 @@ def load_dotenv_into_environ(env_path: Path = DEFAULT_ENV_PATH) -> None:
             os.environ[key] = value
 
 
-def get_connection() -> psycopg.Connection:
+def get_connection(connect_timeout: int | None = None) -> psycopg.Connection:
     load_dotenv_into_environ()
     password = os.environ.get("POSTGRES_PASSWORD")
     if not password:
@@ -35,10 +35,14 @@ def get_connection() -> psycopg.Connection:
             "POSTGRES_PASSWORD nie jest ustawione w środowisku ani w .env — "
             "sprawdź M\\.env (nie loguj tu wartości)."
         )
+    kwargs = {}
+    if connect_timeout is not None:  # tylko gdy podany; bez argumentu zachowanie bez zmian
+        kwargs["connect_timeout"] = connect_timeout
     return psycopg.connect(
         host=os.environ.get("MANNAZ_PG_HOST", "127.0.0.1"),
         port=int(os.environ.get("MANNAZ_PG_PORT", "5433")),
         dbname=os.environ.get("MANNAZ_PG_DB", "mannaz"),
         user=os.environ.get("MANNAZ_PG_USER", "mannaz"),
         password=password,
+        **kwargs,
     )

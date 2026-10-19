@@ -6,7 +6,8 @@
 # Kopia: robocopy do D:\mannaz-backup\estimates-raw, bez opcji lustra i
 # czyszczenia (nic w kopii nie jest usuwane). Kod robocopy >= 8 = blad kopii.
 # Weryfikacja: sha256 kazdego .body z tego przebiegu w kopii == raw_sha256 z meta.
-# Kod wyjscia: kod Pythona, chyba ze kopia/weryfikacja zawiodla (3).
+# Kod wyjscia: kod Pythona (0/1/2/4), chyba ze kopia/weryfikacja zawiodla (3);
+# przy 3 log dostaje linie "kod Pythona przed nadpisaniem: n".
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repo '.venv\Scripts\python.exe'
 $rawDir = Join-Path $repo 'data\estimates\raw'
@@ -123,6 +124,9 @@ finally {
     }
 }
 $code = $pyCode
-if ($copyFailed) { $code = 3 }
+if ($copyFailed) {
+    $code = 3
+    Write-Log "kod Pythona przed nadpisaniem: $pyCode"
+}
 Write-Log "kod wrappera: $code"
 exit $code

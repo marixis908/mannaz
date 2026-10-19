@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -122,8 +123,11 @@ class ArchiveEntry:
     error: str | None = None  # blad archiwizacji; blad HTTP jest w fetch.error
 
 
-def archive_snapshot(root: Path, fr: FetchResult) -> ArchiveEntry:
-    """Zapis wylaczny; czesciowe pliki po bledzie zostaja do audytu."""
+def archive_snapshot(root: Path, fr: FetchResult, instrument_id: int | None = None) -> ArchiveEntry:
+    """Zapis wylaczny; czesciowe pliki po bledzie zostaja do audytu.
+
+    instrument_id (A4) trafia do meta jako int albo null; body i raw_sha256 bez zmian.
+    """
     raw_ref = raw_sha256 = byte_count = meta_ref = None
     try:
         safe_symbol = re.sub(r"[^A-Za-z0-9._-]", "_", fr.source_symbol)
@@ -153,7 +157,7 @@ def archive_snapshot(root: Path, fr: FetchResult) -> ArchiveEntry:
         meta = {key: value for key, value in asdict(fr).items() if key != "body"}
         meta["fetched_at_utc"] = fr.fetched_at_utc.astimezone(timezone.utc).isoformat()
         meta.update(raw_ref=raw_ref, raw_sha256=raw_sha256, byte_count=byte_count,
-                    safe_symbol=safe_symbol)
+                    safe_symbol=safe_symbol, instrument_id=instrument_id)
         with meta_path.open("x", encoding="utf-8", newline="\n") as stream:
             json.dump(meta, stream, sort_keys=True, ensure_ascii=True)
             stream.write("\n")
@@ -373,6 +377,7 @@ class SymbolResult:
     meta_ref: str | None = None
     in_db: bool = False
     archived: bool = False
+    db_failed: bool = False  # A5: wyjatek przy zapisie do bazy (niezaleznie od 'error')
 
 
 @dataclass(frozen=True)
@@ -398,11 +403,16 @@ class RunSummary:
     skipped: int
     archive_root: str
     results: tuple = ()
+    emergency: bool = False  # A3: przebieg bez bazy (conn=None), tylko archiwum
 
 
 def run_estimates(conn, universe, *, archive_root, http_get=None, sleep=time.sleep,
                   pause_s=1.5, max_consecutive_429=3) -> RunSummary:
-    """R2: pobierz -> zarchiwizuj -> sparsuj -> wpisz -> commit, per symbol."""
+    """R2: pobierz -> zarchiwizuj -> sparsuj -> wpisz -> commit, per symbol.
+
+    conn=None to tryb awaryjny (A3): fetch -> archive_snapshot, bez parse i insert;
+    przerwy i reguly 429 bez zmian.
+    """
     root = Path(archive_root)
     sha = code_sha()
     results: list[SymbolResult] = []
@@ -423,36 +433,45 @@ def run_estimates(conn, universe, *, archive_root, http_get=None, sleep=time.sle
         parsed = ParsedSnapshot(status=None)
         error = None
         in_db = False
+        db_failed = False
         rows = 0
         try:
-            entry = archive_snapshot(root, fr)
-            if fr.body is not None:
+            entry = archive_snapshot(root, fr, instrument_id)
+            if conn is not None and fr.body is not None:
                 parsed = parse_quote_summary(fr.body)
             if entry.error is not None:
-                conn.rollback()
+                if conn is not None:
+                    conn.rollback()
                 error = f"archiwizacja: {entry.error}"
-            else:
+            elif conn is not None:
                 summary = _insert_commit(conn, instrument_id, entry, parsed, sha)
                 in_db = summary.snapshot_id is not None
                 rows = summary.inserted_rows
         except Exception as exc:  # blad jednego symbolu nie cofa poprzednich
             try:
-                conn.rollback()
+                if conn is not None:
+                    conn.rollback()
             except Exception:
                 pass
-            in_db, rows = False, 0
+            in_db, rows, db_failed = False, 0, True
             error = f"baza: {type(exc).__name__}"
         archived = entry is not None and entry.error is None
-        if error is None and fr.error is not None and not is_429:
-            error = fr.error
-        if (error is None and fr.error is None and parsed.status is not None
+        # Blad pobrania/odczytu nie znika pod bledem bazy: zostaje na poczatku 'error'
+        # (kod 1 ma pierwszenstwo przed 4); blad archiwizacji jak dotad wygrywa.
+        cause = fr.error if fr.error is not None and not is_429 else None
+        if (cause is None and fr.error is None and parsed.status is not None
                 and parsed.status.startswith(READ_ERROR_PREFIXES)):
-            error = f"odczyt: {parsed.status}"
+            cause = f"odczyt: {parsed.status}"
+        if cause is not None:
+            if error is None:
+                error = cause
+            elif db_failed:
+                error = f"{cause}; {error}"
         status = "429" if is_429 else ("blad" if error is not None else "ok")
         results.append(SymbolResult(
             instrument_id, symbol, fr.http_status, parsed.status, rows, status, error,
             entry.raw_ref if entry else None, entry.meta_ref if entry else None,
-            in_db, archived,
+            in_db, archived, db_failed,
         ))
         if consecutive >= max_consecutive_429:
             stopped = True
@@ -468,7 +487,142 @@ def run_estimates(conn, universe, *, archive_root, http_get=None, sleep=time.sle
         skipped=sum(1 for r in results if r.status == SKIPPED_AFTER_429),
         archive_root=str(root),
         results=tuple(results),
+        emergency=conn is None,
     )
+
+
+def db_only_count(summary: RunSummary) -> int:
+    """A5: snapshoty tylko w archiwum z powodu bazy - tryb awaryjny (wszystkie
+    zarchiwizowane) albo blad bazy przy zapisie symbolu (db_failed). Inne
+    archive_only (np. niezmapowany symbol) nie wchodza."""
+    return sum(
+        1 for r in summary.results
+        if r.archived and (summary.emergency or r.db_failed)
+    )
+
+
+def db_error_count(summary: RunSummary) -> int:
+    """Zarchiwizowane symbole, ktorych jedynym bledem jest blad bazy przy zapisie
+    ('baza:' na poczatku error); w kodzie wyjscia nie sa bledami (kod 4). Blad bazy
+    bez archiwum albo razem z bledem pobrania/odczytu zostaje bledem (kod 1)."""
+    return sum(1 for r in summary.results
+               if r.archived and r.db_failed and (r.error or "").startswith("baza:"))
+
+
+# ---------------------------------------------------------------------------
+# Etap A fpe-wait: czekanie na baze (A1) i zapasowe uniwersum (A2). Bez ilosci
+# i kosztow - tylko pary (instrument_id, yahoo_symbol).
+# ---------------------------------------------------------------------------
+
+
+def wait_for_db(connect, *, deadline_s=600, interval_s=15, attempt_timeout_s=10,
+                clock=time.monotonic, sleep=time.sleep, log=print):
+    """A1: ponawiaj connect(connect_timeout=...) do deadline_s; zwraca conn albo None.
+
+    Limit liczy clock() od startu czekania, nie liczba prob. Pierwsza proba zawsze
+    sie odbywa (deadline_s=0 = jedna proba bez sleep); kolejna tylko gdy po przerwie
+    clock() - start < deadline_s. Log: jedna linia ASCII na probe, tylko nazwa klasy
+    wyjatku (R7: bez tresci); t = sekundy od startu, zaokraglone do calkowitych.
+    """
+    sep = " \u00b7 "
+    start = clock()
+    attempt = 0
+    while True:
+        attempt += 1
+        elapsed = int(round(clock() - start))
+        try:
+            conn = connect(connect_timeout=attempt_timeout_s)
+        except Exception as exc:
+            log(sep.join([f"baza: proba {attempt}", f"t={elapsed}s", type(exc).__name__]))
+        else:
+            log(sep.join([f"baza: proba {attempt}", f"t={elapsed}s", "ok"]))
+            return conn
+        # Nie spimy, gdy po przerwie kolejna proba i tak nie zmiesci sie w limicie.
+        if clock() - start + interval_s >= deadline_s:
+            return None
+        sleep(interval_s)
+        # sleep moze trwac dluzej niz interval_s: proba tylko przed terminem (A1).
+        if clock() - start >= deadline_s:
+            return None
+
+
+UNIVERSE_FILE_NAME = "universe_last.json"
+UNIVERSE_REASONS = ("brak", "json", "pola", "sha")
+
+
+def _universe_sha(items) -> str:
+    """sha256 bajtow UTF-8 tekstu 'id<TAB>symbol<LF>' per pozycja, posortowane po id."""
+    text = "".join(f"{i}\t{s}\n" for i, s in sorted(items))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def save_universe(path, universe, *, now_utc=None) -> str:
+    """A2: atomowy zapis uniwersum (tmp w tym samym katalogu + os.replace).
+
+    Zwraca saved_at_utc. Wyjatek w trakcie zapisu zostawia poprzedni plik nienaruszony
+    (plik tymczasowy jest usuwany).
+    """
+    path = Path(path)
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    saved_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    items = sorted((int(i), str(s)) for i, s in universe)
+    doc = {
+        "saved_at_utc": saved_at,
+        "items": [{"instrument_id": i, "yahoo_symbol": s} for i, s in items],
+        "sha256": _universe_sha(items),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(doc, stream, sort_keys=True, ensure_ascii=True)
+            stream.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return saved_at
+
+
+@dataclass(frozen=True)
+class StoredUniverse:
+    items: list | None = None  # [(id, symbol)] posortowane po id, albo None
+    saved_at_utc: str | None = None
+    age_days: int | None = None
+    reason: str | None = None  # brak | json | pola | sha, gdy items is None
+
+
+def load_universe(path, *, now_utc=None) -> StoredUniverse:
+    """A2: odczyt z weryfikacja; brak pliku, zly JSON, brak pol albo zle sha = reason."""
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return StoredUniverse(reason="brak")
+    try:
+        doc = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return StoredUniverse(reason="json")
+    try:
+        saved_at, sha, rows = doc["saved_at_utc"], doc["sha256"], doc["items"]
+        items = [(r["instrument_id"], r["yahoo_symbol"]) for r in rows]
+        saved = datetime.strptime(saved_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        valid = (
+            isinstance(sha, str) and items
+            and all(type(i) is int and isinstance(s, str) and s for i, s in items)
+        )
+    except (KeyError, TypeError, ValueError):
+        return StoredUniverse(reason="pola")
+    if not valid:
+        return StoredUniverse(reason="pola")
+    items.sort()
+    if _universe_sha(items) != sha:
+        return StoredUniverse(reason="sha")
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return StoredUniverse(items, saved_at, max((now - saved).days, 0))
 
 
 def _insert_commit(conn, instrument_id, entry, parsed, sha):

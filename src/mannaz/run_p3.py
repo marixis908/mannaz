@@ -8,7 +8,7 @@ dało się uruchomić każdy krok niezależnie (np. przez innego agenta):
     python -m mannaz.run_p3 corp-actions
     python -m mannaz.run_p3 risk [--date YYYY-MM-DD]
     python -m mannaz.run_p3 prices-correct --file CSV [--dry-run] [--convention TEKST | --notrade]
-    python -m mannaz.run_p3 estimates [--instrument-ids ID [ID ...]] [--archive-root DIR]
+    python -m mannaz.run_p3 estimates [--instrument-ids ID [ID ...]] [--archive-root DIR] [--db-wait-s N]
     python -m mannaz.run_p3 satellite --from YYYY-MM-DD --to YYYY-MM-DD --out DIR [--account-values CSV] [--symbol-map CSV]
 
 Bez argumentów `--instrument-ids`/`--currencies`/`--start`/`--end`, `prices` i
@@ -50,9 +50,15 @@ from mannaz.cycle import (
 )
 from mannaz.db import DEFAULT_ENV_PATH, get_connection
 from mannaz.estimates import (
+    UNIVERSE_FILE_NAME,
+    db_error_count,
+    db_only_count,
+    load_universe,
     missing_universe_ids,
     run_estimates,
+    save_universe,
     select_estimates_universe,
+    wait_for_db,
 )
 from mannaz.fx import DEFAULT_START as FX_DEFAULT_START
 from mannaz.fx import NBP_CURRENCIES, run_fx_fetch
@@ -515,30 +521,85 @@ def _ascii(value) -> str:
     return str(value).encode("ascii", "backslashreplace").decode("ascii")
 
 
+def _fpe_stan(errors, rate_limited, skipped, db_only, emergency) -> str:
+    """A5: linia stanow, drukowana zawsze (tez przy kodzie 2)."""
+    sep = " \u00b7 "
+    return "FPE-STAN: " + sep.join([
+        f"bledy {errors}", f"429 {rate_limited}", f"pominiete {skipped}",
+        f"tylko archiwum (baza) {db_only}", f"tryb awaryjny {'tak' if emergency else 'nie'}",
+    ])
+
+
+def _fpe_exit_code(errors, rate_limited, skipped, db_only) -> int:
+    """A5 (D4), pierwszenstwo 3 > 2 > 1 > 4 > 0; tu 1 > 4 > 0 (2 i 3 poza tym wywolaniem)."""
+    if errors or rate_limited or skipped:
+        return 1
+    return 4 if db_only else 0
+
+
 def cmd_estimates(args: argparse.Namespace) -> None:
     """FPE-RUN: pobranie konsensusu Yahoo dla uniwersum (equity, nie core, nie
-    benchmark, pozycja otwarta) albo dla `--instrument-ids`. Kod wyjscia: 0 bez
-    bledow; 1 gdy jakikolwiek blad/429/pominiety; 2 puste uniwersum lub blad
-    bazy. Wydruk: wylacznie licznosci i statusy (bez ilosci/kosztow/kwot)."""
+    benchmark, pozycja otwarta) albo dla `--instrument-ids`. Baza: czekanie do
+    `--db-wait-s` (A1); po nieudanym czekaniu przebieg awaryjny z pliku uniwersum
+    <archive-root>/../universe_last.json (A2/A3, tylko archiwum). Kod wyjscia:
+    0 wszystko w bazie; 1 blad/429/pominiete; 2 nic nie pobrano (puste uniwersum,
+    brak bazy i waznego pliku); 4 snapshot tylko w archiwum z powodu bazy.
+    Wydruk: wylacznie licznosci i statusy (bez ilosci/kosztow/kwot)."""
     reconfigure = getattr(sys.stdout, "reconfigure", None)
     if reconfigure is not None:
         reconfigure(errors="replace")
+    # resolve(): dla '--archive-root .' samo .parent zostaloby w '.' (recenzja Codex, MINOR).
+    universe_path = Path(args.archive_root).resolve().parent / UNIVERSE_FILE_NAME
     conn = None
+    universe = None
     try:
-        try:
-            conn = get_connection()
-            with conn.cursor() as cur:
-                universe = select_estimates_universe(cur, args.instrument_ids)
-            conn.rollback()
-        except Exception as exc:
-            print(f"FPE-RUN: blad bazy ({type(exc).__name__})")
-            sys.exit(2)
+        # Czekanie tylko tu, przed odczytem uniwersum (A1); dalej blad bazy bez czekania.
+        conn = wait_for_db(get_connection, deadline_s=args.db_wait_s)
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    universe = select_estimates_universe(cur, args.instrument_ids)
+                conn.rollback()
+            except Exception as exc:
+                print(f"FPE-RUN: blad bazy ({type(exc).__name__})")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+        emergency = conn is None
+        if emergency:
+            stored = load_universe(universe_path)
+            if stored.items is None:
+                print(f"FPE-RUN: baza niedostepna, plik uniwersum niewazny ({stored.reason})"
+                      " - brak pobran")
+                print(_fpe_stan(0, 0, 0, 0, False))
+                sys.exit(2)
+            universe = stored.items
+            if args.instrument_ids:
+                wanted = {int(i) for i in args.instrument_ids}
+                universe = [item for item in universe if item[0] in wanted]
         missing = missing_universe_ids(args.instrument_ids, universe) if args.instrument_ids else []
         for missing_id in missing:
-            print(f"pominiete id={missing_id}: brak yahoo_symbol lub instrumentu")
+            if emergency:
+                print(f"pominiete id={missing_id}: poza plikiem uniwersum")
+            else:
+                print(f"pominiete id={missing_id}: brak yahoo_symbol lub instrumentu")
         if not universe:
             print("FPE-RUN: puste uniwersum - brak pobran")
+            print(_fpe_stan(0, 0, len(missing), 0, emergency))
             sys.exit(2)
+        if not emergency and not args.instrument_ids:
+            # A2: tylko pelne uniwersum z odczytu na zywo; blad zapisu nie zatrzymuje przebiegu.
+            try:
+                save_universe(universe_path, universe)
+            except Exception as exc:
+                print(f"FPE-RUN: zapis pliku uniwersum nieudany ({type(exc).__name__})")
+        if emergency:
+            print(
+                "FPE-RUN: tryb awaryjny \u00b7 uniwersum z " + stored.saved_at_utc
+                + f" \u00b7 wiek {stored.age_days} d \u00b7 symbole {len(universe)}"
+            )
         summary = run_estimates(conn, universe, archive_root=args.archive_root)
     finally:
         if conn is not None:
@@ -560,12 +621,12 @@ def cmd_estimates(args: argparse.Namespace) -> None:
                 f"parse_status={res.parse_status} wiersze={res.rows} status={res.status}"
             )
         )
-    # R3: blad bazy (tez przy zapisie symbolu) = 2 i ma pierwszenstwo; pominiete id = 1.
-    if any(res.error is not None and res.error.startswith("baza:") for res in summary.results):
-        sys.exit(2)
-    if summary.errors or summary.rate_limited or summary.skipped or missing:
-        sys.exit(1)
-    sys.exit(0)
+    # A5: blad bazy przy zapisie symbolu nie jest "bledem" dla kodu 1 - daje 4.
+    errors = summary.errors - db_error_count(summary)
+    skipped = summary.skipped + len(missing)
+    db_only = db_only_count(summary)
+    print(_fpe_stan(errors, summary.rate_limited, skipped, db_only, summary.emergency))
+    sys.exit(_fpe_exit_code(errors, summary.rate_limited, skipped, db_only))
 
 
 def cmd_cycle(args: argparse.Namespace) -> None:
@@ -698,6 +759,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--archive-root", type=Path,
         default=Path(DEFAULT_ENV_PATH).parent / "data" / "estimates" / "raw",
         help="katalog archiwum bajtow (domyslnie <repo>/data/estimates/raw)",
+    )
+    p_est.add_argument(
+        "--db-wait-s", type=int, default=600,
+        help="maks. czekanie na baze w sekundach (domyslnie 600; 0 = jedna proba bez czekania)",
     )
     p_est.set_defaults(func=cmd_estimates)
 

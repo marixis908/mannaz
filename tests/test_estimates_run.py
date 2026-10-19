@@ -24,6 +24,9 @@ def no_network(monkeypatch):
 
     monkeypatch.setattr(YfData, "get", blocked)
     monkeypatch.setattr(est, "code_sha", lambda: "synthetic-sha")
+    # fpe-wait A2: przebiegi bez --instrument-ids zapisywalyby universe_last.json obok
+    # domyslnego archiwum; testy tego pliku go nie dotykaja (zapis testuje test_estimates_wait).
+    monkeypatch.setattr(run_p3, "save_universe", lambda *a, **kw: None)
 
 
 def response(body, status=200):
@@ -221,7 +224,7 @@ def test_t5_exit_code_one_on_error(monkeypatch, tmp_path):
 
 def run_with(monkeypatch, summary, universe, argv=("estimates",), get_conn=None):
     conn = FakeConn()
-    monkeypatch.setattr(run_p3, "get_connection", get_conn or (lambda: conn))
+    monkeypatch.setattr(run_p3, "get_connection", get_conn or (lambda **kw: conn))
     monkeypatch.setattr(run_p3, "select_estimates_universe", lambda cur, ids=None: list(universe))
     monkeypatch.setattr(run_p3, "run_estimates", lambda *a, **kw: summary)
     with pytest.raises(SystemExit) as excinfo:
@@ -243,7 +246,9 @@ def test_t6_exit_codes(monkeypatch, capsys):
     universe = [(1, "A"), (2, "B")]
     assert run_with(monkeypatch, make_summary(), universe) == 0
     out = capsys.readouterr().out
-    assert out.splitlines()[0].startswith("FPE-RUN: symbole 2")
+    # wiersze "baza: proba ..." (A1) poprzedzaja FPE-RUN; pomijamy je
+    out_lines = [ln for ln in out.splitlines() if not ln.startswith("baza: proba")]
+    assert out_lines[0].startswith("FPE-RUN: symbole 2")
     assert "snapshoty 2" in out and "w bazie 2" in out and "pominiete 0" in out
     assert run_with(monkeypatch, make_summary(errors=1), universe) == 1
     assert run_with(monkeypatch, make_summary(rate_limited=1), universe) == 1
@@ -254,7 +259,7 @@ def test_t6_exit_codes(monkeypatch, capsys):
 
     monkeypatch.setattr(run_p3, "run_estimates", boom)
     conn = FakeConn()
-    monkeypatch.setattr(run_p3, "get_connection", lambda: conn)
+    monkeypatch.setattr(run_p3, "get_connection", lambda **kw: conn)
     monkeypatch.setattr(run_p3, "select_estimates_universe", lambda cur, ids=None: [])
     with pytest.raises(SystemExit) as excinfo:
         run_p3.main(["estimates", "--instrument-ids", "7", "8"])
@@ -273,20 +278,26 @@ def test_t6_missing_id_with_success_is_one(monkeypatch, capsys):
     assert "pominiete id=9: brak yahoo_symbol lub instrumentu" in out and "pominiete 1" in out
 
 
-def test_t6_db_error_during_run_is_two(monkeypatch):
-    # recenzja Codex V2 #2: blad bazy przy zapisie symbolu = kod 2 (pierwszenstwo nad 1)
-    summary = make_summary(errors=2, rate_limited=1, results=(
-        est.SymbolResult(1, "A", 200, None, 0, "blad", "baza: OperationalError"),
-        est.SymbolResult(2, "B", 404, None, 0, "blad", "HTTP 404", "r", "m", True, True)))
-    assert run_with(monkeypatch, summary, [(1, "A"), (2, "B")]) == 2
+def test_t6_db_error_during_run_is_four(monkeypatch):
+    # fpe-wait A5 (D4): blad bazy przy zapisie symbolu = kod 4 (dotad 2; nizsze od 1).
+    # Dane testu: symbol A zarchiwizowany z bledem bazy (archived=True), B w bazie;
+    # dotychczasowe rate_limited=1 i drugi blad HTTP 404 dawalyby teraz 1, nie 4.
+    summary = make_summary(errors=1, results=(
+        est.SymbolResult(1, "A", 200, None, 0, "blad", "baza: OperationalError", "r", "m",
+                         False, True, True),
+        est.SymbolResult(2, "B", 200, None, 3, "ok", None, "r", "m", True, True)))
+    assert run_with(monkeypatch, summary, [(1, "A"), (2, "B")]) == 4
 
 
-def test_t6_connection_error_is_two(monkeypatch, capsys):
-    def failing():
+def test_t6_connection_error_is_two(monkeypatch, capsys, tmp_path):
+    def failing(**kw):
         raise RuntimeError("synthetic")
 
-    assert run_with(monkeypatch, make_summary(), [(1, "A")], get_conn=failing) == 2
-    assert "RuntimeError" in capsys.readouterr().out
+    # --db-wait-s 0: jedna proba; brak pliku uniwersum w tmp_path = kod 2 (A3)
+    argv = ("estimates", "--db-wait-s", "0", "--archive-root", str(tmp_path / "raw"))
+    assert run_with(monkeypatch, make_summary(), [(1, "A")], argv=argv, get_conn=failing) == 2
+    out = capsys.readouterr().out
+    assert "RuntimeError" in out and "FPE-STAN:" in out
 
 
 def test_t6_archive_root_default_and_override(monkeypatch):
@@ -307,8 +318,10 @@ def test_t7_no_amount_fields_and_output(monkeypatch, capsys):
         assert not {f.name for f in dataclasses.fields(cls)} & FORBIDDEN
     assert run_with(monkeypatch, make_summary(), [(1, "A"), (2, "B")]) == 0
     out = capsys.readouterr().out
-    lines = out.splitlines()
-    assert lines[0].startswith("FPE-RUN:") and all(line.isascii() for line in lines[1:])
+    lines = [ln for ln in out.splitlines() if not ln.startswith("baza: proba")]
+    # linie FPE-STAN (A5) maja separator U+00B7 jak FPE-RUN; ASCII dotyczy wierszy symboli
+    assert lines[0].startswith("FPE-RUN:") and all(
+        line.isascii() for line in lines[1:] if not line.startswith("FPE-"))
     words = set(out.replace("=", " ").replace(":", " ").split())
     assert not words & FORBIDDEN
     assert "id=1 symbol=A http_status=200 parse_status=None wiersze=3" in out
@@ -335,7 +348,7 @@ def run_cli_on_body(monkeypatch, tmp_path, body):
     import functools
 
     conn = FakeConn()
-    monkeypatch.setattr(run_p3, "get_connection", lambda: conn)
+    monkeypatch.setattr(run_p3, "get_connection", lambda **kw: conn)
     monkeypatch.setattr(run_p3, "select_estimates_universe", lambda cur, ids=None: [(1, "SYN")])
     http_get = lambda url, params=None, timeout=None: response(body, 200)  # noqa: E731
     monkeypatch.setattr(run_p3, "run_estimates", functools.partial(

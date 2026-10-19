@@ -133,6 +133,13 @@ def test_e1_bytes_and_metadata(tmp_path):
     assert meta["byte_count"] == len(body)
     assert meta["raw_sha256"] == entry.raw_sha256
     assert meta["fetched_at_utc"] == NOW.isoformat()
+    assert "instrument_id" in meta and meta["instrument_id"] is None  # A4: domyslnie null
+
+
+def test_e1b_instrument_id_in_meta(tmp_path):
+    entry = est.archive_snapshot(tmp_path, fetch(b"{}"), 42)
+    assert entry.error is None
+    assert json.loads((tmp_path / entry.meta_ref).read_bytes())["instrument_id"] == 42
 
 
 def test_e2_collision_preserves_both_files(tmp_path):
