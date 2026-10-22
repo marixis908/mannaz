@@ -1,6 +1,6 @@
 # Mannaz — system monitoringu portfela satelitarnego
 
-**Rewizja 4.23 · 2026-10-18**
+**Rewizja 4.24 · 2026-10-22**
 
 ---
 
@@ -47,7 +47,8 @@ Dokument opisuje **wersję docelową**. Zakres pierwszej implementacji jest wę�
 | 4.20 | 2026-10-16 | M62: zapadka nie przechodzi przez zmianę reguły stopu, liczona od pierwszej oceny nową regułą (B-80); M69: sekcja „Zmiany pozycji” porównuje pozycje otwarte z poprzednią oceną (B-74); M78: cykl czyta kotwice `account_values` z `data\manual` (B-73); decyzja: owner 2026-10-16 (ocena cyklu 2026-10-15_1747, brief CC-B70) |
 | 4.21 | 2026-10-17 | T12: wiersz bez ceny z datą po D = informacja w HEARTBEAT (B-83); M67: tolerancja rewizji 1e-6 względnie, ochrona korekty ręcznej (`tradingview_manual_*`), podsekcja „Konflikty z korektą ręczną” (B-84); §9.6: brak obrotu potwierdzony w TradingView (`tradingview_manual_notrade`, B-78); decyzja: planista 2026-10-17 (brief CC-DQ) |
 | 4.22 | 2026-10-18 | §16.5 mnożniki z konsensusu: P/E NTM — przybliżenie z konsensusu rocznego (M90), rewizja dla stałego okresu (M91), agregat E/P części akcyjnej (M92), pokrycie konsensusu (M93), kwalifikacja mnożnika do RVS i jawna zmiana mnożnika (M94) — zmiany merytoryczne; T47 progi dopasowania okresu i flag, T48 kontrakt archiwum konsensusu; §8.2 `estimate_snapshots` i `estimates` per okres; M28 i O-13 doprecyzowane (konsensus jako wejście mnożników relatywnych i bramek, zakaz alertów dotyczy reverse DCF) — zmiana redakcyjna bez zmiany intencji; M15, M40 odwołanie do M91; P-13–P-17; O-52, O-53; decyzja: owner 2026-10-18 (pilotaż `docs/pomiary/forward-pe-pilot-r1.md`, brief CC-R422) |
-| **4.23** | **2026-10-18** | **T48 doprecyzowany (archiwizacja odpowiedzi koncowej biblioteki, koncowe 429 jako nieudane pobranie, deduplikacja wylaczona do zamkniecia P-16); T49 harmonogram strumienia konsensusu na komputerze ownera z progiem przegladu (hybryda z VPS); §8.2 `estimate_snapshots` i `estimates` zgodne z migracja `sql/020_estimates.sql` (m.in. parse_status, skipped_labels, price_currency, instrument_id NOT NULL, fiscal_year jako konwencja Mannaz, pierwszenstwo statusu `bledna data okresu`); §5.4 wiersz snapshotow konsensusu zgodny z M65; P-16 zaktualizowany (C3 skreslony jako bramka); wyciag `docs/pomiary/fpe-importer-c2.md`, poprawka opisu 10-K w wyciagu pilotazu — doprecyzowania i zapis decyzji, bez nowych regul oceny; decyzja: owner 2026-10-18 (brief CC-R423)** |
+| 4.23 | 2026-10-18 | T48 doprecyzowany (archiwizacja odpowiedzi koncowej biblioteki, koncowe 429 jako nieudane pobranie, deduplikacja wylaczona do zamkniecia P-16); T49 harmonogram strumienia konsensusu na komputerze ownera z progiem przegladu (hybryda z VPS); §8.2 `estimate_snapshots` i `estimates` zgodne z migracja `sql/020_estimates.sql` (m.in. parse_status, skipped_labels, price_currency, instrument_id NOT NULL, fiscal_year jako konwencja Mannaz, pierwszenstwo statusu `bledna data okresu`); §5.4 wiersz snapshotow konsensusu zgodny z M65; P-16 zaktualizowany (C3 skreslony jako bramka); wyciag `docs/pomiary/fpe-importer-c2.md`, poprawka opisu 10-K w wyciagu pilotazu — doprecyzowania i zapis decyzji, bez nowych regul oceny; decyzja: owner 2026-10-18 (brief CC-R423) |
+| **4.24** | **2026-10-22** | **§9.6 punkt 7: brakujący wiersz sesji z samym wypełniaczem Yahoo (`provider_filler` w `ingest_errors`) uzupełnia się z TradingView przez `prices-correct --insert-missing` (konwencja `tradingview_manual_b76`, dowód wypełniacza i sesja w kalendarzu giełdy; importer nie nadpisuje — M67, B-84); B-91; decyzja: owner 2026-10-22 (brief CC prices-insert, rew. 2)** |
 
 ### 0.3 Oznaczenia
 
@@ -594,6 +595,7 @@ Pozostałe kanały:
 4. Ryzyko (stopy, ATR, Chandelier, cena zamknięcia na D) liczy się w warstwie `*_split_adj` (T6). Ilość i cenę wejścia z brokera przenosi się do tej warstwy czynnikiem ze zdarzeń w `corporate_events`. Brak zdarzenia przy cenach już skorygowanych przez Yahoo daje błąd rzędu ratio — dlatego detektor jest etapem cyklu, a nie kontrolą okazjonalną.
 5. Wartości historyczne zmieniają się między pobraniami także bez splitu — rewizje dostawcy (M67).
 6. Brak obrotu potwierdzony w TradingView zapisuje się jako `tradingview_manual_notrade`; detektor wypełniaczy pomija takie wiersze (B-78).
+7. Brakujący wiersz sesji, dla której Yahoo zwraca wyłącznie wypełniacz (`provider_filler` w `ingest_errors`), uzupełnia się ręcznie wartościami z TradingView przez `prices-correct --insert-missing` (konwencja `tradingview_manual_b76`). Wstawienie wymaga dowodu wypełniacza w `ingest_errors` i daty sesji w kalendarzu giełdy. Importer takiego wiersza nie nadpisuje (M67, B-84).
 
 ## 10. Wielowalutowość, FX i konwencje
 
