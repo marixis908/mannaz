@@ -1248,10 +1248,28 @@ class ManualCorrectionSummary:
     rows_input: int = 0
     rows_to_write: int = 0
     # (yahoo_symbol, price_date, powód): "symbol" / "brak wiersza" / "nie filler" / "ohlc" / "duplikat"
+    # oraz (B-91, tylko z insert_missing) "brak dowodu wypelniacza" / "nie sesja"
     rejected: list[tuple[str, date | None, str]] = field(default_factory=list)
+    # rows_to_write / rows_written = UPDATE + INSERT; rows_inserted = w tym INSERT (B-91)
     rows_written: int = 0
+    rows_inserted: int = 0
     per_symbol: dict[str, int] = field(default_factory=dict)
     dates_per_symbol: dict[str, tuple[date, date]] = field(default_factory=dict)
+
+
+def _is_exchange_session(exchange: str | None, price_date: date) -> bool:
+    """B-91: czy `price_date` jest sesją w kalendarzu giełdy `exchange`. Ta sama
+    metoda co cykl (`cycle._default_sessions_fn`: `sessions_in_range`) i mapowanie
+    `EXCHANGE_TO_CALENDAR_CODE`; import z cycle.py odpada (cycle importuje prices).
+    Brak giełdy / giełda spoza mapy / data poza zakresem kalendarza -> False."""
+    calendar_code = EXCHANGE_TO_CALENDAR_CODE.get(exchange) if exchange else None
+    if calendar_code is None:
+        return False
+    try:
+        cal = _get_calendar(calendar_code)
+        return len(cal.sessions_in_range(price_date.isoformat(), price_date.isoformat())) > 0
+    except (xcals_errors.InvalidCalendarName, xcals_errors.DateOutOfBounds):
+        return False
 
 
 class ManualCorrectionRejectedError(RuntimeError):
@@ -1270,6 +1288,7 @@ def apply_manual_corrections(
     dry_run: bool = True,
     now: datetime | None = None,
     notrade: bool = False,
+    insert_missing: bool = False,
 ) -> ManualCorrectionSummary:
     """B-76 (N1): ręczna korekta WYŁĄCZNIE wierszy-wypełniaczy (`prices_daily`,
     source='yahoo'). `rows` = (yahoo_symbol, price_date, open, high, low, close,
@@ -1287,7 +1306,19 @@ def apply_manual_corrections(
     volume == 0 (inaczej "ohlc"), zapisany wiersz musi być wypełniaczem (jak w
     B-76), zapis O/H/L/C wg wejścia i volume_split_adj 0, `ingest_errors`
     `manual_correction` z prefiksem "B-78:". Detektor wypełniaczy takich wierszy
-    nie zgłasza, a importer ich nie nadpisuje (reguła B-84)."""
+    nie zgłasza, a importer ich nie nadpisuje (reguła B-84).
+
+    B-91 `insert_missing=True` (na cały plik): wiersz wejścia BEZ zapisanego
+    wiersza (source='yahoo') jest WSTAWIANY, gdy (b) w `ingest_errors` jest wpis
+    `provider_filler`/source='yahoo' dla (instrument, data) — inaczej "brak dowodu
+    wypelniacza"; (c) data jest sesją w kalendarzu giełdy instrumentu (inaczej
+    "nie sesja"; brak giełdy/kalendarza = brak potwierdzenia); (d) OHLC jak wyżej
+    (przy `notrade` reguła B-78). INSERT: source='yahoo', currency z instruments,
+    volume_raw NULL, konwencja jak w UPDATE; log `manual_correction` z prefiksem
+    "B-76 insert:" / "B-78 insert:", old=brak. Bez flagi "brak wiersza" jak dotąd.
+    Zapisany wypełniacz -> UPDATE niezależnie od flagi; zapisany nie-wypełniacz ->
+    "nie filler". `rows_to_write`/`rows_written` = UPDATE + INSERT,
+    `rows_inserted` = w tym INSERT."""
     if notrade:
         if convention is not None and convention != NOTRADE_CONVENTION:
             raise ValueError(f"notrade wymusza konwencje {NOTRADE_CONVENTION}, podano {convention}")
@@ -1324,9 +1355,29 @@ def apply_manual_corrections(
                 )
                 stored = cur.fetchone()
                 if stored is None:
-                    summary.rejected.append((symbol, price_date, "brak wiersza"))
-                    continue
-                if not is_provider_filler(*stored):
+                    if not insert_missing:
+                        summary.rejected.append((symbol, price_date, "brak wiersza"))
+                        continue
+                    # B-91: wstawienie luki; bramki (b) dowód wypełniacza Yahoo,
+                    # (c) sesja w kalendarzu giełdy, potem (d) ohlc (niżej) —
+                    # powód = pierwsza niespełniona.
+                    cur.execute(
+                        """
+                        SELECT 1 FROM ingest_errors
+                        WHERE instrument_id = %s AND price_date = %s
+                          AND error_type = 'provider_filler' AND source = 'yahoo'
+                        LIMIT 1
+                        """,
+                        (instrument_id, price_date),
+                    )
+                    if cur.fetchone() is None:
+                        summary.rejected.append((symbol, price_date, "brak dowodu wypelniacza"))
+                        continue
+                    cur.execute("SELECT exchange FROM instruments WHERE id = %s", (instrument_id,))
+                    if not _is_exchange_session(cur.fetchone()[0], price_date):
+                        summary.rejected.append((symbol, price_date, "nie sesja"))
+                        continue
+                elif not is_provider_filler(*stored):
                     summary.rejected.append((symbol, price_date, "nie filler"))
                     continue
                 vals = (o_, h_, l_, c_, v_)
@@ -1339,12 +1390,58 @@ def apply_manual_corrections(
                 ):
                     summary.rejected.append((symbol, price_date, "ohlc"))
                     continue
-                planned.append((instrument_id, symbol, price_date, vals, tuple(stored)))
+                planned.append((instrument_id, symbol, price_date, vals, None if stored is None else tuple(stored)))
             summary.rows_to_write = len(planned)
 
             if not dry_run and not summary.rejected:
                 for instrument_id, symbol, price_date, (o_, h_, l_, c_, v_), stored in planned:
                     events = _instrument_split_events(cur, instrument_id)
+                    if stored is None:
+                        # B-91: INSERT luki; source='yahoo' (importer czyta wiersz po
+                        # source, _is_manual_row chroni go wg B-84), volume_raw NULL jak
+                        # w INSERT importera, currency z instruments.
+                        cur.execute(
+                            """
+                            INSERT INTO prices_daily (
+                                instrument_id, price_date, currency, source,
+                                open_raw, high_raw, low_raw, close_raw, volume_raw,
+                                open_split_adj, high_split_adj, low_split_adj,
+                                close_split_adj, volume_split_adj, adjustment_convention
+                            ) SELECT %s, %s, i.currency, 'yahoo', %s, %s, %s, %s, NULL,
+                                     %s, %s, %s, %s, %s, %s
+                            FROM instruments i WHERE i.id = %s
+                            """,
+                            (
+                                instrument_id,
+                                price_date,
+                                reconstruct_raw(o_, price_date, events),
+                                reconstruct_raw(h_, price_date, events),
+                                reconstruct_raw(l_, price_date, events),
+                                reconstruct_raw(c_, price_date, events),
+                                o_,
+                                h_,
+                                l_,
+                                c_,
+                                v_,
+                                convention,
+                                instrument_id,
+                            ),
+                        )
+                        _log_ingest_error(
+                            cur,
+                            source="tradingview",
+                            instrument_id=instrument_id,
+                            price_date=price_date,
+                            error_type="manual_correction",
+                            detail=(
+                                f"{tag} insert: old=brak new="
+                                + "/".join(str(x) for x in (o_, h_, l_, c_, v_))
+                            ),
+                            run_started_at=run_started_at,
+                        )
+                        summary.rows_written += 1
+                        summary.rows_inserted += 1
+                        continue
                     cur.execute(
                         """
                         UPDATE prices_daily SET
